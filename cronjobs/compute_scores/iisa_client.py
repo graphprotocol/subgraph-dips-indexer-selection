@@ -45,21 +45,17 @@ def _auth_header(token: Optional[str]) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _should_retry(exc: Exception, status_code: Optional[int]) -> bool:
-    """Retry transport errors and 5xx responses. Don't retry 4xx — those are our fault."""
-    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
-        return True
-    if status_code is not None and 500 <= status_code < 600:
-        return True
-    return False
-
-
 class _AttemptFailed(Exception):
-    """One attempt failed in a way the retry loop should record and maybe retry."""
+    """One attempt failed; carries the underlying error and whether another attempt may help.
 
-    def __init__(self, error: Exception) -> None:
+    Dropped connections, timeouts and every recorded HTTP failure (5xx, 429) are worth
+    retrying. Other request errors, such as a malformed URL, will fail the same way again.
+    """
+
+    def __init__(self, error: Exception, retryable: bool) -> None:
         super().__init__(str(error))
         self.error = error
+        self.retryable = retryable
 
 
 def _attempt_request(
@@ -77,21 +73,17 @@ def _attempt_request(
     try:
         response = requests.request(method, url, headers=headers, json=json_body, timeout=timeout)
     except requests.RequestException as exc:
-        raise _AttemptFailed(exc) from exc
+        retryable = isinstance(exc, (requests.ConnectionError, requests.Timeout))
+        raise _AttemptFailed(exc, retryable) from exc
 
     status = response.status_code
     if 200 <= status < 300:
         return response
     if 400 <= status < 500 and status != 429:
         raise IISAPushError(f"{method} {url} failed with {status}: {response.text[:500]}")
-    raise _AttemptFailed(requests.HTTPError(f"{method} {url} returned {status}", response=response))
-
-
-def _is_retryable(error: Exception) -> bool:
-    """Recorded HTTP failures (5xx, 429) are worth retrying; transport errors ask _should_retry."""
-    if isinstance(error, requests.HTTPError):
-        return True
-    return _should_retry(error, None)
+    raise _AttemptFailed(
+        requests.HTTPError(f"{method} {url} returned {status}", response=response), retryable=True
+    )
 
 
 def _http_status(error: Exception) -> Optional[int]:
@@ -140,9 +132,10 @@ def _request_with_retry(
             return _attempt_request(method, url, headers, json_body, timeout)
         except _AttemptFailed as failed:
             last_exc = failed.error
+            retryable = failed.retryable
         last_status = _http_status(last_exc)
         _log_failed_attempt(attempt, url, last_exc)
-        if not _is_retryable(last_exc):
+        if not retryable:
             break
         if attempt < RETRY_ATTEMPTS:
             time.sleep(delay)

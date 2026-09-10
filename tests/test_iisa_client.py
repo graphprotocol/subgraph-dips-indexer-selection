@@ -125,3 +125,19 @@ class TestRequestWithRetry:
                 _request_with_retry("POST", URL, token="t", json_body=[])
 
         assert "last_status=503" in str(exc_info.value)
+
+    def test_http_error_raised_by_the_transport_stops_after_one_attempt(self):
+        """An HTTPError thrown by requests itself is not one of ours and must not be retried."""
+        with (
+            patch(
+                "iisa_client.requests.request",
+                side_effect=requests.HTTPError("boom"),
+            ) as mock_request,
+            patch("iisa_client.time.sleep") as mock_sleep,
+        ):
+            with pytest.raises(IISAPushError) as exc_info:
+                _request_with_retry("POST", URL, token="t", json_body=[])
+
+        assert mock_request.call_count == 1
+        mock_sleep.assert_not_called()
+        assert "last_status=None" in str(exc_info.value)
