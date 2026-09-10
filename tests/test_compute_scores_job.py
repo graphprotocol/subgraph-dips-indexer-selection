@@ -729,6 +729,18 @@ class TestDeterminism:
             == int.from_bytes(hashlib.sha256(b"query-abc-JFK").digest()[:8], byteorder="big") % 100
         )
 
+    def test_default_scoring_seed_is_derived_from_the_start_date(self):
+        """Without an explicit seed, sampling must still be reproducible for a given window."""
+        from datetime import date
+
+        assert processing.default_scoring_seed(date(2026, 5, 1)) == 20260501
+        assert processing.default_scoring_seed(date(2026, 5, 1)) == processing.default_scoring_seed(
+            date(2026, 5, 1)
+        )
+        assert processing.default_scoring_seed(date(2026, 5, 2)) != processing.default_scoring_seed(
+            date(2026, 5, 1)
+        )
+
     def test_strategic_sample_deterministic_with_seed(self):
         """strategic_sample with the same seed produces identical output."""
         df = pd.DataFrame(
