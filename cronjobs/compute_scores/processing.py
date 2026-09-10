@@ -829,7 +829,7 @@ def compute_all_scores(
             "sampled_query_id_hashed_mod_integer_root",
         ]
 
-        latency_rankings, latency_results = perform_latency_linear_regression(
+        latency_rankings, _ = perform_latency_linear_regression(
             filtered_data, predictor, categorical, numeric
         )
         indexer_query_count = (
