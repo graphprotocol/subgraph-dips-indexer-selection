@@ -1573,6 +1573,58 @@ class TestComputeAllScoresGeoipDemotion:
             "demotion warning should not fire when any indexer has a public IP"
         )
 
+    def test_partial_mode_scores_every_indexer_with_neutral_latency(self, monkeypatch):
+        from datetime import date
+        from unittest.mock import MagicMock
+
+        indexer_ids = ["0x" + c * 40 for c in "abc"]
+        combined_queries = self._build_combined_queries(indexer_ids)
+
+        mock_provider = MagicMock()
+        mock_provider.fetch_initial_query_results.return_value = pd.DataFrame(
+            {
+                "deployment_hash": ["QmTestDeployment"] * 3,
+                "indexer": indexer_ids,
+                "num_rows": [20, 20, 20],
+            }
+        )
+        mock_provider.fetch_combined_query_results.return_value = combined_queries
+        mock_provider.fetch_stake_to_fees.return_value = pd.DataFrame(
+            {
+                "indexer": indexer_ids,
+                "stake_to_fees": [1.0, 2.0, 3.0],
+                "total_query_fees": [10.0, 20.0, 30.0],
+                "last_known_slashable_stake": [100.0, 200.0, 300.0],
+            }
+        )
+        mock_provider.graph_network_url = "http://graph-network:8000"
+
+        def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("GeoIP resolution must not run in partial mode")
+
+        monkeypatch.setattr(processing, "resolve_indexer_geoip", fail_if_called)
+        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
+        monkeypatch.setattr(
+            processing,
+            "fetch_and_filter_graph_node_versions",
+            lambda merged, urls: merged,
+        )
+
+        result = compute_all_scores(
+            provider=mock_provider,
+            start_date=date(2026, 5, 1),
+            start_ts="2026-05-01T00:00:00Z",
+            num_days=28,
+            target_rows=20_000_000,
+            geoip_available=False,
+        )
+
+        assert len(result) == 3, "all three indexers should appear in the output"
+        assert (result["scoring_mode"] == "partial_no_geoip").all()
+        assert (result["lat_lin_reg_coefficient"] == 0.0).all()
+        assert (result["query_count"] == 0).all()
+        assert (result["dips_info_available"] == False).all()  # noqa: E712
+
 
 class TestRunScoringModeReporting:
     """The summary log must reflect the published scoring_mode, not the input flag.
