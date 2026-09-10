@@ -115,14 +115,13 @@ def _run_full_pipeline(
             geoip_available=geoip_available,
             seed=seed,
         )
+        if scores_df.empty:
+            logger.warning("Pipeline returned empty results")
+            return None, MODE_FAILED
+        return scores_df, _mode_from_scores(scores_df, geoip_available)
     except Exception as e:
         logger.warning("Pipeline failed: %s", e)
         return None, MODE_FAILED
-
-    if scores_df.empty:
-        logger.warning("Pipeline returned empty results")
-        return None, MODE_FAILED
-    return scores_df, _mode_from_scores(scores_df, geoip_available)
 
 
 def _run_degraded_pipeline() -> tuple[Optional[pd.DataFrame], str]:
@@ -155,6 +154,7 @@ def _push_scores(provider: RedpandaProvider, scores_df: pd.DataFrame) -> bool:
 
 
 def _warn_about_mode(mode: str) -> None:
+    """Tell operators when a run published anything less than full scores."""
     if mode == MODE_PARTIAL:
         logger.warning(
             "Scoring ran without GeoIP — latency scores are neutral (0.5). "

@@ -1720,3 +1720,22 @@ class TestRunScoringModeReporting:
         assert result is False
         mock_provider.write_scores.assert_not_called()
         assert any("mode=failed" in r.getMessage() for r in caplog.records)
+
+    def test_falls_back_to_degraded_when_pipeline_result_is_unusable(self, monkeypatch, caplog):
+        """A pipeline result that breaks the empty check must fall back, not crash the job."""
+        from unittest.mock import MagicMock
+
+        mock_provider = MagicMock()
+        degraded_df = self._df("degraded")
+
+        monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
+        monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
+        monkeypatch.setattr(main, "compute_all_scores", lambda **kwargs: None)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: degraded_df)
+
+        with caplog.at_level("INFO", logger=main.logger.name):
+            result = main.run_scoring()
+
+        assert result is True
+        mock_provider.write_scores.assert_called_once_with(degraded_df)
+        assert any("mode=degraded" in r.getMessage() for r in caplog.records)
