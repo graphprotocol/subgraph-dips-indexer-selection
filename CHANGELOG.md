@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.9.4](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.3...v2.9.4) (2026-09-10)
+
+
+### Changed
+
+* **deps:** bump google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml ([#232](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/232)) ([12d6238](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/12d6238e88d982bafc8ffd9672ebac3bebfe5e64))
+
 ## [2.9.3](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.9.2...v2.9.3) (2026-08-11)
 
 
