@@ -357,6 +357,65 @@ def fetch_dips_info(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+async def _post_graph_node_status(
+    session: "aiohttp.ClientSession",
+    status_url: str,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """POST the version query to one indexer's status endpoint and return the parsed body.
+
+    Raises aiohttp errors for 5xx / non-2xx responses and for bodies over the size cap, so
+    the caller's retry loop can decide what to do with them.
+    """
+    import aiohttp
+
+    payload = {"query": "{ version { version commit } }"}
+    async with semaphore:
+        async with session.post(
+            status_url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=GRAPH_NODE_VERSION_FETCH_TIMEOUT),
+        ) as resp:
+            if resp.status >= 500:
+                raise aiohttp.ClientResponseError(
+                    resp.request_info,
+                    resp.history,
+                    status=resp.status,
+                    message=f"Server error {resp.status}",
+                )
+            resp.raise_for_status()
+            # Explicit byte cap so a pathological indexer can't stream a
+            # huge body and exhaust cron memory; reading N+1 lets us
+            # detect overflow by comparing the returned length to N.
+            raw = await resp.content.read(GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES + 1)
+            if len(raw) > GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES:
+                raise aiohttp.ClientPayloadError(
+                    f"Response exceeded {GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES} bytes"
+                )
+            body: dict = json.loads(raw)
+            return body
+
+
+def _extract_graph_node_version(data: object) -> tuple[Optional[str], Optional[str]]:
+    """Pull (version, commit) out of a `{"data": {"version": {...}}}` body.
+
+    Defensive shape check: forks may flatten `version`, proxies may return arrays or
+    HTML. Validating each level lets us return (None, None) instead of crashing.
+    """
+    data_envelope = data.get("data") if isinstance(data, dict) else None
+    version_obj = data_envelope.get("version") if isinstance(data_envelope, dict) else None
+    if not isinstance(version_obj, dict):
+        version_obj = {}
+    return version_obj.get("version"), version_obj.get("commit")
+
+
+def _is_deterministic_client_error(error: Exception) -> bool:
+    """True for 4xx: the endpoint is missing or rejects the query, so a retry is wasted."""
+    import aiohttp
+
+    return isinstance(error, aiohttp.ClientResponseError) and 400 <= error.status < 500
+
+
 async def _fetch_single_graph_node_version_async(
     session: "aiohttp.ClientSession",
     indexer: str,
@@ -372,50 +431,12 @@ async def _fetch_single_graph_node_version_async(
     import aiohttp
 
     status_url = url.rstrip("/") + "/status"
-    payload = {"query": "{ version { version commit } }"}
-
-    async def do_fetch() -> dict:
-        async with semaphore:
-            async with session.post(
-                status_url,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=GRAPH_NODE_VERSION_FETCH_TIMEOUT),
-            ) as resp:
-                if resp.status >= 500:
-                    raise aiohttp.ClientResponseError(
-                        resp.request_info,
-                        resp.history,
-                        status=resp.status,
-                        message=f"Server error {resp.status}",
-                    )
-                resp.raise_for_status()
-                # Explicit byte cap so a pathological indexer can't stream a
-                # huge body and exhaust cron memory; reading N+1 lets us
-                # detect overflow by comparing the returned length to N.
-                raw = await resp.content.read(GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES + 1)
-                if len(raw) > GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES:
-                    raise aiohttp.ClientPayloadError(
-                        f"Response exceeded {GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES} bytes"
-                    )
-                body: dict = json.loads(raw)
-                return body
-
     last_error: Optional[Exception] = None
     for attempt in range(GRAPH_NODE_VERSION_MAX_RETRIES):
         try:
-            data = await do_fetch()
-            # Defensive shape check around `{"data": {"version": {...}}}`:
-            # forks may flatten `version`, proxies may return arrays or HTML.
-            # Validating each level lets us return all-None instead of crashing.
-            data_envelope = data.get("data") if isinstance(data, dict) else None
-            version_obj = data_envelope.get("version") if isinstance(data_envelope, dict) else None
-            if not isinstance(version_obj, dict):
-                version_obj = {}
-            return {
-                "indexer": indexer,
-                "graph_node_version": version_obj.get("version"),
-                "graph_node_commit": version_obj.get("commit"),
-            }
+            data = await _post_graph_node_status(session, status_url, semaphore)
+            version, commit = _extract_graph_node_version(data)
+            return {"indexer": indexer, "graph_node_version": version, "graph_node_commit": commit}
         except (
             aiohttp.ClientError,
             asyncio.TimeoutError,
@@ -427,17 +448,14 @@ async def _fetch_single_graph_node_version_async(
             # malformed shape would otherwise propagate through gather()
             # and crash the whole run.
             last_error = e
-            # 4xx is deterministic: the endpoint either doesn't exist or
-            # rejects the query and won't change shape on retry. Skip the
-            # remaining attempts so we don't waste backoff time on a wall.
-            if isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500:
-                break
-            if attempt < GRAPH_NODE_VERSION_MAX_RETRIES - 1:
-                delay = min(
-                    GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX,
-                    GRAPH_NODE_VERSION_RETRY_BACKOFF_MULTIPLIER * (2**attempt),
-                )
-                await asyncio.sleep(delay)
+        if _is_deterministic_client_error(last_error):
+            break
+        if attempt < GRAPH_NODE_VERSION_MAX_RETRIES - 1:
+            delay = min(
+                GRAPH_NODE_VERSION_RETRY_BACKOFF_MAX,
+                GRAPH_NODE_VERSION_RETRY_BACKOFF_MULTIPLIER * (2**attempt),
+            )
+            await asyncio.sleep(delay)
 
     logger.debug(
         f"Failed to fetch graph-node version from {url} for indexer {indexer}: {last_error}"
