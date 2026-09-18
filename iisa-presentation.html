@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IISA: Indexing Indexer Selection Algorithm</title>
+<style>
+  :root {
+    --bg: #f0f2f6;
+    --surface: #ffffff;
+    --border: #dde1e7;
+    --text: #1e2530;
+    --text-secondary: #4a5568;
+    --accent: #3563e9;
+    --accent-light: #eef2ff;
+    --accent-dark: #1e3a8a;
+    --accent-glow: rgba(53, 99, 233, 0.08);
+    --code-bg: #f1f3f8;
+    --table-stripe: #f8f9fc;
+    --green: #16a34a;
+    --green-bg: #dcfce7;
+    --orange: #d97706;
+    --orange-bg: #fef3c7;
+    --red: #dc2626;
+    --red-bg: #fee2e2;
+    --gradient-start: #0f1b33;
+    --gradient-end: #1e3a6e;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--text);
+    background: var(--bg);
+    line-height: 1.75;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---- Header ---- */
+  header {
+    background: linear-gradient(135deg, var(--gradient-start) 0%, var(--gradient-end) 60%, #2952a3 100%);
+    color: #fff;
+    padding: 72px 0 56px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+  header::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -10%;
+    width: 120%;
+    height: 200%;
+    background: radial-gradient(ellipse at 30% 50%, rgba(53,99,233,0.15) 0%, transparent 60%);
+    pointer-events: none;
+  }
+  header h1 {
+    font-size: 2.6rem;
+    font-weight: 800;
+    letter-spacing: -1px;
+    margin-bottom: 10px;
+    position: relative;
+  }
+  header .subtitle {
+    font-size: 1.15rem;
+    color: #93b4e8;
+    font-weight: 400;
+    position: relative;
+  }
+  header .meta {
+    margin-top: 20px;
+    font-size: 0.85rem;
+    color: #6b8ec4;
+    position: relative;
+  }
+
+  /* ---- Sections ---- */
+  section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 40px 44px;
+    margin: 28px auto;
+    max-width: 1100px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 6px 24px rgba(0,0,0,0.03);
+    position: relative;
+  }
+
+  .section-label {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--accent);
+    background: var(--accent-light);
+    padding: 4px 12px;
+    border-radius: 4px;
+    margin-bottom: 12px;
+  }
+
+  h2 {
+    font-size: 1.55rem;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 16px;
+    letter-spacing: -0.3px;
+  }
+
+  h3 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text);
+    margin: 24px 0 8px;
+  }
+
+  p { margin-bottom: 14px; color: var(--text-secondary); }
+  p strong { color: var(--text); }
+
+  code {
+    background: var(--code-bg);
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.86em;
+    color: var(--accent-dark);
+    border: 1px solid #e2e6ee;
+  }
+
+  /* ---- Tables ---- */
+  table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    margin: 18px 0;
+    font-size: 0.95rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  thead th {
+    background: var(--accent-dark);
+    color: #fff;
+    font-weight: 600;
+    text-align: left;
+    padding: 13px 18px;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  tbody td {
+    padding: 13px 18px;
+    border-bottom: 1px solid #eef0f4;
+    vertical-align: middle;
+    color: var(--text);
+  }
+  tbody tr:nth-child(even) { background: var(--table-stripe); }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--accent-glow); }
+
+  /* ---- Weight bars ---- */
+  .weight-cell {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .weight-bar-track {
+    width: 120px;
+    height: 8px;
+    background: #e8ebf0;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .weight-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: linear-gradient(90deg, var(--accent), #6b8de6);
+  }
+  .weight-label {
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: var(--text);
+    min-width: 36px;
+  }
+
+  /* ---- Direction badges ---- */
+  .dir-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+  .dir-badge.up { background: var(--green-bg); color: var(--green); }
+  .dir-badge.down { background: var(--accent-light); color: var(--accent); }
+
+  /* ---- Diagram ---- */
+  .diagram {
+    margin: 24px -20px;
+    text-align: center;
+    overflow-x: auto;
+    background: #f8f9fc;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 36px 28px;
+  }
+  .diagram .mermaid {
+    display: inline-block;
+    text-align: left;
+  }
+  .diagram svg {
+    width: 100%;
+    height: auto;
+    min-height: 260px;
+  }
+
+  /* ---- Callout ---- */
+  .callout {
+    background: var(--accent-light);
+    border-left: 4px solid var(--accent);
+    padding: 14px 18px;
+    border-radius: 0 8px 8px 0;
+    margin: 18px 0;
+    font-size: 0.93rem;
+    color: var(--text-secondary);
+  }
+
+  /* ---- Mode cards ---- */
+  .mode-cards {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    margin: 18px 0;
+  }
+  .mode-card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+    transition: box-shadow 0.2s;
+  }
+  .mode-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.06); }
+  .mode-card h4 { margin-bottom: 8px; font-size: 1rem; }
+  .mode-card p { font-size: 0.88rem; color: var(--text-secondary); margin: 0; }
+
+  .mode-card.full { border-top: 4px solid var(--green); }
+  .mode-card.partial { border-top: 4px solid var(--orange); }
+  .mode-card.degraded { border-top: 4px solid var(--red); }
+
+  .badge {
+    display: inline-block;
+    padding: 3px 14px;
+    border-radius: 14px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .badge.green { background: var(--green-bg); color: var(--green); }
+  .badge.orange { background: var(--orange-bg); color: var(--orange); }
+  .badge.red { background: var(--red-bg); color: var(--red); }
+
+  /* ---- Philosophy / Design Rationale ---- */
+  .rationale-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
+    margin-top: 16px;
+  }
+  .rationale-card {
+    padding: 20px 22px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--table-stripe);
+  }
+  .rationale-card h4 {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--accent-dark);
+    margin-bottom: 6px;
+  }
+  .rationale-card p {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    margin: 0;
+    line-height: 1.6;
+  }
+
+  /* ---- Normalisation detail cards ---- */
+  .norm-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
+    margin-top: 18px;
+  }
+  .norm-card {
+    padding: 20px 22px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    border-left: 4px solid var(--accent);
+  }
+  .norm-card h4 {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+  .norm-card p {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+    margin: 0;
+    line-height: 1.6;
+  }
+
+  /* ---- Footer ---- */
+  footer {
+    text-align: center;
+    padding: 32px;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+  }
+
+  @media print {
+    header { padding: 32px 0 24px; }
+    section { break-inside: avoid; border: none; box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="container">
+    <h1>IISA: Indexing Indexer Selection Algorithm</h1>
+    <p class="subtitle">V1 Architecture and Scoring Design</p>
+    <p class="meta">The Graph &middot; DIPs Indexer Selection</p>
+  </div>
+</header>
+
+<!-- ================================================================== -->
+<!-- HOW IT WORKS -->
+<!-- ================================================================== -->
+<section>
+  <div class="section-label">Architecture</div>
+  <h2>How It Works</h2>
+  <p>
+    A scoring service replays 28 days of real gateway query traffic from Redpanda daily, combines
+    it with on-chain stake data from the Graph Network subgraph and pricing fetched directly from
+    each indexer's <code>/dips/info</code> endpoint, then computes a quality score per indexer and
+    writes the results to a shared volume. A separate HTTP service loads those pre-computed scores
+    and serves selection requests on demand -- selection is fast because all the heavy computation
+    happened in the background.
+  </p>
+  <div class="diagram">
+    <pre class="mermaid">
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '20px', 'primaryColor': '#eef2ff', 'primaryTextColor': '#1e2530', 'primaryBorderColor': '#3563e9', 'lineColor': '#64748b', 'secondaryColor': '#f8f9fc', 'tertiaryColor': '#f0f2f6', 'fontFamily': '-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif'}, 'flowchart': {'nodeSpacing': 40, 'rankSpacing': 70, 'curve': 'basis', 'padding': 20, 'useMaxWidth': false}}}%%
+
+flowchart LR
+    subgraph Scoring["Score Computation Service &lpar;daily&rpar;"]
+        direction TB
+        RP["Redpanda\n28-day replay"]
+        GS["Graph Network\nSubgraph"]
+        DI["Indexer\n/dips/info"]
+        PIPE["Scoring\nPipeline"]
+        RP --> PIPE
+        GS --> PIPE
+        DI --> PIPE
+    end
+
+    PIPE -->|"JSON on\nshared PVC"| PVC[("indexer_scores.json")]
+
+    subgraph Selection["HTTP Selection Service &lpar;on-demand&rpar;"]
+        API["POST\n/select-indexers"]
+    end
+
+    PVC --> API
+    DIPPER["dipper"] -->|"request"| API
+    API -->|"response"| DIPPER
+
+    style Scoring fill:#eef2ff,stroke:#3563e9,stroke-width:2px,color:#1e2530
+    style Selection fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#1e2530
+    style PVC fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#1e2530
+    style DIPPER fill:#f8f9fc,stroke:#64748b,stroke-width:2px,color:#1e2530
+    style RP fill:#fff,stroke:#3563e9,color:#1e2530
+    style GS fill:#fff,stroke:#3563e9,color:#1e2530
+    style DI fill:#fff,stroke:#3563e9,color:#1e2530
+    style PIPE fill:#3563e9,stroke:#1e3a8a,color:#fff
+    style API fill:#16a34a,stroke:#166534,color:#fff
+    </pre>
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<!-- SCORING AND NORMALISATION -->
+<!-- ================================================================== -->
+<section>
+  <div class="section-label">Core Logic</div>
+  <h2>Scoring and Normalisation</h2>
+  <p>
+    Each indexer is scored across six dimensions, normalised to [0, 1] where 1 is best,
+    then combined via weighted average. Missing metrics are excluded from both numerator
+    and denominator -- weights redistribute across available dimensions rather than
+    penalising indexers for missing data.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th style="width:200px">Weight</th>
+        <th>Direction</th>
+        <th>What It Captures</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>stake_to_fees</code></td>
+        <td><div class="weight-cell"><div class="weight-bar-track"><div class="weight-bar-fill" style="width:100%"></div></div><span class="weight-label">30%</span></div></td>
+        <td><span class="dir-badge up">Higher = better</span></td>
+        <td>Economic security and capacity headroom</td>
+      </tr>
+      <tr>
+        <td><code>base_price_per_epoch</code></td>
+        <td><div class="weight-cell"><div class="weight-bar-track"><div class="weight-bar-fill" style="width:83%"></div></div><span class="weight-label">25%</span></div></td>
+        <td><span class="dir-badge down">Lower = better</span></td>
+        <td>Cost efficiency (from /dips/info pricing)</td>
+      </tr>
+      <tr>
+        <td><code>lat_lin_reg_coefficient</code></td>
+        <td><div class="weight-cell"><div class="weight-bar-track"><div class="weight-bar-fill" style="width:67%"></div></div><span class="weight-label">20%</span></div></td>
+        <td><span class="dir-badge down">Lower = better</span></td>
+        <td>Latency after controlling for distance and deployment</td>
+      </tr>
+      <tr>
+        <td><code>uptime_score</code></td>
+        <td><div class="weight-cell"><div class="weight-bar-track"><div class="weight-bar-fill" style="width:50%"></div></div><span class="weight-label">15%</span></div></td>
+        <td><span class="dir-badge up">Higher = better</span></td>
+        <td>Availability over the 28-day window</td>
+      </tr>
+      <tr>
+        <td><code>success_rate</code></td>
+        <td><div class="weight-cell"><div class="weight-bar-track"><div class="weight-bar-fill" style="width:17%"></div></div><span class="weight-label">5%</span></div></td>
+        <td><span class="dir-badge up">Higher = better</span></td>
+        <td>Query success ratio</td>
+      </tr>
+      <tr>
+        <td><code>price_per_entity</code></td>
+        <td><div class="weight-cell"><div class="weight-bar-track"><div class="weight-bar-fill" style="width:17%"></div></div><span class="weight-label">5%</span></div></td>
+        <td><span class="dir-badge down">Lower = better</span></td>
+        <td>Per-entity pricing</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>How normalisation works</h3>
+
+  <div class="norm-grid">
+    <div class="norm-card">
+      <h4>Uptime and Success Rate</h4>
+      <p>
+        Piecewise linear scaling: indexers below 97% of the best performer's value score
+        <strong>zero</strong>. Only the top 3% band maps linearly from 0 to 1. Most indexers
+        cluster in the high 90s, so differentiation happens at the top -- 98.5% of best
+        scores 0.5, while 96% scores 0.
+      </p>
+    </div>
+    <div class="norm-card">
+      <h4>Price</h4>
+      <p>
+        Normalised as <code>1 - (price / ceiling)</code>.
+        When dipper provides a budget, that is the ceiling. Otherwise, ceiling falls back to
+        the observed max among surviving candidates (post hard-filter). Floor is always 0 GRT.
+        Indexers above budget are filtered out entirely before scoring.
+      </p>
+    </div>
+    <div class="norm-card">
+      <h4>Latency</h4>
+      <p>
+        Scored via linear regression controlling for distance, deployment, and query characteristics.
+        Uses an upper-bound confidence interval
+        (<code>coeff + 1.5 &times; SE</code>), so indexers with few samples or inconsistent
+        performance are scored conservatively.
+      </p>
+    </div>
+    <div class="norm-card">
+      <h4>Stake-to-Fees</h4>
+      <p>
+        <code>(staked - locked) / total_fees</code>. Indexers with zero query fees
+        normalise to 1.0 (maximum capacity headroom). Higher ratio means more economic
+        security per unit of fee revenue.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<!-- HOW IT SELECTS -->
+<!-- ================================================================== -->
+<section>
+  <div class="section-label">Selection</div>
+  <h2>How It Selects</h2>
+  <p>
+    When dipper sends a <code>POST /select-indexers</code> request with a deployment ID, target
+    group size, chain, and optional budget, the service first filters candidates by DIP availability,
+    chain support, and budget, then normalises metrics and computes weighted scores for the
+    surviving set.
+  </p>
+
+  <h3>Group assignment</h3>
+  <table>
+    <thead>
+      <tr><th>Condition</th><th>Action</th><th>Details</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Under-staffed</strong></td>
+        <td>Add indexers</td>
+        <td>Adds the highest-scoring eligible candidate. Repeats until target size reached.</td>
+      </tr>
+      <tr>
+        <td><strong>Over-staffed</strong></td>
+        <td>Remove worst</td>
+        <td>Removes the lowest-scoring indexer. Repeats until at target.</td>
+      </tr>
+      <tr>
+        <td><strong>At target</strong></td>
+        <td>Replace check</td>
+        <td>
+          Only indexers scoring below <code>0.15</code> are candidates for replacement.
+          A swap requires the candidate to score at least <code>0.50</code> higher -- preventing
+          churn from marginal improvements.
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Decentralisation</h3>
+  <p>
+    Groups of 2+ indexers prefer at least 2 unique ASN organisations and 2 unique geographic
+    locations. This is a soft constraint: the algorithm tries diversity-satisfying candidates
+    first, but falls back to the overall best scorer if the constraint can't be met.
+  </p>
+
+  <h3>Load spreading</h3>
+  <p>
+    When dipper passes expected fees from already-accepted agreements (<code>optimistic_dips_fees</code>),
+    these are added to fee totals before recomputing <code>stake_to_fees</code>. This naturally
+    deprioritises indexers that already have agreements, spreading load across the network.
+  </p>
+</section>
+
+<!-- ================================================================== -->
+<!-- RESILIENCE -->
+<!-- ================================================================== -->
+<section>
+  <div class="section-label">Operations</div>
+  <h2>Resilience</h2>
+  <p>The system degrades gracefully through three operating modes.</p>
+  <div class="mode-cards">
+    <div class="mode-card full">
+      <h4><span class="badge green">Full</span></h4>
+      <p>All data sources available. Complete pipeline with latency regression, GeoIP, and real pricing.</p>
+    </div>
+    <div class="mode-card partial">
+      <h4><span class="badge orange">Partial</span></h4>
+      <p>GeoIP unavailable. Latency set to neutral (0.5). Uptime, success rate, and stake-to-fees still from real data.</p>
+    </div>
+    <div class="mode-card degraded">
+      <h4><span class="badge red">Degraded</span></h4>
+      <p>Redpanda also unavailable. All quality metrics equal. Differentiation from real pricing only.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ================================================================== -->
+<!-- V1 DESIGN RATIONALE -->
+<!-- ================================================================== -->
+<section>
+  <div class="section-label">Philosophy</div>
+  <h2>V1 Design Rationale</h2>
+  <div class="rationale-grid">
+    <div class="rationale-card">
+      <h4>Orthogonal dimensions, configurable weights</h4>
+      <p>Six independent axes that can be tuned individually. Adding a new dimension means adding one column and one weight, not restructuring the algorithm.</p>
+    </div>
+    <div class="rationale-card">
+      <h4>Regression-based latency</h4>
+      <p>Controls for distance, deployment, and query effects instead of conflating fast-nearby indexers with slow ones. The confidence interval penalty handles cold-start conservatively.</p>
+    </div>
+    <div class="rationale-card">
+      <h4>Soft decentralisation</h4>
+      <p>Hard constraints make selection infeasible when the candidate pool is small. Prefer diversity, but never block a selection entirely. Tighten as the indexer population grows.</p>
+    </div>
+    <div class="rationale-card">
+      <h4>Conservative replacement</h4>
+      <p>A 0.50 score improvement threshold prioritises stability. Frequent churn disrupts service and forces indexers to repeatedly sync and accept agreements.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  IISA V1 &middot; The Graph &middot; DIPs Indexer Selection
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      fontSize: '20px',
+      fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif'
+    },
+    flowchart: {
+      useMaxWidth: false,
+      htmlLabels: true,
+      curve: 'basis',
+      nodeSpacing: 40,
+      rankSpacing: 70,
+      padding: 20
+    }
+  });
+</script>
+
+</body>
+</html>
