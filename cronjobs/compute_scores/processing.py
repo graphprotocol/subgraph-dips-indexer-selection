@@ -703,6 +703,15 @@ def diagnose_geoip_failure(combined_queries: pd.DataFrame) -> str:
     )
 
 
+def default_scoring_seed(start_date: date) -> int:
+    """Seed to use when the caller does not supply one: the window's start date as YYYYMMDD.
+
+    This mirrors the convention the Redpanda provider uses for its own row sampling, so a
+    run over a given window samples the same rows whether or not a seed was passed in.
+    """
+    return int(start_date.strftime("%Y%m%d"))
+
+
 def compute_all_scores(
     provider,
     start_date: date,
@@ -816,7 +825,10 @@ def compute_all_scores(
                 "or the filter thresholds are too strict for the current dataset."
             )
 
-        rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+        if seed is None:
+            seed = default_scoring_seed(start_date)
+            logger.info("No scoring seed supplied; using %d derived from the start date", seed)
+        rng = np.random.default_rng(seed)
         filtered_data, integer_root = strategic_sample(
             filtered_data, target_rows_per_subgraph, rng=rng
         )
