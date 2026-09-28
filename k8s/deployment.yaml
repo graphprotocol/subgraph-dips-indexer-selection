@@ -24,7 +24,7 @@ spec:
         - name: github-registry-secret
       containers:
         - name: iisa
-          image: ghcr.io/edgeandnode/subgraph-dips-indexer-selection:v2.9.3 # x-release-please-version
+          image: ghcr.io/edgeandnode/subgraph-dips-indexer-selection:v2.9.4 # x-release-please-version
           ports:
             - name: http
               containerPort: 8080
