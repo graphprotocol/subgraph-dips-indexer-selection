@@ -42,10 +42,12 @@ jobs:
       - name: Generate image tags
         id: tags
         run: |
-          SHA_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
-          echo "sha_short=$SHA_SHORT" >> $GITHUB_OUTPUT
-          echo "sha_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$SHA_SHORT" >> $GITHUB_OUTPUT
-          echo "latest_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          {
+            echo "sha_short=$SHA_SHORT"
+            echo "sha_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$SHA_SHORT"
+            echo "latest_tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -103,11 +105,13 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## Docker Image Rebuilt" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ steps.tags.outputs.latest_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **SHA tag**: \`${{ steps.tags.outputs.sha_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **GeoLite2-City**: location lookups" >> $GITHUB_STEP_SUMMARY
-          echo "- **GeoLite2-ASN**: organization lookups" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Docker Image Rebuilt"
+            echo ""
+            echo "- **Image**: \`${{ steps.tags.outputs.latest_tag }}\`"
+            echo "- **SHA tag**: \`${{ steps.tags.outputs.sha_tag }}\`"
+            echo "- **GeoLite2-City**: location lookups"
+            echo "- **GeoLite2-ASN**: organization lookups"
+            echo ""
+            echo "This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com"
+          } >> "$GITHUB_STEP_SUMMARY"
