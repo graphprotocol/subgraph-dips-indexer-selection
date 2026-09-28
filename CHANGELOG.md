@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.9.4](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.3...v2.9.4) (2026-09-28)
+
+
+### Fixed
+
+* deploy new scoring cronjob images again ([#244](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/244)) ([052c62a](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/052c62a70fd30d59c38fe2a90db4188bcc802dfd))
+* **deps:** upgrade anyio past its 2 known vulnerabilities ([#245](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/245)) ([e412a4b](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/e412a4b95b080a42cc36c68f02c2fbc960f2cf39))
+* **processing:** seed the query sampler when no seed is given ([#236](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/236)) ([d8aa30b](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/d8aa30bec10079c1d6a3f07603a6344c527a0b1d))
+
+
+### Changed
+
+* **deps:** bump google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml ([#232](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/232)) ([12d6238](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/12d6238e88d982bafc8ffd9672ebac3bebfe5e64))
+* **k8s:** update cronjob image to sha-052c62a ([#246](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/246)) ([5afe042](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/5afe0428b8b440592e756e1ea966bc2aa5b01062))
+* **processing:** drop the redundant invalid-UTF-8 catch ([#238](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/238)) ([891044b](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/891044bc2061759e686757d2c3d4b0c3ab0ae9ec))
+* **processing:** drop the unused regression results variable ([#235](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/235)) ([94cc4dd](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/94cc4dd47ba96c5d9fd22ae6b9c5a9dc033422fa))
+* **processing:** name the latency coefficient column once ([#234](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/234)) ([b8538ee](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/b8538ee5acab8010384fe12a30e29155324525e5))
+* **processing:** name the standard error column once ([#233](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/233)) ([6ab6241](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/6ab6241bdc94dbb7ac827714ada8596a15988df3))
+* **processing:** split score orchestration into named stages ([#237](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/237)) ([735e763](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/735e763ae499f84481feb304ad0bd8db6dd69915))
+* **processing:** split the graph-node version fetch into steps ([#239](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/239)) ([ed653fa](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ed653faf3ddaddac8a583763c24bb5e4f0c93921))
+* split the iisa retry loop into steps ([#241](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/241)) ([0566da5](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/0566da5ac0a8e640a958530abf6ad0c38b67ff8b))
+* split the scoring run into named stages ([#240](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/240)) ([114807e](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/114807edfeb491140fa3ead4e6a24d675e55c97e))
+
 ## [2.9.3](https://github.com/edgeandnode/subgraph-dips-indexer-selection/compare/v2.9.2...v2.9.3) (2026-08-11)
 
 
