@@ -71,6 +71,12 @@ jobs:
           BRANCH_NAME="chore/update-cronjob-image-${{ steps.tags.outputs.sha_short }}"
           sed -i 's|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: ${{ steps.tags.outputs.sha_tag }}|' k8s/score-computation-cronjob.yaml
 
+          # sed succeeds even when nothing matches, so confirm the new tag was actually written
+          if ! grep -qF "image: ${{ steps.tags.outputs.sha_tag }}" k8s/score-computation-cronjob.yaml; then
+            echo "::error::k8s/score-computation-cronjob.yaml has no image under ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}, so the new tag could not be written"
+            exit 1
+          fi
+
           # Check if there are actual changes
           if git diff --quiet k8s/score-computation-cronjob.yaml; then
             echo "No changes to k8s yaml, skipping PR creation"
