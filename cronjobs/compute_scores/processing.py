@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 # Constants
 LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER = 1.5
+# Column name the latency regression uses for each coefficient's standard error.
+STANDARD_ERROR_COLUMN = "Standard Error"
 REQUEST_STATUS_OK = "200 OK"
 REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK = "Unavailable(MissingBlock)"
 
@@ -838,7 +840,7 @@ def compute_all_scores(
             {
                 "indexer": unique_indexers,
                 "Latency Coefficient": 0.0,
-                "Standard Error": 0.0,
+                STANDARD_ERROR_COLUMN: 0.0,
                 "p-value": 1.0,
                 "Latency Coefficient + Error Confidence Interval": 0.0,
             }
@@ -914,7 +916,7 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
 
     # Latency metrics
     scores["lat_lin_reg_coefficient"] = merged.get("Latency Coefficient")
-    scores["lat_coefficient_std_error"] = merged.get("Standard Error")
+    scores["lat_coefficient_std_error"] = merged.get(STANDARD_ERROR_COLUMN)
     scores["lat_coefficient_upper_bound"] = merged.get(
         "Latency Coefficient + Error Confidence Interval"
     )
@@ -1352,7 +1354,7 @@ def perform_latency_linear_regression(
         {
             "Variable": feature_names,
             "Latency Coefficient": coefficients,
-            "Standard Error": std_errors,
+            STANDARD_ERROR_COLUMN: std_errors,
             "p-value": p_values,
         }
     )
@@ -1367,12 +1369,12 @@ def perform_latency_linear_regression(
     indexer_rankings["Variable"] = indexer_rankings["Variable"].str.replace("one_hot__indexer_", "")
     indexer_rankings.rename(columns={"Variable": "indexer"}, inplace=True)
     indexer_rankings.dropna(
-        subset=["Latency Coefficient", "Standard Error", "p-value"], inplace=True
+        subset=["Latency Coefficient", STANDARD_ERROR_COLUMN, "p-value"], inplace=True
     )
 
     indexer_rankings["Latency Coefficient + Error Confidence Interval"] = (
         indexer_rankings["Latency Coefficient"]
-        + LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER * indexer_rankings["Standard Error"]
+        + LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER * indexer_rankings[STANDARD_ERROR_COLUMN]
     )
 
     return indexer_rankings, results_df
@@ -1521,7 +1523,7 @@ def merge_and_prepare_dataframes(
     merged = merged.drop(columns=[c for c in columns_to_drop if c in merged.columns])
 
     if drop_missing_latency:
-        columns_to_check = ["Latency Coefficient", "Standard Error", "p-value"]
+        columns_to_check = ["Latency Coefficient", STANDARD_ERROR_COLUMN, "p-value"]
         existing = [c for c in columns_to_check if c in merged.columns]
         if existing:
             merged = merged.dropna(subset=existing)
