@@ -712,6 +712,155 @@ def default_scoring_seed(start_date: date) -> int:
     return int(start_date.strftime("%Y%m%d"))
 
 
+def _resolve_geoip_or_demote(combined_queries: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """Merge indexer and query geolocation into the queries; return (queries, geoip_available).
+
+    When no indexer resolved to a public location (the normal local-network / Docker case,
+    where every indexer sits on a bridge-network IP) the queries are returned untouched with
+    geoip_available=False so the caller takes the partial path instead of a distance
+    pipeline that would throw anyway.
+    """
+    indexers_df = resolve_indexer_geoip(combined_queries)
+
+    if indexers_df["dst_lat"].notna().sum() == 0:
+        combined_queries_with_indexers = merge_in_indexers_info(combined_queries, indexers_df)
+        logger.warning(
+            "GeoIP resolution succeeded for 0/%d indexers; demoting to "
+            "partial mode (latency scores neutral, all other metrics "
+            "from real query data).%s",
+            len(indexers_df),
+            diagnose_geoip_failure(combined_queries_with_indexers),
+        )
+        return combined_queries, False
+
+    combined_queries = merge_in_indexers_info(combined_queries, indexers_df)
+    return merge_in_query_geolocation_info(combined_queries), True
+
+
+def _add_neutral_geo_columns(combined_queries: pd.DataFrame) -> None:
+    """Add the columns GeoIP resolution would have produced, as NaN, so later steps find them."""
+    for col in ["dst_lat", "dst_lon", "dst_country", "org", "ip_addr"]:
+        combined_queries[col] = np.nan
+    combined_queries["indexer_network"] = "arbitrum"
+    # Source geo columns from merge_in_query_geolocation_info
+    combined_queries["IATA_code"] = combined_queries["query_id"].str[-3:]
+    for col in ["src_lat", "src_lon", "src_country"]:
+        combined_queries[col] = np.nan
+
+
+def _fit_latency_rankings(
+    combined_queries: pd.DataFrame,
+    target_rows_per_subgraph: int,
+    start_date: date,
+    seed: Optional[int],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Full path: distances, filtering, sampling and the latency regression.
+
+    Returns (latency_rankings, indexer_query_count). Raises RuntimeError when the data thins
+    out to nothing at any stage, since a regression on an empty frame would be meaningless.
+    """
+    combined_queries = calculate_distances(combined_queries)
+
+    logger.info(f"Before filter_successful_queries: {len(combined_queries)} rows")
+    dst_lat_nan_count = combined_queries["dst_lat"].isna().sum()
+    src_lat_nan_count = combined_queries["src_lat"].isna().sum()
+    logger.info(f"  src_lat NaN: {src_lat_nan_count}, dst_lat NaN: {dst_lat_nan_count}")
+
+    if dst_lat_nan_count == len(combined_queries):
+        raise RuntimeError(
+            "All dst_lat values are NaN - GeoIP resolution failed for all indexers."
+            + diagnose_geoip_failure(combined_queries)
+        )
+
+    combined_queries_filtered = filter_successful_queries(combined_queries)
+    logger.info(f"After filter_successful_queries: {len(combined_queries_filtered)} rows")
+
+    predictor = ["response_time_ms"]
+    categorical = ["indexer", "deployment_hash", "indexer_network", "query_id"]
+    numeric = ["distance_miles", "fee"]
+
+    filtered_data = combined_queries_filtered[predictor + categorical + numeric]
+    logger.info(f"After column selection: {len(filtered_data)} rows")
+    dist_nan = filtered_data["distance_miles"].isna().sum()
+    fee_nan = filtered_data["fee"].isna().sum()
+    logger.info(f"  NaN counts - distance_miles: {dist_nan}, fee: {fee_nan}")
+    filtered_data = filtered_data.dropna(subset=numeric)
+    logger.info(f"After dropna(numeric): {len(filtered_data)} rows")
+
+    if len(filtered_data) == 0:
+        raise RuntimeError(
+            "No rows remain after dropping NaN values in numeric "
+            "columns (distance_miles, fee). This typically means "
+            "GeoIP resolution failed (all distances are NaN) or "
+            "there's a data quality issue with the source tables."
+        )
+
+    filtered_data = iterative_filter(
+        filtered_data,
+        ITERATIVE_FILTER_MIN_DEPLOYMENT_INDEXERS,
+        ITERATIVE_FILTER_MIN_DEPLOYMENTS_PER_INDEXER,
+        ITERATIVE_FILTER_MIN_QUERIES_PER_INDEXER,
+        ITERATIVE_FILTER_MIN_QUERIES_PER_DEPLOYMENT,
+    )
+
+    if len(filtered_data) == 0:
+        raise RuntimeError(
+            "No rows remain after iterative filtering. Either the data volume is too low "
+            "or the filter thresholds are too strict for the current dataset."
+        )
+
+    if seed is None:
+        seed = default_scoring_seed(start_date)
+        logger.info("No scoring seed supplied; using %d derived from the start date", seed)
+    rng = np.random.default_rng(seed)
+    filtered_data, integer_root = strategic_sample(filtered_data, target_rows_per_subgraph, rng=rng)
+    filtered_data = hash_sampled_queries(filtered_data, integer_root)
+
+    categorical = [
+        "indexer",
+        "deployment_hash",
+        "indexer_network",
+        "sampled_query_id_hashed_mod_integer_root",
+    ]
+
+    latency_rankings, _ = perform_latency_linear_regression(
+        filtered_data, predictor, categorical, numeric
+    )
+    indexer_query_count = filtered_data.groupby("indexer").size().reset_index(name="query_count")
+    return latency_rankings, indexer_query_count
+
+
+def _neutral_latency_rankings(combined_queries: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Partial path: a neutral latency row per indexer and a 0 query count for each."""
+    unique_indexers = combined_queries["indexer"].unique()
+    latency_rankings = pd.DataFrame(
+        {
+            "indexer": unique_indexers,
+            LATENCY_COEFFICIENT_COLUMN: 0.0,
+            STANDARD_ERROR_COLUMN: 0.0,
+            "p-value": 1.0,
+            "Latency Coefficient + Error Confidence Interval": 0.0,
+        }
+    )
+    indexer_query_count = pd.DataFrame({"indexer": unique_indexers, "query_count": 0})
+    return latency_rankings, indexer_query_count
+
+
+def _attach_dips_info(merged: pd.DataFrame, indexer_urls: Dict[str, str]) -> pd.DataFrame:
+    """Merge each indexer's DIP pricing into the scores, or fill the columns with no-data values."""
+    if indexer_urls:
+        dips_info_df = fetch_dips_info(indexer_urls)
+        merged = pd.merge(merged, dips_info_df, on="indexer", how="left")
+        merged["dips_info_available"] = merged["dips_info_available"].fillna(False)
+        return merged
+
+    merged["dips_info_available"] = False
+    merged["dips_min_grt_per_30_days"] = "{}"
+    merged["dips_min_grt_per_billion_entities_per_30_days"] = None
+    merged["dips_supported_networks"] = "[]"
+    return merged
+
+
 def compute_all_scores(
     provider,
     start_date: date,
@@ -736,135 +885,24 @@ def compute_all_scores(
     )
 
     if geoip_available:
-        # Full path: resolve GeoIP and merge into queries
-        indexers_df = resolve_indexer_geoip(combined_queries)
-
-        # Demote to partial when no indexer resolved publicly: this is the
-        # normal local-network / Docker case (bridge-network IPs). Catching
-        # it here skips the distance + filter pipeline that would throw anyway.
-        if indexers_df["dst_lat"].notna().sum() == 0:
-            combined_queries_with_indexers = merge_in_indexers_info(combined_queries, indexers_df)
-            logger.warning(
-                "GeoIP resolution succeeded for 0/%d indexers; demoting to "
-                "partial mode (latency scores neutral, all other metrics "
-                "from real query data).%s",
-                len(indexers_df),
-                diagnose_geoip_failure(combined_queries_with_indexers),
-            )
-            geoip_available = False
-        else:
-            combined_queries = merge_in_indexers_info(combined_queries, indexers_df)
-            combined_queries = merge_in_query_geolocation_info(combined_queries)
+        combined_queries, geoip_available = _resolve_geoip_or_demote(combined_queries)
 
     if not geoip_available:
-        # No GeoIP (configured off, or demoted from full mode above): add
-        # expected columns as NaN so downstream functions don't crash.
+        # No GeoIP (configured off, or demoted from full mode above)
         logger.warning(
             "GeoIP unavailable, skipping geo resolution. Latency scores will be neutral."
         )
-        for col in ["dst_lat", "dst_lon", "dst_country", "org", "ip_addr"]:
-            combined_queries[col] = np.nan
-        combined_queries["indexer_network"] = "arbitrum"
-        # Source geo columns from merge_in_query_geolocation_info
-        combined_queries["IATA_code"] = combined_queries["query_id"].str[-3:]
-        for col in ["src_lat", "src_lon", "src_country"]:
-            combined_queries[col] = np.nan
+        _add_neutral_geo_columns(combined_queries)
 
     # Save data for uptime calculations before filtering
     data_for_uptime = combined_queries[["indexer", "status", "timestamp"]].copy()
 
     if geoip_available:
-        # Full path: distance calculation, regression, fail-fast checks
-        combined_queries = calculate_distances(combined_queries)
-
-        logger.info(f"Before filter_successful_queries: {len(combined_queries)} rows")
-        dst_lat_nan_count = combined_queries["dst_lat"].isna().sum()
-        src_lat_nan_count = combined_queries["src_lat"].isna().sum()
-        logger.info(f"  src_lat NaN: {src_lat_nan_count}, dst_lat NaN: {dst_lat_nan_count}")
-
-        if dst_lat_nan_count == len(combined_queries):
-            raise RuntimeError(
-                "All dst_lat values are NaN - GeoIP resolution failed for all indexers."
-                + diagnose_geoip_failure(combined_queries)
-            )
-
-        combined_queries_filtered = filter_successful_queries(combined_queries)
-        logger.info(f"After filter_successful_queries: {len(combined_queries_filtered)} rows")
-
-        predictor = ["response_time_ms"]
-        categorical = ["indexer", "deployment_hash", "indexer_network", "query_id"]
-        numeric = ["distance_miles", "fee"]
-
-        filtered_data = combined_queries_filtered[predictor + categorical + numeric]
-        logger.info(f"After column selection: {len(filtered_data)} rows")
-        dist_nan = filtered_data["distance_miles"].isna().sum()
-        fee_nan = filtered_data["fee"].isna().sum()
-        logger.info(f"  NaN counts - distance_miles: {dist_nan}, fee: {fee_nan}")
-        filtered_data = filtered_data.dropna(subset=numeric)
-        logger.info(f"After dropna(numeric): {len(filtered_data)} rows")
-
-        if len(filtered_data) == 0:
-            raise RuntimeError(
-                "No rows remain after dropping NaN values in numeric "
-                "columns (distance_miles, fee). This typically means "
-                "GeoIP resolution failed (all distances are NaN) or "
-                "there's a data quality issue with the source tables."
-            )
-
-        filtered_data = iterative_filter(
-            filtered_data,
-            ITERATIVE_FILTER_MIN_DEPLOYMENT_INDEXERS,
-            ITERATIVE_FILTER_MIN_DEPLOYMENTS_PER_INDEXER,
-            ITERATIVE_FILTER_MIN_QUERIES_PER_INDEXER,
-            ITERATIVE_FILTER_MIN_QUERIES_PER_DEPLOYMENT,
-        )
-
-        if len(filtered_data) == 0:
-            raise RuntimeError(
-                "No rows remain after iterative filtering. Either the data volume is too low "
-                "or the filter thresholds are too strict for the current dataset."
-            )
-
-        if seed is None:
-            seed = default_scoring_seed(start_date)
-            logger.info("No scoring seed supplied; using %d derived from the start date", seed)
-        rng = np.random.default_rng(seed)
-        filtered_data, integer_root = strategic_sample(
-            filtered_data, target_rows_per_subgraph, rng=rng
-        )
-        filtered_data = hash_sampled_queries(filtered_data, integer_root)
-
-        categorical = [
-            "indexer",
-            "deployment_hash",
-            "indexer_network",
-            "sampled_query_id_hashed_mod_integer_root",
-        ]
-
-        latency_rankings, _ = perform_latency_linear_regression(
-            filtered_data, predictor, categorical, numeric
-        )
-        indexer_query_count = (
-            filtered_data.groupby("indexer").size().reset_index(name="query_count")
+        latency_rankings, indexer_query_count = _fit_latency_rankings(
+            combined_queries, target_rows_per_subgraph, start_date, seed
         )
     else:
-        # No GeoIP: synthetic neutral latency rankings for all indexers
-        unique_indexers = combined_queries["indexer"].unique()
-        latency_rankings = pd.DataFrame(
-            {
-                "indexer": unique_indexers,
-                LATENCY_COEFFICIENT_COLUMN: 0.0,
-                STANDARD_ERROR_COLUMN: 0.0,
-                "p-value": 1.0,
-                "Latency Coefficient + Error Confidence Interval": 0.0,
-            }
-        )
-        indexer_query_count = pd.DataFrame(
-            {
-                "indexer": unique_indexers,
-                "query_count": 0,
-            }
-        )
+        latency_rankings, indexer_query_count = _neutral_latency_rankings(combined_queries)
 
     # GeoIP-independent metrics: always computed from real Redpanda data
     indexer_success_rate = calculate_indexer_success_rate(combined_queries)
@@ -889,15 +927,7 @@ def compute_all_scores(
     # the network subgraph (Redpanda only has indexers the gateway has queried,
     # so newly registered ones would be invisible without this lookup).
     indexer_urls = discover_indexers_from_network_subgraph(provider.graph_network_url)
-    if indexer_urls:
-        dips_info_df = fetch_dips_info(indexer_urls)
-        merged = pd.merge(merged, dips_info_df, on="indexer", how="left")
-        merged["dips_info_available"] = merged["dips_info_available"].fillna(False)
-    else:
-        merged["dips_info_available"] = False
-        merged["dips_min_grt_per_30_days"] = "{}"
-        merged["dips_min_grt_per_billion_entities_per_30_days"] = None
-        merged["dips_supported_networks"] = "[]"
+    merged = _attach_dips_info(merged, indexer_urls)
 
     # Attach graph-node versions and drop indexers below the configured
     # minimum (no-op when MIN_GRAPH_NODE_VERSION is unset).
