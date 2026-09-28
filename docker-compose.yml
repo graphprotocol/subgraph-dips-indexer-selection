@@ -1,6 +1,6 @@
 services:
   iisa:
-    image: ghcr.io/edgeandnode/subgraph-dips-indexer-selection:${IISA_TAG:-local}
+    image: ghcr.io/graphprotocol/subgraph-dips-indexer-selection:${IISA_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile
