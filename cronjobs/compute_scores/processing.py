@@ -420,12 +420,12 @@ async def _fetch_single_graph_node_version_async(
             aiohttp.ClientError,
             asyncio.TimeoutError,
             ValueError,
-            UnicodeDecodeError,
             AttributeError,
         ) as e:
             # Catch tuple deliberately broad: a single misbehaving indexer
-            # returning HTML / invalid UTF-8 / a malformed shape would
-            # otherwise propagate through gather() and crash the whole run.
+            # returning HTML / invalid UTF-8 (a ValueError subclass) / a
+            # malformed shape would otherwise propagate through gather()
+            # and crash the whole run.
             last_error = e
             # 4xx is deterministic: the endpoint either doesn't exist or
             # rejects the query and won't change shape on retry. Skip the
