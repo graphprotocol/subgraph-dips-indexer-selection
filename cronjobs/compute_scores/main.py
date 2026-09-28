@@ -12,7 +12,9 @@ import resource
 import sys
 import time
 from datetime import date, timedelta
+from typing import Optional
 
+import pandas as pd
 from iisa_client import IISAPushError, get_push_token
 from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
 from redpanda import RedpandaProvider
@@ -76,6 +78,94 @@ def get_peak_memory_mb() -> float:
     return usage / 1024
 
 
+def _mode_from_scores(scores_df: pd.DataFrame, geoip_available: bool) -> str:
+    """Read the mode the pipeline actually ran in from its output.
+
+    compute_all_scores may demote internally to partial when every GeoIP lookup failed,
+    so the summary must reflect what was published, not what was requested.
+    """
+    if "scoring_mode" not in scores_df.columns:
+        return MODE_FULL if geoip_available else MODE_PARTIAL
+    actual = scores_df["scoring_mode"].iloc[0]
+    return MODE_PARTIAL if actual == "partial_no_geoip" else MODE_FULL
+
+
+def _run_full_pipeline(
+    provider: RedpandaProvider, geoip_available: bool, seed: int
+) -> tuple[Optional[pd.DataFrame], str]:
+    """Run compute_all_scores over the last NUM_DAYS; return (scores, mode).
+
+    Returns (None, MODE_FAILED) when the pipeline raises or produces no rows, so the
+    caller can fall back to degraded scoring. compute_all_scores handles both the full
+    and the partial (no GeoIP) modes itself.
+    """
+    end_date = date.today()
+    start_date = end_date - timedelta(days=NUM_DAYS)
+    start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    mode_label = "full" if geoip_available else "partial (no GeoIP)"
+    logger.info("Attempting %s pipeline for %s to %s", mode_label, start_date, end_date)
+    try:
+        scores_df = compute_all_scores(
+            provider=provider,
+            start_date=start_date,
+            start_ts=start_ts,
+            num_days=NUM_DAYS,
+            target_rows=TARGET_ROWS,
+            geoip_available=geoip_available,
+            seed=seed,
+        )
+        if scores_df.empty:
+            logger.warning("Pipeline returned empty results")
+            return None, MODE_FAILED
+        return scores_df, _mode_from_scores(scores_df, geoip_available)
+    except Exception as e:
+        logger.warning("Pipeline failed: %s", e)
+        return None, MODE_FAILED
+
+
+def _run_degraded_pipeline() -> tuple[Optional[pd.DataFrame], str]:
+    """Fallback scoring: equal quality metrics plus real pricing, no Redpanda data needed."""
+    logger.info("Running degraded scoring (equal quality + real pricing)")
+    try:
+        scores_df = compute_degraded_scores(GRAPH_NETWORK_SUBGRAPH_URL)
+    except Exception as e:
+        logger.exception("Degraded scoring also failed: %s", e)
+        return None, MODE_FAILED
+
+    if scores_df is None or scores_df.empty:
+        return None, MODE_FAILED
+    return scores_df, MODE_DEGRADED
+
+
+def _push_scores(provider: RedpandaProvider, scores_df: pd.DataFrame) -> bool:
+    """Push the scores to iisa; return False instead of raising when the push fails.
+
+    A push failure (auth, validation, or retry exhaustion) must not escape run accounting:
+    the caller marks the run failed and exits non-zero so the CronJob's
+    failedJobsHistoryLimit captures it.
+    """
+    try:
+        provider.write_scores(scores_df)
+    except IISAPushError as e:
+        logger.error("Failed to push scores to iisa: %s", e)
+        return False
+    return True
+
+
+def _warn_about_mode(mode: str) -> None:
+    """Tell operators when a run published anything less than full scores."""
+    if mode == MODE_PARTIAL:
+        logger.warning(
+            "Scoring ran without GeoIP — latency scores are neutral (0.5). "
+            "Install MaxMind GeoLite2 databases for full scoring."
+        )
+    elif mode == MODE_DEGRADED:
+        logger.warning("Scoring degraded — full pipeline unavailable, pushed real pricing only.")
+    elif mode == MODE_FAILED:
+        logger.error("Scoring failed")
+
+
 def run_scoring() -> bool:
     """Run one scoring cycle. Returns True on success."""
     pipeline_start = time.time()
@@ -92,78 +182,19 @@ def run_scoring() -> bool:
         logger.warning("GeoIP databases unavailable, latency scores will be neutral")
 
     provider = RedpandaProvider()
-    scores_df = None
-    mode = MODE_FAILED
 
-    # Always attempt compute_all_scores — it handles both full and partial (no GeoIP) modes
-    try:
-        end_date = date.today()
-        start_date = end_date - timedelta(days=NUM_DAYS)
-        start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        mode_label = "full" if geoip_available else "partial (no GeoIP)"
-        logger.info("Attempting %s pipeline for %s to %s", mode_label, start_date, end_date)
-        scores_df = compute_all_scores(
-            provider=provider,
-            start_date=start_date,
-            start_ts=start_ts,
-            num_days=NUM_DAYS,
-            target_rows=TARGET_ROWS,
-            geoip_available=geoip_available,
-            seed=seed,
-        )
-        if scores_df.empty:
-            logger.warning("Pipeline returned empty results")
-            scores_df = None
-        else:
-            # compute_all_scores may demote internally to partial when every
-            # GeoIP lookup failed; read the actual mode from the result so
-            # the summary reflects what was published, not what was requested.
-            if "scoring_mode" in scores_df.columns:
-                actual = scores_df["scoring_mode"].iloc[0]
-                mode = MODE_PARTIAL if actual == "partial_no_geoip" else MODE_FULL
-            else:
-                mode = MODE_FULL if geoip_available else MODE_PARTIAL
-    except Exception as e:
-        logger.warning("Pipeline failed: %s", e)
-        scores_df = None
-
-    # Degraded fallback: equal quality metrics + real pricing (no Redpanda data needed)
+    scores_df, mode = _run_full_pipeline(provider, geoip_available, seed)
     if scores_df is None:
-        logger.info("Running degraded scoring (equal quality + real pricing)")
-        try:
-            scores_df = compute_degraded_scores(GRAPH_NETWORK_SUBGRAPH_URL)
-            if scores_df is not None and not scores_df.empty:
-                mode = MODE_DEGRADED
-            else:
-                scores_df = None
-        except Exception as e:
-            logger.exception("Degraded scoring also failed: %s", e)
-            scores_df = None
+        scores_df, mode = _run_degraded_pipeline()
 
     elapsed = time.time() - pipeline_start
-    success = scores_df is not None and not scores_df.empty
+    success = scores_df is not None
 
-    if scores_df is not None and not scores_df.empty:
-        try:
-            provider.write_scores(scores_df)
-        except IISAPushError as e:
-            # Push failure (auth, validation, or retry exhaustion) must not
-            # escape run accounting. Mark the run failed and let the caller
-            # exit non-zero so the CronJob's failedJobsHistoryLimit captures it.
-            logger.error("Failed to push scores to iisa: %s", e)
-            success = False
-            mode = MODE_FAILED
+    if scores_df is not None and not _push_scores(provider, scores_df):
+        success = False
+        mode = MODE_FAILED
 
-    if mode == MODE_PARTIAL:
-        logger.warning(
-            "Scoring ran without GeoIP — latency scores are neutral (0.5). "
-            "Install MaxMind GeoLite2 databases for full scoring."
-        )
-    elif mode == MODE_DEGRADED:
-        logger.warning("Scoring degraded — full pipeline unavailable, pushed real pricing only.")
-    elif mode == MODE_FAILED:
-        logger.error("Scoring failed")
+    _warn_about_mode(mode)
 
     logger.info(
         "Scoring complete: mode=%s, indexers=%d, elapsed=%.1fs, peak_memory=%.0fMB",
