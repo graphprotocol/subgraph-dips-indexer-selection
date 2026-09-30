@@ -36,4 +36,4 @@ packaging>=21.0,<26.0
 
 # Transitive pins to keep the vulnerability scanner happy.
 idna>=3.15
-urllib3>=2.7.0
+urllib3>=2.8.0
