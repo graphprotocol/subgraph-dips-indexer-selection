@@ -1115,19 +1115,15 @@ def _build_selected_indexers(
     return results
 
 
-def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
-    """Run IndexerSelector and return a SelectionResponse for the deployment.
+def _price_filtered_candidates(
+    history: pd.DataFrame, request: SelectionRequest
+) -> Optional[pd.DataFrame]:
+    """Apply the request's price constraints to ``history`` before scoring.
 
-    The selector weights stake-to-fees, base price, latency, uptime,
-    success rate, and price-per-entity; lower is better for prices and
-    latency, higher for the rest.
+    Returns None, after logging why, when no candidate survives the filter.
     """
-    if _state.history is None:
-        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
-
-    # Filter by price constraints before scoring
     filtered_history, filter_reason = _filter_by_price(
-        _state.history,
+        history,
         request.chain_id,
         request.max_grt_per_30_days,
     )
@@ -1144,18 +1140,37 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
                 "No indexers available for deployment %s (unknown reason)",
                 request.deployment_id,
             )
-        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+        return None
 
     logger.info(
         "deployment=%s proceeding with %d candidates after price filtering (from %d total)",
         request.deployment_id,
         len(filtered_history),
-        len(_state.history) if _state.history is not None else 0,
+        len(history),
     )
+    return filtered_history
 
-    # Enrich with chain-specific price columns for normalization
-    enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
 
+def _synced_indexers_for(deployment_id: str) -> set[str]:
+    """Look up which indexers are already synced for this deployment."""
+    synced_indexers: set[str] = set()
+    if _state.sync_status is not None:
+        synced_indexers = _state.sync_status.synced_indexers_for(deployment_id)
+        if synced_indexers:
+            logger.info(
+                "deployment=%s %d synced indexers available",
+                deployment_id,
+                len(synced_indexers),
+            )
+    return synced_indexers
+
+
+def _build_selector(
+    request: SelectionRequest,
+    enriched_history: pd.DataFrame,
+    synced_indexers: set[str],
+) -> IndexerSelector:
+    """Construct the IndexerSelector for this request; it selects on construction."""
     # Build existing_agreements dict from request
     existing_agreements: dict[str, list[str]] = {}
     if request.existing_indexers:
@@ -1164,18 +1179,7 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     # Build pending_agreements dict - convert to expected format
     pending_agreements: dict[str, list[str]] = request.pending_agreements or {}
 
-    # Look up which indexers are already synced for this deployment
-    synced_indexers: set[str] = set()
-    if _state.sync_status is not None:
-        synced_indexers = _state.sync_status.synced_indexers_for(request.deployment_id)
-        if synced_indexers:
-            logger.info(
-                "deployment=%s %d synced indexers available",
-                request.deployment_id,
-                len(synced_indexers),
-            )
-
-    processor = IndexerSelector(
+    return IndexerSelector(
         history=enriched_history,
         deployment_id=cast(IpfsHashStr, request.deployment_id),
         existing_agreements=cast(dict[IpfsHashStr, list[EthAddressStr]], existing_agreements),
@@ -1191,55 +1195,79 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
         synced_indexers=cast(set[EthAddressStr], synced_indexers),
     )
 
-    # Log selection reasoning for auditability
-    if processor.data is not None and not processor.data.empty and processor.current_group:
-        scored = processor.data[processor.data["indexer"].isin(processor.current_group)]
-        # The weight key for each metric is its normalised column name without the
-        # "norm_" prefix, which matches the keys in processor.weights / DEFAULT_WEIGHTS.
-        component_cols = [
-            ("norm_stake_to_fees", "stake_to_fees"),
-            ("norm_base_price_per_epoch", "base_price"),
-            ("norm_lat_lin_reg_coefficient", "latency"),
-            ("norm_uptime_score", "uptime"),
-            ("norm_success_rate", "success_rate"),
-            ("norm_price_per_entity", "price_per_entity"),
+
+def _log_selection_reasoning(processor: IndexerSelector, deployment_id: str) -> None:
+    """Log each selected indexer's score breakdown for auditability."""
+    if processor.data is None or processor.data.empty or not processor.current_group:
+        return
+
+    scored = processor.data[processor.data["indexer"].isin(processor.current_group)]
+    # The weight key for each metric is its normalised column name without the
+    # "norm_" prefix, which matches the keys in processor.weights / DEFAULT_WEIGHTS.
+    component_cols = [
+        ("norm_stake_to_fees", "stake_to_fees"),
+        ("norm_base_price_per_epoch", "base_price"),
+        ("norm_lat_lin_reg_coefficient", "latency"),
+        ("norm_uptime_score", "uptime"),
+        ("norm_success_rate", "success_rate"),
+        ("norm_price_per_entity", "price_per_entity"),
+    ]
+    for _, row in scored.iterrows():
+        # Each present metric, paired with its normalised value and its active
+        # weight. The weight key is the column name without the "norm_" prefix.
+        present = [
+            (label, float(row[col]), float(cast(float, processor.weights[col[len("norm_") :]])))
+            for col, label in component_cols
+            if col in row.index and pd.notna(row[col]) and col[len("norm_") :] in processor.weights
         ]
-        for _, row in scored.iterrows():
-            # Each present metric, paired with its normalised value and its active
-            # weight. The weight key is the column name without the "norm_" prefix.
-            present = [
-                (label, float(row[col]), float(cast(float, processor.weights[col[len("norm_") :]])))
-                for col, label in component_cols
-                if col in row.index
-                and pd.notna(row[col])
-                and col[len("norm_") :] in processor.weights
-            ]
-            components = {label: round(value, 3) for label, value, _ in present}
-            weights = {label: round(weight, 3) for label, _, weight in present}
-            # Each metric's weighted contribution to the score: value * weight
-            # renormalised over the weights of the metrics this indexer has, so the
-            # contributions sum to the logged score (mirrors _calculate_weighted_scores).
-            weight_total = sum(weight for _, _, weight in present)
-            contributions = {
-                label: round(value * weight / weight_total, 4)
-                for label, value, weight in present
-                if weight_total > 0
-            }
-            weighted = (
-                round(float(row["weighted_score"]), 4)
-                if "weighted_score" in row.index and pd.notna(row["weighted_score"])
-                else None
-            )
-            logger.info(
-                "selected indexer=%s score=%.4f components=%s weights=%s contributions=%s "
-                "deployment=%s",
-                row["indexer"],
-                weighted if weighted is not None else 0.0,
-                components,
-                weights,
-                contributions,
-                request.deployment_id,
-            )
+        components = {label: round(value, 3) for label, value, _ in present}
+        weights = {label: round(weight, 3) for label, _, weight in present}
+        # Each metric's weighted contribution to the score: value * weight
+        # renormalised over the weights of the metrics this indexer has, so the
+        # contributions sum to the logged score (mirrors _calculate_weighted_scores).
+        weight_total = sum(weight for _, _, weight in present)
+        contributions = {
+            label: round(value * weight / weight_total, 4)
+            for label, value, weight in present
+            if weight_total > 0
+        }
+        weighted = (
+            round(float(row["weighted_score"]), 4)
+            if "weighted_score" in row.index and pd.notna(row["weighted_score"])
+            else None
+        )
+        logger.info(
+            "selected indexer=%s score=%.4f components=%s weights=%s contributions=%s "
+            "deployment=%s",
+            row["indexer"],
+            weighted if weighted is not None else 0.0,
+            components,
+            weights,
+            contributions,
+            deployment_id,
+        )
+
+
+def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
+    """Run IndexerSelector and return a SelectionResponse for the deployment.
+
+    The selector weights stake-to-fees, base price, latency, uptime,
+    success rate, and price-per-entity; lower is better for prices and
+    latency, higher for the rest.
+    """
+    if _state.history is None:
+        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+
+    # Filter by price constraints before scoring
+    filtered_history = _price_filtered_candidates(_state.history, request)
+    if filtered_history is None:
+        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+
+    # Enrich with chain-specific price columns for normalization
+    enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
+    synced_indexers = _synced_indexers_for(request.deployment_id)
+    processor = _build_selector(request, enriched_history, synced_indexers)
+    _log_selection_reasoning(processor, request.deployment_id)
 
     # Build response with pricing info
     selected = _build_selected_indexers(
