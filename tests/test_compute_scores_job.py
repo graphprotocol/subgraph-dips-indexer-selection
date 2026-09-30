@@ -1372,6 +1372,63 @@ class TestMergeAndPrepareDataframes:
         # Assert - extra column preserved
         assert "extra_col" in result.columns
 
+    def test_merge_warns_when_model_input_indexer_has_no_estimate(
+        self,
+        indexer_uptime,
+        indexer_rankings,
+        agg_df,
+        indexer_success_rate,
+        stake_to_fees,
+        indexer_query_count,
+        caplog,
+    ):
+        """0x123 went into the latency model (it has a query count) but got no estimate back."""
+        # Act
+        with caplog.at_level("INFO", logger="processing"):
+            result = merge_and_prepare_dataframes(
+                indexer_uptime,
+                indexer_rankings,
+                agg_df,
+                indexer_success_rate,
+                stake_to_fees,
+                indexer_query_count,
+            )
+
+        # Assert
+        assert "0x123" not in result["indexer"].values
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "0x123" in warnings[0].getMessage()
+
+    def test_merge_logs_info_for_indexers_filtered_out_before_the_model(
+        self,
+        indexer_uptime,
+        indexer_rankings,
+        agg_df,
+        indexer_success_rate,
+        stake_to_fees,
+        indexer_query_count,
+        caplog,
+    ):
+        """An indexer the model never saw is an expected drop, so it is not a warning."""
+        # Arrange - 0x123 was filtered out before the model, so it has no query count
+        model_input = indexer_query_count[indexer_query_count["indexer"] != "0x123"]
+
+        # Act
+        with caplog.at_level("INFO", logger="processing"):
+            merge_and_prepare_dataframes(
+                indexer_uptime,
+                indexer_rankings,
+                agg_df,
+                indexer_success_rate,
+                stake_to_fees,
+                model_input,
+            )
+
+        # Assert
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        assert "Dropping 1 indexer(s) that the latency model's data filters left out" in caplog.text
+
 
 # ----------------------------------------------------------------------
 # main.py: run_scoring() push-failure accounting and validate_configuration()

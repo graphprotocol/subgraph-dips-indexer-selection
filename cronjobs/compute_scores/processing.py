@@ -1606,6 +1606,22 @@ def merge_and_prepare_dataframes(
         columns_to_check = [LATENCY_COEFFICIENT_COLUMN, STANDARD_ERROR_COLUMN, "p-value"]
         existing = [c for c in columns_to_check if c in merged.columns]
         if existing:
+            no_estimate = merged.loc[merged[existing].isna().any(axis=1), "indexer"]
+            # indexer_query_count lists exactly the indexers the latency model was given, and
+            # each of those should come back with an estimate, so a missing one is a bug.
+            given_to_model = no_estimate.isin(indexer_query_count["indexer"])
+            if given_to_model.any():
+                logger.warning(
+                    "Latency model returned no estimate for %d indexer(s) it was given, "
+                    "dropping them from scoring: %s",
+                    given_to_model.sum(),
+                    ", ".join(no_estimate[given_to_model]),
+                )
+            if (~given_to_model).any():
+                logger.info(
+                    "Dropping %d indexer(s) that the latency model's data filters left out",
+                    (~given_to_model).sum(),
+                )
             merged = merged.dropna(subset=existing)
 
     merged = pd.merge(merged, agg_df, on="indexer", how="left")
