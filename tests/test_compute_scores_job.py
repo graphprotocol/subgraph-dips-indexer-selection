@@ -1383,8 +1383,9 @@ class TestValidateConfigurationIISAURL:
     """validate_configuration() must fail fast when IISA_API_URL is unset."""
 
     def test_missing_iisa_api_url_raises_configuration_error(self, monkeypatch):
-        # Arrange — satisfy REDPANDA_BOOTSTRAP_SERVERS so only IISA_API_URL trips.
+        # Arrange — satisfy the Redpanda settings so only IISA_API_URL trips.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
         monkeypatch.setattr(main, "IISA_API_URL", "")
 
         # Act / Assert
@@ -1396,10 +1397,36 @@ class TestValidateConfigurationIISAURL:
     def test_present_iisa_api_url_passes(self, monkeypatch):
         # Arrange — all required config set.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
         monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
 
         # Act / Assert — should not raise
         main.validate_configuration()
+
+
+class TestValidateConfigurationRedpandaTopic:
+    """validate_configuration() must refuse to run without an explicit REDPANDA_TOPIC.
+
+    The topic comes from each environment's ConfigMap; a missing map or key must fail the
+    run rather than let the job fall back to scoring the mainnet topic.
+    """
+
+    @pytest.mark.parametrize("topic", [None, ""], ids=["unset", "empty"])
+    def test_missing_topic_raises_configuration_error(self, monkeypatch, caplog, topic):
+        # Arrange — everything else valid, so only the topic trips.
+        monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+        if topic is None:
+            monkeypatch.delenv("REDPANDA_TOPIC", raising=False)
+        else:
+            monkeypatch.setenv("REDPANDA_TOPIC", topic)
+
+        # Act / Assert
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError):
+                main.validate_configuration()
+
+        assert "REDPANDA_TOPIC is required" in caplog.text
 
 
 class TestComputeAllScoresGeoipDemotion:

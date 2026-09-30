@@ -53,6 +53,12 @@ These secrets are created out of band and are never committed:
   the service rejects pushes without it.
 - `github-registry-secret` - image pull secret for the GitHub container registry.
 
+The CronJob also needs the `iisa-redpanda-config` ConfigMap, which each environment
+supplies to choose what the job scores: `REDPANDA_TOPIC` (for example
+`gateway_queries_testnet`) and `REDPANDA_GATEWAY_IDS`. If the ConfigMap or its
+`REDPANDA_TOPIC` key is missing, the run fails with `REDPANDA_TOPIC is required` rather
+than falling back to the mainnet `gateway_queries` topic.
+
 Geo-location data uses MaxMind GeoLite2, downloaded into the CronJob image at build
 time, so no geo API key is needed at runtime.
 
