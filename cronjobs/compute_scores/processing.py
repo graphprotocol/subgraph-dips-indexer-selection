@@ -1377,6 +1377,15 @@ def perform_latency_linear_regression(
     model_columns = categorical + numeric
     x = df[model_columns]
     y = df[predictor]
+    pipeline = _fit_latency_model(x, y, categorical, numeric)
+    results_df, deg_freedom = _coefficient_statistics(pipeline, x, y)
+    return _indexer_latency_rankings(results_df, deg_freedom), results_df
+
+
+def _fit_latency_model(
+    x: pd.DataFrame, y: pd.DataFrame, categorical: list, numeric: list
+) -> Pipeline:
+    """Fit latency against the model's features, raising RuntimeError if the fit fails."""
     other_categorical = [column for column in categorical if column != "indexer"]
 
     # A column for every indexer and no intercept, which the indexer columns stand in for.
@@ -1407,6 +1416,13 @@ def perform_latency_linear_regression(
             "Latency linear regression failed. This may indicate data quality issues "
             "(e.g., insufficient variance, collinearity, or too few samples)."
         )
+    return pipeline
+
+
+def _coefficient_statistics(
+    pipeline: Pipeline, x: pd.DataFrame, y: pd.DataFrame
+) -> Tuple[pd.DataFrame, int]:
+    """Each model coefficient with its standard error and p-value, plus the degrees of freedom."""
     y_pred = pipeline.predict(x)
 
     # Analyze results
@@ -1431,7 +1447,11 @@ def perform_latency_linear_regression(
             "p-value": p_values,
         }
     )
+    return results_df, deg_freedom
 
+
+def _indexer_latency_rankings(results_df: pd.DataFrame, deg_freedom: int) -> pd.DataFrame:
+    """Each indexer's latency gap to the median indexer, plus the upper bound scoring uses."""
     # Calculate robust normalized coefficients
     indexer_rankings = results_df[
         results_df["Variable"].str.startswith("indexer__indexer_")
@@ -1458,7 +1478,7 @@ def perform_latency_linear_regression(
         + LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER * indexer_rankings[STANDARD_ERROR_COLUMN]
     )
 
-    return indexer_rankings, results_df
+    return indexer_rankings
 
 
 def calculate_indexer_success_rate(df: pd.DataFrame) -> pd.DataFrame:
