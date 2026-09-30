@@ -28,7 +28,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timezone
-from typing import Dict, List, Optional, Tuple, cast
+from typing import Callable, Dict, List, Optional, Tuple, cast
 
 import base58
 import numpy as np
@@ -780,6 +780,50 @@ class RedpandaProvider:
         return valid
 
     # -----------------------------------------------------------------------
+    # Internal: steps shared by both passes
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _pass_window(start_date: date) -> Tuple[datetime, int, int]:
+        """Return (end_dt, start_ts_ms, end_ts_ms) for the window from start_date (UTC) to now."""
+        start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+        end_dt = datetime.now(timezone.utc)
+        start_ts_ms = int(start_dt.timestamp() * 1000)
+        end_ts_ms = int(end_dt.timestamp() * 1000)
+        return end_dt, start_ts_ms, end_ts_ms
+
+    def _run_partition_workers(
+        self,
+        worker: Callable[[tuple], tuple],
+        partitions: list,
+        end_ts_ms: int,
+        *extra_args: object,
+    ) -> List[tuple]:
+        """Run `worker` once per partition in a process pool, returning results in partition order.
+
+        Each worker gets (topic, partition, start offset, end_ts_ms, consumer config, gateway
+        filter, *extra_args, end offset), where extra_args holds the pass's own settings.
+        """
+        # Consume partitions in parallel across processes to bypass the GIL.
+        config = self._consumer_config()
+        gw_filter = self._gateway_id_filter
+        args = [
+            (
+                tp.topic,
+                tp.partition,
+                tp.offset,
+                end_ts_ms,
+                config,
+                gw_filter,
+                *extra_args,
+                self._partition_ends.get(tp.partition, tp.offset),
+            )
+            for tp in partitions
+        ]
+        with ProcessPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
+            return list(pool.map(worker, args))
+
+    # -----------------------------------------------------------------------
     # Internal: Pass 1 — count
     # -----------------------------------------------------------------------
 
@@ -790,10 +834,7 @@ class RedpandaProvider:
         Uses extract_keys_and_fees for minimal parsing, raw byte keys,
         batch polling, and parallel partition consumption.
         """
-        start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-        end_dt = datetime.now(timezone.utc)
-        start_ts_ms = int(start_dt.timestamp() * 1000)
-        end_ts_ms = int(end_dt.timestamp() * 1000)
+        end_dt, start_ts_ms, end_ts_ms = self._pass_window(start_date)
 
         logger.info(
             "Starting count pass: topic=%s, window=%s to %s",
@@ -815,23 +856,7 @@ class RedpandaProvider:
             self._count_cache_num_days = num_days
             return
 
-        # Consume partitions in parallel across processes to bypass the GIL.
-        config = self._consumer_config()
-        gw_filter = self._gateway_id_filter
-        args = [
-            (
-                tp.topic,
-                tp.partition,
-                tp.offset,
-                end_ts_ms,
-                config,
-                gw_filter,
-                self._partition_ends.get(tp.partition, tp.offset),
-            )
-            for tp in partitions
-        ]
-        with ProcessPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
-            results = list(pool.map(_count_partition_worker, args))
+        results = self._run_partition_workers(_count_partition_worker, partitions, end_ts_ms)
 
         # Merge per-partition counts and fees
         merged_counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
@@ -884,10 +909,7 @@ class RedpandaProvider:
         batch polling, cached partitions, deferred string conversion,
         parallel partition consumption, and process-local PRNG.
         """
-        start_dt = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-        end_dt = datetime.now(timezone.utc)
-        start_ts_ms = int(start_dt.timestamp() * 1000)
-        end_ts_ms = int(end_dt.timestamp() * 1000)
+        end_dt, start_ts_ms, end_ts_ms = self._pass_window(start_date)
 
         logger.info(
             "Starting sample pass: topic=%s, window=%s to %s, rows_to_use=%d",
@@ -910,26 +932,10 @@ class RedpandaProvider:
             self._row_cache_rows_to_use = rows_to_use
             return
 
-        # Consume partitions in parallel across processes to bypass the GIL.
-        config = self._consumer_config()
-        gw_filter = self._gateway_id_filter
         seed = int(os.environ.get("SCORING_SEED", start_date.strftime("%Y%m%d")))
-        args = [
-            (
-                tp.topic,
-                tp.partition,
-                tp.offset,
-                end_ts_ms,
-                config,
-                gw_filter,
-                rows_to_use,
-                seed,
-                self._partition_ends.get(tp.partition, tp.offset),
-            )
-            for tp in partitions
-        ]
-        with ProcessPoolExecutor(max_workers=min(len(partitions), MAX_PARTITION_WORKERS)) as pool:
-            results = list(pool.map(_sample_partition_worker, args))
+        results = self._run_partition_workers(
+            _sample_partition_worker, partitions, end_ts_ms, rows_to_use, seed
+        )
 
         # Merge per-partition reservoirs using Algorithm R streaming.
         #
