@@ -7,7 +7,7 @@ metrics including latency, uptime, success rate, and economic security.
 
 import logging
 from types import MappingProxyType
-from typing import NewType, Optional, TypedDict, cast
+from typing import Callable, NewType, Optional, TypedDict, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -622,100 +622,91 @@ def _normalize_metrics(
     observed max, so one outlier price can't compress the rest. Missing metrics
     normalise to NaN, then to 0.
     """
-    if merged.empty:
-        new_columns = [
+    # (norm column, source column, normaliser), in the order the columns are added.
+    metrics: list[tuple[str, str, Callable[[pd.Series], Union[pd.Series, float]]]] = [
+        (
             "norm_lat_lin_reg_coefficient",
-            "norm_uptime_score",
-            "norm_stake_to_fees",
-            "norm_success_rate",
+            "Latency Coefficient + Error Confidence Interval",
+            _normalize_latency,
+        ),
+        # higher is better
+        ("norm_uptime_score", "% up_x", _normalize_uptime_and_success_rate),
+        ("norm_stake_to_fees", "stake_to_fees", _normalize_stake_to_fees),
+        # higher is better
+        ("norm_success_rate", "average_status", _normalize_uptime_and_success_rate),
+        (
             "norm_base_price_per_epoch",
-            "norm_price_per_entity",
-        ]
-        for col in new_columns:
-            merged[col] = pd.Series(dtype=float)
+            "base_price_per_epoch",
+            lambda prices: _normalize_base_price_per_epoch(prices, price_ceiling),
+        ),
+        ("norm_price_per_entity", "price_per_entity", _normalize_price_per_entity),
+    ]
+
+    if merged.empty:
+        for norm_col, _, _ in metrics:
+            merged[norm_col] = pd.Series(dtype=float)
         return merged
 
-    # Normalise latency linear regression score
-    if "norm_lat_lin_reg_coefficient" not in merged.columns:
-        if "Latency Coefficient + Error Confidence Interval" in merged.columns:
-            merged["norm_lat_lin_reg_coefficient"] = 1 - _normalize_generic(
-                merged["Latency Coefficient + Error Confidence Interval"]
-            )  # lower is better
+    # Keep a norm_ column the input already carries (the CronJob ships latency normalised).
+    for norm_col, source_col, normalize in metrics:
+        if norm_col in merged.columns:
+            continue
+        if source_col in merged.columns:
+            merged[norm_col] = normalize(merged[source_col])
         else:
-            merged["norm_lat_lin_reg_coefficient"] = np.nan
-
-    # Normalise uptime score
-    if "norm_uptime_score" not in merged.columns:
-        if "% up_x" in merged.columns:
-            merged["norm_uptime_score"] = _normalize_uptime_and_success_rate(
-                merged["% up_x"]
-            )  # higher is better
-        else:
-            merged["norm_uptime_score"] = np.nan
-
-    # Normalise stake to fees ratio (higher = more capacity = better).
-    # Indexers with zero fees get NaN (infinite ratio = maximum capacity).
-    # Fill NaN above the max finite value so they normalise to 1.0.
-    if "norm_stake_to_fees" not in merged.columns:
-        if "stake_to_fees" in merged.columns:
-            stf = merged["stake_to_fees"].copy()
-            finite_max = stf.max()
-            fill_value = (finite_max + 1.0) if pd.notna(finite_max) else 1.0
-            stf = stf.fillna(fill_value)
-            merged["norm_stake_to_fees"] = _normalize_generic(stf)
-        else:
-            merged["norm_stake_to_fees"] = np.nan
-
-    # Normalise success rate score
-    if "norm_success_rate" not in merged.columns:
-        if "average_status" in merged.columns:
-            merged["norm_success_rate"] = _normalize_uptime_and_success_rate(
-                merged["average_status"]
-            )  # higher is better
-        else:
-            merged["norm_success_rate"] = np.nan
-
-    # Normalize base price per epoch (lower is better).
-    # When price_ceiling is provided, use it instead of the observed max
-    # so outlier prices cannot compress differentiation among others.
-    if "norm_base_price_per_epoch" not in merged.columns:
-        if "base_price_per_epoch" in merged.columns:
-            prices = (
-                pd.to_numeric(merged["base_price_per_epoch"], errors="coerce")
-                .fillna(0.0)
-                .clip(lower=0)
-            )
-            ceiling = (
-                price_ceiling if price_ceiling is not None and price_ceiling > 0 else prices.max()
-            )
-            if ceiling > 0 and ceiling > prices.min():
-                merged["norm_base_price_per_epoch"] = (1 - (prices / ceiling)).clip(lower=0)
-            else:
-                merged["norm_base_price_per_epoch"] = 0.5
-        else:
-            merged["norm_base_price_per_epoch"] = np.nan
-
-    # Normalize price per entity (lower is better).
-    # price_ceiling applies to base epoch price; entity pricing uses
-    # observed max since there is no separate budget field for it.
-    if "norm_price_per_entity" not in merged.columns:
-        if "price_per_entity" in merged.columns:
-            prices = (
-                pd.to_numeric(merged["price_per_entity"], errors="coerce").fillna(0.0).clip(lower=0)
-            )
-            ceiling = prices.max()
-            if ceiling > 0 and ceiling > prices.min():
-                merged["norm_price_per_entity"] = 1 - (prices / ceiling)
-            else:
-                merged["norm_price_per_entity"] = 0.5
-        else:
-            merged["norm_price_per_entity"] = np.nan
+            merged[norm_col] = np.nan
 
     # Fill NaN values with 0 for all norm_ columns
     norm_columns = [col for col in merged.columns if col.startswith("norm_")]
     merged[norm_columns] = merged[norm_columns].fillna(0)
 
     return merged
+
+
+def _normalize_latency(latency: pd.Series) -> pd.Series:
+    """Normalise the latency linear regression score."""
+    return 1 - _normalize_generic(latency)  # lower is better
+
+
+def _normalize_stake_to_fees(stake_to_fees: pd.Series) -> pd.Series:
+    """Normalise stake to fees ratio (higher = more capacity = better).
+
+    Indexers with zero fees get NaN (infinite ratio = maximum capacity).
+    Fill NaN above the max finite value so they normalise to 1.0.
+    """
+    stf = stake_to_fees.copy()
+    finite_max = stf.max()
+    fill_value = (finite_max + 1.0) if pd.notna(finite_max) else 1.0
+    stf = stf.fillna(fill_value)
+    return _normalize_generic(stf)
+
+
+def _normalize_base_price_per_epoch(
+    base_price_per_epoch: pd.Series, price_ceiling: Optional[float]
+) -> Union[pd.Series, float]:
+    """Normalize base price per epoch (lower is better).
+
+    When price_ceiling is provided, use it instead of the observed max
+    so outlier prices cannot compress differentiation among others.
+    """
+    prices = pd.to_numeric(base_price_per_epoch, errors="coerce").fillna(0.0).clip(lower=0)
+    ceiling = price_ceiling if price_ceiling is not None and price_ceiling > 0 else prices.max()
+    if ceiling > 0 and ceiling > prices.min():
+        return (1 - (prices / ceiling)).clip(lower=0)
+    return 0.5
+
+
+def _normalize_price_per_entity(price_per_entity: pd.Series) -> Union[pd.Series, float]:
+    """Normalize price per entity (lower is better).
+
+    price_ceiling applies to base epoch price; entity pricing uses
+    observed max since there is no separate budget field for it.
+    """
+    prices = pd.to_numeric(price_per_entity, errors="coerce").fillna(0.0).clip(lower=0)
+    ceiling = prices.max()
+    if ceiling > 0 and ceiling > prices.min():
+        return cast(pd.Series, 1 - (prices / ceiling))
+    return 0.5
 
 
 def _normalize_generic(series: pd.Series) -> pd.Series:
