@@ -43,6 +43,11 @@ spec:
               limits:
                 memory: "50Gi"
                 cpu: "8"
+            # Each environment names the Redpanda topic and gateway IDs to score in this ConfigMap.
+            # Required on purpose: without it the job would fall back to the mainnet topic.
+            envFrom:
+            - configMapRef:
+                name: iisa-redpanda-config
             env:
             - name: NUM_DAYS
               value: "28"
@@ -53,8 +58,6 @@ spec:
                 secretKeyRef:
                   name: iisa-redpanda-credentials
                   key: REDPANDA_BOOTSTRAP_SERVERS
-            - name: REDPANDA_TOPIC
-              value: "gateway_queries"
             - name: GRAPH_NETWORK_SUBGRAPH_URL
               valueFrom:
                 secretKeyRef:
@@ -79,8 +82,6 @@ spec:
                   key: IISA_PUSH_TOKEN
             - name: IISA_REQUIRE_PUSH_TOKEN
               value: "true"
-            - name: REDPANDA_GATEWAY_IDS
-              value: ""
             # Minimum PEP 440 graph-node version; empty disables the filter.
             # Pinned to graph-node v0.43.0 — see
             # https://github.com/graphprotocol/graph-node/releases/tag/v0.43.0
