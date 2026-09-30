@@ -41,7 +41,7 @@ from iisa_client import (
     get_scores_status,
     post_scores,
 )
-from subgraph import paginate_subgraph_query
+from subgraph import paginate_subgraph_query, redact_url
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -589,7 +589,7 @@ class RedpandaProvider:
             )
             return pd.DataFrame(columns=["stake_to_fees"])
 
-        logger.info("Fetching stake data from %s", self.graph_network_url)
+        logger.info("Fetching stake data from %s", redact_url(self.graph_network_url))
         try:
             indexers = self._paginate_graphql_indexers()
         except Exception:

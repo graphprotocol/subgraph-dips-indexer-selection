@@ -7,12 +7,27 @@ handling, and page-size defaults live in one place.
 """
 
 import logging
+import re
 import time
 from typing import List
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Gateway URLs carry the API key in the path (https://gateway.thegraph.com/api/<key>/subgraphs/...),
+# so logging the raw URL hands the key to anyone who can read the logs. Match on the route after
+# the key rather than the key's format, so this keeps working if the key format changes.
+_GATEWAY_API_KEY = re.compile(r"(/api/)[^/?#\s]+(?=/(?:subgraphs|deployments)/)")
+
+
+class SubgraphQueryError(RuntimeError):
+    """A subgraph request failed. The message never contains an unredacted API key."""
+
+
+def redact_url(text: str) -> str:
+    """Return ``text`` with any gateway API key in a URL path replaced by ``<redacted>``."""
+    return _GATEWAY_API_KEY.sub(r"\1<redacted>", text)
 
 
 def paginate_subgraph_query(
@@ -29,8 +44,8 @@ def paginate_subgraph_query(
     indicates there are no more results.
 
     Raises ``RuntimeError`` on GraphQL-level errors (``"errors"`` key in
-    response).  HTTP and connection errors from ``requests`` propagate
-    unhandled so the caller can decide on retry/fallback policy.
+    response), and ``SubgraphQueryError`` on HTTP and connection errors so the
+    caller can decide on retry/fallback policy.
 
     Args:
         url: Subgraph endpoint URL.
@@ -46,17 +61,31 @@ def paginate_subgraph_query(
     all_entities: List[dict] = []
     page_num = 0
 
-    logger.info("Paginating subgraph query (entity=%s, page_size=%d) at %s", entity, page_size, url)
+    logger.info(
+        "Paginating subgraph query (entity=%s, page_size=%d) at %s",
+        entity,
+        page_size,
+        redact_url(url),
+    )
 
     while True:
         page_num += 1
         t0 = time.monotonic()
-        response = requests.post(
-            url,
-            json={"query": query, "variables": {"first": page_size, "lastId": last_id}},
-            timeout=30,
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                url,
+                json={"query": query, "variables": {"first": page_size, "lastId": last_id}},
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            # requests writes the full URL into its error messages ("for url: ..." on HTTP
+            # errors, "Max retries exceeded with url: ..." on connection errors). Raising
+            # "from None" keeps that original error out of any traceback a caller logs.
+            raise SubgraphQueryError(
+                f"{type(e).__name__} querying {redact_url(url)} (page {page_num}): "
+                f"{redact_url(str(e))}"
+            ) from None
         data = response.json()
 
         if "errors" in data:
