@@ -26,7 +26,10 @@ import random
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Generator, Sized
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple, cast
 
@@ -181,25 +184,35 @@ def _emit_heartbeat(
     )
 
 
-def _count_partition_worker(args: tuple) -> tuple:
+@dataclass
+class _PartitionReadStats:
+    """Message and filtered counts for one partition read, set when the read ends."""
+
+    messages: int = 0
+    filtered: int = 0
+
+
+def _iter_partition_queries(
+    label: str,
+    topic: str,
+    partition: int,
+    start_offset: int,
+    end_ts_ms: int,
+    config: dict,
+    gw_filter: Optional[set],
+    end_offset: int,
+    pairs: Sized,
+    stats: _PartitionReadStats,
+) -> Generator[Tuple[ClientQueryProtobuf, int], None, None]:
+    """Read one partition from start_offset, yielding (query, ts_ms) per parsed message.
+
+    Ends after 3 empty consume() calls in a row or at the first message past end_ts_ms.
+    Skips error messages, unparseable payloads and gateways outside gw_filter. Heartbeats
+    report len(pairs); the message and filtered counts go to `stats` when the read ends.
     """
-    Count pass for a single partition. Runs in a child process.
-
-    Args is a tuple: (topic, partition, offset, end_ts_ms,
-                       consumer_config, gateway_id_filter, end_offset)
-    `offset` is the start offset at the window boundary; `end_offset` is
-    the broker high watermark captured at pass start, used only for the
-    progress/ETA suffix in heartbeats.
-
-    Returns: (counts, fees, message_count, filtered_count)
-    """
-    topic, partition, start_offset, end_ts_ms, config, gw_filter, end_offset = args
-
     from confluent_kafka import Consumer, TopicPartition
 
     consumer = Consumer(config)
-    counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
-    fees: Dict[bytes, float] = defaultdict(float)
     total_messages = 0
     filtered_count = 0
     consecutive_empty = 0
@@ -212,18 +225,18 @@ def _count_partition_worker(args: tuple) -> tuple:
         # first 30s consume() call, so a broker connection problem can't
         # masquerade as an unstarted worker.
         loop_start = time.monotonic()
-        _emit_heartbeat("count", partition, 0, 0, 0, start_offset, start_offset, end_offset, 0.0)
+        _emit_heartbeat(label, partition, 0, 0, 0, start_offset, start_offset, end_offset, 0.0)
         last_progress_log = loop_start
 
         while True:
             now = time.monotonic()
             if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
                 _emit_heartbeat(
-                    "count",
+                    label,
                     partition,
                     total_messages,
                     filtered_count,
-                    len(counts),
+                    len(pairs),
                     start_offset,
                     last_offset,
                     end_offset,
@@ -250,9 +263,10 @@ def _count_partition_worker(args: tuple) -> tuple:
                     ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
                 if ts_ms > end_ts_ms:
-                    return (counts, fees, total_messages, filtered_count)
+                    return
 
-                last_offset = msg.offset()
+                # offset() is None only on error events, which are skipped above.
+                last_offset = msg.offset()  # type: ignore[assignment]
                 total_messages += 1
 
                 try:
@@ -265,16 +279,53 @@ def _count_partition_worker(args: tuple) -> tuple:
                     filtered_count += 1
                     continue
 
-                for attempt in query.indexer_queries:
-                    idx_bytes = bytes(attempt.indexer)
-                    dep_bytes = bytes(attempt.deployment)
-                    if len(dep_bytes) == 32 and len(idx_bytes) == 20:
-                        counts[(dep_bytes, idx_bytes)] += 1
-                        fees[idx_bytes] += attempt.fee_grt
+                yield query, ts_ms
     finally:
+        stats.messages = total_messages
+        stats.filtered = filtered_count
         consumer.close()
 
-    return (counts, fees, total_messages, filtered_count)
+
+def _count_partition_worker(args: tuple) -> tuple:
+    """
+    Count pass for a single partition. Runs in a child process.
+
+    Args is a tuple: (topic, partition, offset, end_ts_ms,
+                       consumer_config, gateway_id_filter, end_offset)
+    `offset` is the start offset at the window boundary; `end_offset` is
+    the broker high watermark captured at pass start, used only for the
+    progress/ETA suffix in heartbeats.
+
+    Returns: (counts, fees, message_count, filtered_count)
+    """
+    topic, partition, start_offset, end_ts_ms, config, gw_filter, end_offset = args
+
+    counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+    fees: Dict[bytes, float] = defaultdict(float)
+    stats = _PartitionReadStats()
+
+    queries = _iter_partition_queries(
+        "count",
+        topic,
+        partition,
+        start_offset,
+        end_ts_ms,
+        config,
+        gw_filter,
+        end_offset,
+        pairs=counts,
+        stats=stats,
+    )
+    with closing(queries):
+        for query, _ts_ms in queries:
+            for attempt in query.indexer_queries:
+                idx_bytes = bytes(attempt.indexer)
+                dep_bytes = bytes(attempt.deployment)
+                if len(dep_bytes) == 32 and len(idx_bytes) == 20:
+                    counts[(dep_bytes, idx_bytes)] += 1
+                    fees[idx_bytes] += attempt.fee_grt
+
+    return (counts, fees, stats.messages, stats.filtered)
 
 
 def _sample_partition_worker(args: tuple) -> tuple:
@@ -294,16 +345,10 @@ def _sample_partition_worker(args: tuple) -> tuple:
         args
     )
 
-    from confluent_kafka import Consumer, TopicPartition
-
     rng = random.Random(seed + partition)
-    consumer = Consumer(config)
     reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
-    filtered_count = 0
-    total_messages = 0
-    consecutive_empty = 0
-    last_offset = start_offset
+    stats = _PartitionReadStats()
 
     # Worker-local intern caches. Protobuf hands us fresh str objects for every
     # message even when the value is identical to one we've already seen, so
@@ -316,124 +361,78 @@ def _sample_partition_worker(args: tuple) -> tuple:
     status_cache: Dict[str, str] = {}
     chain_cache: Dict[str, str] = {}
 
-    try:
-        consumer.assign([TopicPartition(topic, partition, start_offset)])
+    queries = _iter_partition_queries(
+        "sample",
+        topic,
+        partition,
+        start_offset,
+        end_ts_ms,
+        config,
+        gw_filter,
+        end_offset,
+        pairs=reservoirs,
+        stats=stats,
+    )
+    with closing(queries):
+        for query, ts_ms in queries:
+            for attempt in query.indexer_queries:
+                idx_bytes = bytes(attempt.indexer)
+                dep_bytes = bytes(attempt.deployment)
+                url = attempt.url
 
-        # Startup heartbeat: see _count_partition_worker.
-        loop_start = time.monotonic()
-        _emit_heartbeat("sample", partition, 0, 0, 0, start_offset, start_offset, end_offset, 0.0)
-        last_progress_log = loop_start
+                if len(dep_bytes) != 32 or len(idx_bytes) != 20 or not url:
+                    continue
 
-        while True:
-            now = time.monotonic()
-            if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
-                _emit_heartbeat(
-                    "sample",
-                    partition,
-                    total_messages,
-                    filtered_count,
-                    len(reservoirs),
-                    start_offset,
-                    last_offset,
-                    end_offset,
-                    now - loop_start,
+                key = (dep_bytes, idx_bytes)
+                n = counts[key]
+
+                # Hoist descriptor-based protobuf attribute access — each
+                # `attempt.<field>` lookup goes through a descriptor and
+                # costs ~200ns. Bind once per attempt and reuse.
+                raw_result = attempt.result
+                raw_chain = attempt.indexed_chain
+
+                # url/status/subgraph_network are interned via a worker-local
+                # cache (see top of worker). First sight of a value pays
+                # sys.intern + cache store; every subsequent row hits the
+                # dict-lookup fast path. query_id is unique per query so
+                # caching/interning it would burn cycles for no dedup.
+                interned_url = url_cache.get(url)
+                if interned_url is None:
+                    interned_url = sys.intern(url if url.endswith("/") else url + "/")
+                    url_cache[url] = interned_url
+
+                interned_status = status_cache.get(raw_result)
+                if interned_status is None:
+                    interned_status = sys.intern(_map_result_to_status(raw_result))
+                    status_cache[raw_result] = interned_status
+
+                interned_chain = chain_cache.get(raw_chain)
+                if interned_chain is None:
+                    interned_chain = sys.intern(raw_chain)
+                    chain_cache[raw_chain] = interned_chain
+
+                row = (
+                    query.query_id,
+                    attempt.fee_grt,
+                    ts_ms,
+                    attempt.blocks_behind,
+                    attempt.response_time_ms,
+                    interned_status,
+                    interned_chain,
+                    interned_url,
                 )
-                last_progress_log = now
 
-            messages = consumer.consume(num_messages=1000, timeout=30.0)
+                if n < rows_to_use:
+                    reservoirs[key].append(row)
+                else:
+                    j = rng.randint(0, n)
+                    if j < rows_to_use:
+                        reservoirs[key][j] = row
 
-            if not messages:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-                continue
+                counts[key] += 1
 
-            consecutive_empty = 0
-
-            for msg in messages:
-                if msg.error():
-                    continue
-
-                ts_type, ts_ms = msg.timestamp()
-                if ts_ms < 0:
-                    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-                if ts_ms > end_ts_ms:
-                    return (reservoirs, counts, filtered_count)
-
-                last_offset = msg.offset()
-                total_messages += 1
-
-                try:
-                    query = ClientQueryProtobuf()
-                    query.ParseFromString(msg.value())
-                except Exception:
-                    continue
-
-                if gw_filter and query.gateway_id not in gw_filter:
-                    filtered_count += 1
-                    continue
-
-                for attempt in query.indexer_queries:
-                    idx_bytes = bytes(attempt.indexer)
-                    dep_bytes = bytes(attempt.deployment)
-                    url = attempt.url
-
-                    if len(dep_bytes) != 32 or len(idx_bytes) != 20 or not url:
-                        continue
-
-                    key = (dep_bytes, idx_bytes)
-                    n = counts[key]
-
-                    # Hoist descriptor-based protobuf attribute access — each
-                    # `attempt.<field>` lookup goes through a descriptor and
-                    # costs ~200ns. Bind once per attempt and reuse.
-                    raw_result = attempt.result
-                    raw_chain = attempt.indexed_chain
-
-                    # url/status/subgraph_network are interned via a worker-local
-                    # cache (see top of worker). First sight of a value pays
-                    # sys.intern + cache store; every subsequent row hits the
-                    # dict-lookup fast path. query_id is unique per query so
-                    # caching/interning it would burn cycles for no dedup.
-                    interned_url = url_cache.get(url)
-                    if interned_url is None:
-                        interned_url = sys.intern(url if url.endswith("/") else url + "/")
-                        url_cache[url] = interned_url
-
-                    interned_status = status_cache.get(raw_result)
-                    if interned_status is None:
-                        interned_status = sys.intern(_map_result_to_status(raw_result))
-                        status_cache[raw_result] = interned_status
-
-                    interned_chain = chain_cache.get(raw_chain)
-                    if interned_chain is None:
-                        interned_chain = sys.intern(raw_chain)
-                        chain_cache[raw_chain] = interned_chain
-
-                    row = (
-                        query.query_id,
-                        attempt.fee_grt,
-                        ts_ms,
-                        attempt.blocks_behind,
-                        attempt.response_time_ms,
-                        interned_status,
-                        interned_chain,
-                        interned_url,
-                    )
-
-                    if n < rows_to_use:
-                        reservoirs[key].append(row)
-                    else:
-                        j = rng.randint(0, n)
-                        if j < rows_to_use:
-                            reservoirs[key][j] = row
-
-                    counts[key] += 1
-    finally:
-        consumer.close()
-
-    return (reservoirs, counts, filtered_count)
+    return (reservoirs, counts, stats.filtered)
 
 
 # ---------------------------------------------------------------------------
