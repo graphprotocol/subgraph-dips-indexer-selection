@@ -1450,7 +1450,8 @@ def perform_latency_linear_regression(
     coefficient = indexer_rankings[LATENCY_COEFFICIENT_COLUMN]
     indexer_rankings[LATENCY_COEFFICIENT_COLUMN] = coefficient - coefficient.median()
     t_ratio = indexer_rankings[LATENCY_COEFFICIENT_COLUMN] / indexer_rankings[STANDARD_ERROR_COLUMN]
-    indexer_rankings["p-value"] = 2 * (1 - t.cdf(np.abs(t_ratio), deg_freedom))
+    # 0 / 0 only happens for the median indexer in an exact fit: no gap, not a missing estimate.
+    indexer_rankings["p-value"] = 2 * (1 - t.cdf(np.abs(t_ratio.fillna(0.0)), deg_freedom))
 
     indexer_rankings["Latency Coefficient + Error Confidence Interval"] = (
         indexer_rankings[LATENCY_COEFFICIENT_COLUMN]

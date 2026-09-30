@@ -886,6 +886,37 @@ class TestPerformLinearRegression:
         assert coefficient["0xfast"] == pytest.approx(-100, abs=2)
         assert coefficient["0xslow"] == pytest.approx(100, abs=2)
 
+    @pytest.mark.filterwarnings(
+        "ignore:divide by zero encountered:RuntimeWarning",
+        "ignore:invalid value encountered:RuntimeWarning",
+    )
+    def test_exact_fit_keeps_the_median_indexer(self, monkeypatch):
+        """An exact fit zeroes every standard error, and the median indexer's gap is also 0."""
+        # Arrange - force the zero error an exact fit gives (float noise hides it with real data)
+        monkeypatch.setattr(processing, "mean_squared_error", lambda *args, **kwargs: 0.0)
+        df = pd.DataFrame(
+            {
+                "indexer": ["0xa", "0xb", "0xc"] * 100,
+                "deployment_hash": "deployment_1",
+                "indexer_network": "arbitrum",
+                "distance_miles": 10.0,
+                "fee": 0.001,
+                "response_time_ms": [100.0, 200.0, 300.0] * 100,
+            }
+        )
+
+        # Act
+        rankings, _ = perform_latency_linear_regression(
+            df,
+            ["response_time_ms"],
+            ["indexer", "deployment_hash", "indexer_network"],
+            ["distance_miles", "fee"],
+        )
+
+        # Assert - every indexer keeps an estimate and a p-value, so none is dropped later
+        assert sorted(rankings["indexer"]) == ["0xa", "0xb", "0xc"]
+        assert rankings["p-value"].notna().all()
+
     def test_perform_latency_linear_regression_with_empty_df(self):
         # Arrange
         empty_df = pd.DataFrame(
