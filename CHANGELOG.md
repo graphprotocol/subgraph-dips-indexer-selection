@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.9.6](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.5...v2.9.6) (2026-09-30)
+
+
+### Fixed
+
+* **deps:** upgrade urllib3 past its 3 known vulnerabilities ([#255](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/255)) ([8091f5b](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/8091f5b74d856a914f5606b3f8632983a55cadd2))
+* **processing:** stop latency scoring leaving out an indexer ([#254](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/254)) ([4e845de](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/4e845dec56daa180c4322302f767c4dbe41f4912))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-19e222c ([#266](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/266)) ([f4a7f80](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/f4a7f809bc91ac84fccea85a0de1060472815dcd))
+* **processing:** split the latency model into its 3 steps ([#258](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/258)) ([8b55e33](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/8b55e33136f8b72af43a8fe651dc88553c7238f6))
+* **redpanda:** share the partition read loop between the 2 passes ([#261](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/261)) ([19e222c](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/19e222cb3e88b75b42f399a4feef1831bcd759e2))
+* **redpanda:** share the window and fan-out between the 2 passes ([#262](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/262)) ([e89b6ad](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/e89b6ad97ae4b9b757b2baddcc17f6a8e7d31afc))
+* **selection:** drive metric normalisation from 1 table ([#260](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/260)) ([b6a62fa](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/b6a62fa7a7af0a30cb38433f9032e64e96617231))
+* **selection:** split indexer selection into named steps ([#259](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/259)) ([c6b252f](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/c6b252f6dc61907eb19e297e6de1b5253f43af1e))
+
 ## [2.9.5](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.4...v2.9.5) (2026-09-30)
 
 
