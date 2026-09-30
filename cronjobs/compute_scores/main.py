@@ -59,6 +59,11 @@ def validate_configuration() -> None:
     if not os.environ.get("REDPANDA_BOOTSTRAP_SERVERS"):
         errors.append("REDPANDA_BOOTSTRAP_SERVERS is required")
 
+    # No default on purpose: falling back to the mainnet topic would quietly score the wrong
+    # network in any environment whose config forgot to name its own.
+    if not os.environ.get("REDPANDA_TOPIC"):
+        errors.append("REDPANDA_TOPIC is required")
+
     if not IISA_API_URL:
         errors.append("IISA_API_URL is required")
 

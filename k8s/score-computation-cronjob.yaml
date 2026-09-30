@@ -44,10 +44,12 @@ spec:
                 memory: "50Gi"
                 cpu: "8"
             # Each environment names the Redpanda topic and gateway IDs to score in this ConfigMap.
-            # Required on purpose: without it the job would fall back to the mainnet topic.
+            # Optional so a missing map fails the run visibly (the job refuses to start without
+            # REDPANDA_TOPIC) instead of leaving the pod waiting and blocking later runs.
             envFrom:
             - configMapRef:
                 name: iisa-redpanda-config
+                optional: true
             env:
             - name: NUM_DAYS
               value: "28"
