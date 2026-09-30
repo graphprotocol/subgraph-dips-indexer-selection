@@ -1369,20 +1369,31 @@ def hash_sampled_queries(df: pd.DataFrame, integer_root: int) -> pd.DataFrame:
 def perform_latency_linear_regression(
     df: pd.DataFrame, predictor: list, categorical: list, numeric: list
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Perform latency linear regression analysis."""
+    """Perform latency linear regression analysis.
+
+    Every indexer gets its own coefficient, reported as its latency gap in ms to the median
+    indexer (negative is faster), so none is left out as the baseline the others compare to.
+    """
     model_columns = categorical + numeric
     x = df[model_columns]
     y = df[predictor]
+    other_categorical = [column for column in categorical if column != "indexer"]
 
+    # A column for every indexer and no intercept, which the indexer columns stand in for.
+    # The usual encoding drops one indexer to make room for an intercept, which would leave it
+    # without a coefficient, and the merge step drops indexers that have none.
     preprocessor = ColumnTransformer(
         transformers=[
-            ("one_hot", OneHotEncoder(handle_unknown="ignore", drop="first"), categorical),
+            ("indexer", OneHotEncoder(handle_unknown="ignore"), ["indexer"]),
+            ("one_hot", OneHotEncoder(handle_unknown="ignore", drop="first"), other_categorical),
             ("scaler", StandardScaler(), numeric),
         ],
         remainder="passthrough",
     )
 
-    pipeline = Pipeline([("preprocessor", preprocessor), ("regressor", LinearRegression())])
+    pipeline = Pipeline(
+        [("preprocessor", preprocessor), ("regressor", LinearRegression(fit_intercept=False))]
+    )
     try:
         logger.info(
             f"Fitting linear regression model with {len(x)} samples, "
@@ -1423,16 +1434,23 @@ def perform_latency_linear_regression(
 
     # Calculate robust normalized coefficients
     indexer_rankings = results_df[
-        (results_df["Variable"].str.startswith("one_hot__indexer_"))
-        & (~results_df["Variable"].str.startswith("one_hot__indexer_network_"))
+        results_df["Variable"].str.startswith("indexer__indexer_")
     ].sort_values(by=LATENCY_COEFFICIENT_COLUMN)
 
     indexer_rankings = indexer_rankings.reset_index(drop=True)
-    indexer_rankings["Variable"] = indexer_rankings["Variable"].str.replace("one_hot__indexer_", "")
+    indexer_rankings["Variable"] = indexer_rankings["Variable"].str.replace("indexer__indexer_", "")
     indexer_rankings.rename(columns={"Variable": "indexer"}, inplace=True)
     indexer_rankings.dropna(
         subset=[LATENCY_COEFFICIENT_COLUMN, STANDARD_ERROR_COLUMN, "p-value"], inplace=True
     )
+
+    # Measure each indexer from the median one; an equal shift for all leaves normalised scores
+    # unchanged. Standard errors stay each indexer's own, since the upper bound below penalises
+    # how little data backs an estimate, not the uncertainty of the median.
+    coefficient = indexer_rankings[LATENCY_COEFFICIENT_COLUMN]
+    indexer_rankings[LATENCY_COEFFICIENT_COLUMN] = coefficient - coefficient.median()
+    t_ratio = indexer_rankings[LATENCY_COEFFICIENT_COLUMN] / indexer_rankings[STANDARD_ERROR_COLUMN]
+    indexer_rankings["p-value"] = 2 * (1 - t.cdf(np.abs(t_ratio), deg_freedom))
 
     indexer_rankings["Latency Coefficient + Error Confidence Interval"] = (
         indexer_rankings[LATENCY_COEFFICIENT_COLUMN]

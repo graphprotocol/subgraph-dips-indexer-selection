@@ -842,6 +842,50 @@ class TestPerformLinearRegression:
         # p-values between 0 and 1
         assert rankings["p-value"].between(0, 1).all()
 
+    def test_every_indexer_gets_a_coefficient(self, sample_df):
+        """Scoring drops an indexer without a coefficient, so none may be left out as a baseline."""
+        # Arrange
+        predictor = ["response_time_ms"]
+        categorical = ["indexer", "deployment_hash", "indexer_network"]
+        numeric = ["distance_miles", "fee"]
+
+        # Act
+        rankings, _ = perform_latency_linear_regression(sample_df, predictor, categorical, numeric)
+
+        # Assert
+        assert sorted(rankings["indexer"]) == sorted(sample_df["indexer"].unique())
+
+    def test_coefficients_are_gaps_to_the_median_indexer(self):
+        """2 indexers 200ms apart each sit 100ms from their median, the faster one below it."""
+        # Arrange - a fast and a slow indexer on the same deployments, with little noise
+        rng = np.random.default_rng(7)
+        rows = 2000
+        indexer = rng.choice(["0xfast", "0xslow"], rows)
+        df = pd.DataFrame(
+            {
+                "indexer": indexer,
+                "deployment_hash": rng.choice(["deployment_1", "deployment_2"], rows),
+                "indexer_network": "arbitrum",
+                "distance_miles": rng.uniform(0, 1000, rows),
+                "fee": rng.uniform(0.000001, 0.01, rows),
+                "response_time_ms": np.where(indexer == "0xfast", 100.0, 300.0)
+                + rng.normal(0, 5, rows),
+            }
+        )
+
+        # Act
+        rankings, _ = perform_latency_linear_regression(
+            df,
+            ["response_time_ms"],
+            ["indexer", "deployment_hash", "indexer_network"],
+            ["distance_miles", "fee"],
+        )
+
+        # Assert
+        coefficient = rankings.set_index("indexer")["Latency Coefficient"]
+        assert coefficient["0xfast"] == pytest.approx(-100, abs=2)
+        assert coefficient["0xslow"] == pytest.approx(100, abs=2)
+
     def test_perform_latency_linear_regression_with_empty_df(self):
         # Arrange
         empty_df = pd.DataFrame(
