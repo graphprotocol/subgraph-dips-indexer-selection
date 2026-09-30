@@ -91,36 +91,58 @@ class TestPaginateSubgraphQuery:
         assert FAKE_KEY not in caplog.text
 
     @pytest.mark.parametrize(
-        "post_kwargs",
+        "post_kwargs, expected_type",
         [
-            {"return_value": _http_error_response()},
-            {"side_effect": _connection_error()},
+            ({"return_value": _http_error_response()}, requests.HTTPError),
+            ({"side_effect": _connection_error()}, requests.ConnectionError),
         ],
         ids=["http_error", "connection_error"],
     )
-    def test_request_failure_hides_key_in_message_and_traceback(self, post_kwargs):
+    def test_request_failure_hides_key_and_keeps_error_type(self, post_kwargs, expected_type):
+        """Callers pick retries by error type, so masking the key must not change it."""
         with patch("subgraph.requests.post", **post_kwargs):
-            with pytest.raises(subgraph.SubgraphQueryError) as excinfo:
+            with pytest.raises(requests.RequestException) as excinfo:
                 subgraph.paginate_subgraph_query(KEYED_URL, QUERY)
 
         formatted = "".join(traceback.format_exception(excinfo.value))
+        assert type(excinfo.value) is expected_type
         assert "<redacted>" in str(excinfo.value)
         assert FAKE_KEY not in formatted
+
+
+@pytest.fixture
+def no_retry_wait():
+    """Skip the stake fetch's retry backoff, which otherwise sleeps for about 30s."""
+    with patch.object(RedpandaProvider._paginate_graphql_indexers.retry, "sleep", lambda _: None):
+        yield
+
+
+def _provider_with_keyed_url() -> RedpandaProvider:
+    with patch.dict(
+        os.environ,
+        {"REDPANDA_BOOTSTRAP_SERVERS": "localhost:9092", "GRAPH_NETWORK_SUBGRAPH_URL": KEYED_URL},
+    ):
+        return RedpandaProvider()
 
 
 class TestCallersHideKey:
     """The 2 production callers catch the error and log it; neither log may carry the key."""
 
-    def test_stake_fetch_logs_hide_key(self, caplog):
+    def test_stake_fetch_still_retries_a_failed_request(self, no_retry_wait):
+        page = MagicMock()
+        page.json.return_value = {
+            "data": {"indexers": [{"id": "0xa", "stakedTokens": "1", "lockedTokens": "0"}]}
+        }
+
+        with patch("subgraph.requests.post", side_effect=[_connection_error(), page]) as post:
+            indexers = _provider_with_keyed_url()._paginate_graphql_indexers()
+
+        assert post.call_count == 2
+        assert [i["id"] for i in indexers] == ["0xa"]
+
+    def test_stake_fetch_logs_hide_key(self, caplog, no_retry_wait):
         caplog.set_level(logging.INFO)
-        with patch.dict(
-            os.environ,
-            {
-                "REDPANDA_BOOTSTRAP_SERVERS": "localhost:9092",
-                "GRAPH_NETWORK_SUBGRAPH_URL": KEYED_URL,
-            },
-        ):
-            provider = RedpandaProvider()
+        provider = _provider_with_keyed_url()
 
         with patch("subgraph.requests.post", side_effect=_connection_error()):
             result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
