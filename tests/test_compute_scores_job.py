@@ -842,6 +842,81 @@ class TestPerformLinearRegression:
         # p-values between 0 and 1
         assert rankings["p-value"].between(0, 1).all()
 
+    def test_every_indexer_gets_a_coefficient(self, sample_df):
+        """Scoring drops an indexer without a coefficient, so none may be left out as a baseline."""
+        # Arrange
+        predictor = ["response_time_ms"]
+        categorical = ["indexer", "deployment_hash", "indexer_network"]
+        numeric = ["distance_miles", "fee"]
+
+        # Act
+        rankings, _ = perform_latency_linear_regression(sample_df, predictor, categorical, numeric)
+
+        # Assert
+        assert sorted(rankings["indexer"]) == sorted(sample_df["indexer"].unique())
+
+    def test_coefficients_are_gaps_to_the_median_indexer(self):
+        """2 indexers 200ms apart each sit 100ms from their median, the faster one below it."""
+        # Arrange - a fast and a slow indexer on the same deployments, with little noise
+        rng = np.random.default_rng(7)
+        rows = 2000
+        indexer = rng.choice(["0xfast", "0xslow"], rows)
+        df = pd.DataFrame(
+            {
+                "indexer": indexer,
+                "deployment_hash": rng.choice(["deployment_1", "deployment_2"], rows),
+                "indexer_network": "arbitrum",
+                "distance_miles": rng.uniform(0, 1000, rows),
+                "fee": rng.uniform(0.000001, 0.01, rows),
+                "response_time_ms": np.where(indexer == "0xfast", 100.0, 300.0)
+                + rng.normal(0, 5, rows),
+            }
+        )
+
+        # Act
+        rankings, _ = perform_latency_linear_regression(
+            df,
+            ["response_time_ms"],
+            ["indexer", "deployment_hash", "indexer_network"],
+            ["distance_miles", "fee"],
+        )
+
+        # Assert
+        coefficient = rankings.set_index("indexer")["Latency Coefficient"]
+        assert coefficient["0xfast"] == pytest.approx(-100, abs=2)
+        assert coefficient["0xslow"] == pytest.approx(100, abs=2)
+
+    @pytest.mark.filterwarnings(
+        "ignore:divide by zero encountered:RuntimeWarning",
+        "ignore:invalid value encountered:RuntimeWarning",
+    )
+    def test_exact_fit_keeps_the_median_indexer(self, monkeypatch):
+        """An exact fit zeroes every standard error, and the median indexer's gap is also 0."""
+        # Arrange - force the zero error an exact fit gives (float noise hides it with real data)
+        monkeypatch.setattr(processing, "mean_squared_error", lambda *args, **kwargs: 0.0)
+        df = pd.DataFrame(
+            {
+                "indexer": ["0xa", "0xb", "0xc"] * 100,
+                "deployment_hash": "deployment_1",
+                "indexer_network": "arbitrum",
+                "distance_miles": 10.0,
+                "fee": 0.001,
+                "response_time_ms": [100.0, 200.0, 300.0] * 100,
+            }
+        )
+
+        # Act
+        rankings, _ = perform_latency_linear_regression(
+            df,
+            ["response_time_ms"],
+            ["indexer", "deployment_hash", "indexer_network"],
+            ["distance_miles", "fee"],
+        )
+
+        # Assert - every indexer keeps an estimate and a p-value, so none is dropped later
+        assert sorted(rankings["indexer"]) == ["0xa", "0xb", "0xc"]
+        assert rankings["p-value"].notna().all()
+
     def test_perform_latency_linear_regression_with_empty_df(self):
         # Arrange
         empty_df = pd.DataFrame(
@@ -1327,6 +1402,63 @@ class TestMergeAndPrepareDataframes:
 
         # Assert - extra column preserved
         assert "extra_col" in result.columns
+
+    def test_merge_warns_when_model_input_indexer_has_no_estimate(
+        self,
+        indexer_uptime,
+        indexer_rankings,
+        agg_df,
+        indexer_success_rate,
+        stake_to_fees,
+        indexer_query_count,
+        caplog,
+    ):
+        """0x123 went into the latency model (it has a query count) but got no estimate back."""
+        # Act
+        with caplog.at_level("INFO", logger="processing"):
+            result = merge_and_prepare_dataframes(
+                indexer_uptime,
+                indexer_rankings,
+                agg_df,
+                indexer_success_rate,
+                stake_to_fees,
+                indexer_query_count,
+            )
+
+        # Assert
+        assert "0x123" not in result["indexer"].values
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "0x123" in warnings[0].getMessage()
+
+    def test_merge_logs_info_for_indexers_filtered_out_before_the_model(
+        self,
+        indexer_uptime,
+        indexer_rankings,
+        agg_df,
+        indexer_success_rate,
+        stake_to_fees,
+        indexer_query_count,
+        caplog,
+    ):
+        """An indexer the model never saw is an expected drop, so it is not a warning."""
+        # Arrange - 0x123 was filtered out before the model, so it has no query count
+        model_input = indexer_query_count[indexer_query_count["indexer"] != "0x123"]
+
+        # Act
+        with caplog.at_level("INFO", logger="processing"):
+            merge_and_prepare_dataframes(
+                indexer_uptime,
+                indexer_rankings,
+                agg_df,
+                indexer_success_rate,
+                stake_to_fees,
+                model_input,
+            )
+
+        # Assert
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        assert "Dropping 1 indexer(s) that the latency model's data filters left out" in caplog.text
 
 
 # ----------------------------------------------------------------------

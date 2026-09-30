@@ -1369,20 +1369,31 @@ def hash_sampled_queries(df: pd.DataFrame, integer_root: int) -> pd.DataFrame:
 def perform_latency_linear_regression(
     df: pd.DataFrame, predictor: list, categorical: list, numeric: list
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Perform latency linear regression analysis."""
+    """Perform latency linear regression analysis.
+
+    Every indexer gets its own coefficient, reported as its latency gap in ms to the median
+    indexer (negative is faster), so none is left out as the baseline the others compare to.
+    """
     model_columns = categorical + numeric
     x = df[model_columns]
     y = df[predictor]
+    other_categorical = [column for column in categorical if column != "indexer"]
 
+    # A column for every indexer and no intercept, which the indexer columns stand in for.
+    # The usual encoding drops one indexer to make room for an intercept, which would leave it
+    # without a coefficient, and the merge step drops indexers that have none.
     preprocessor = ColumnTransformer(
         transformers=[
-            ("one_hot", OneHotEncoder(handle_unknown="ignore", drop="first"), categorical),
+            ("indexer", OneHotEncoder(handle_unknown="ignore"), ["indexer"]),
+            ("one_hot", OneHotEncoder(handle_unknown="ignore", drop="first"), other_categorical),
             ("scaler", StandardScaler(), numeric),
         ],
         remainder="passthrough",
     )
 
-    pipeline = Pipeline([("preprocessor", preprocessor), ("regressor", LinearRegression())])
+    pipeline = Pipeline(
+        [("preprocessor", preprocessor), ("regressor", LinearRegression(fit_intercept=False))]
+    )
     try:
         logger.info(
             f"Fitting linear regression model with {len(x)} samples, "
@@ -1423,16 +1434,24 @@ def perform_latency_linear_regression(
 
     # Calculate robust normalized coefficients
     indexer_rankings = results_df[
-        (results_df["Variable"].str.startswith("one_hot__indexer_"))
-        & (~results_df["Variable"].str.startswith("one_hot__indexer_network_"))
+        results_df["Variable"].str.startswith("indexer__indexer_")
     ].sort_values(by=LATENCY_COEFFICIENT_COLUMN)
 
     indexer_rankings = indexer_rankings.reset_index(drop=True)
-    indexer_rankings["Variable"] = indexer_rankings["Variable"].str.replace("one_hot__indexer_", "")
+    indexer_rankings["Variable"] = indexer_rankings["Variable"].str.replace("indexer__indexer_", "")
     indexer_rankings.rename(columns={"Variable": "indexer"}, inplace=True)
     indexer_rankings.dropna(
         subset=[LATENCY_COEFFICIENT_COLUMN, STANDARD_ERROR_COLUMN, "p-value"], inplace=True
     )
+
+    # Measure each indexer from the median one; an equal shift for all leaves normalised scores
+    # unchanged. Standard errors stay each indexer's own, since the upper bound below penalises
+    # how little data backs an estimate, not the uncertainty of the median.
+    coefficient = indexer_rankings[LATENCY_COEFFICIENT_COLUMN]
+    indexer_rankings[LATENCY_COEFFICIENT_COLUMN] = coefficient - coefficient.median()
+    t_ratio = indexer_rankings[LATENCY_COEFFICIENT_COLUMN] / indexer_rankings[STANDARD_ERROR_COLUMN]
+    # 0 / 0 only happens for the median indexer in an exact fit: no gap, not a missing estimate.
+    indexer_rankings["p-value"] = 2 * (1 - t.cdf(np.abs(t_ratio.fillna(0.0)), deg_freedom))
 
     indexer_rankings["Latency Coefficient + Error Confidence Interval"] = (
         indexer_rankings[LATENCY_COEFFICIENT_COLUMN]
@@ -1588,6 +1607,22 @@ def merge_and_prepare_dataframes(
         columns_to_check = [LATENCY_COEFFICIENT_COLUMN, STANDARD_ERROR_COLUMN, "p-value"]
         existing = [c for c in columns_to_check if c in merged.columns]
         if existing:
+            no_estimate = merged.loc[merged[existing].isna().any(axis=1), "indexer"]
+            # indexer_query_count lists exactly the indexers the latency model was given, and
+            # each of those should come back with an estimate, so a missing one is a bug.
+            given_to_model = no_estimate.isin(indexer_query_count["indexer"])
+            if given_to_model.any():
+                logger.warning(
+                    "Latency model returned no estimate for %d indexer(s) it was given, "
+                    "dropping them from scoring: %s",
+                    given_to_model.sum(),
+                    ", ".join(no_estimate[given_to_model]),
+                )
+            if (~given_to_model).any():
+                logger.info(
+                    "Dropping %d indexer(s) that the latency model's data filters left out",
+                    (~given_to_model).sum(),
+                )
             merged = merged.dropna(subset=existing)
 
     merged = pd.merge(merged, agg_df, on="indexer", how="left")
