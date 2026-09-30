@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.9.5](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.4...v2.9.5) (2026-09-30)
+
+
+### Fixed
+
+* **ci:** stop the dependency audit failing on PyPI outages ([#248](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/248)) ([577b2db](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/577b2dbde81111fc79c18a09c00dd7853a9418c8))
+* **k8s:** let each environment pick the score job's topic ([#252](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/252)) ([1d87de4](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/1d87de454ca5f569b1f131e33e0f66b04c316190))
+* **k8s:** point the iisa service image at the graphprotocol registry ([#247](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/247)) ([1800e08](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/1800e081e77625006050ba148282020514018268))
+* **subgraph:** keep the gateway API key out of score job logs ([#250](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/250)) ([1c64f23](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/1c64f23f46b9c21f91581868beb15ca8ff0447b6))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-1d87de4 ([#253](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/253)) ([f2db318](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/f2db318a4fd8ed57e28b156f78066316cf548bdb))
+
 ## [2.9.4](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.3...v2.9.4) (2026-09-28)
 
 
