@@ -79,3 +79,32 @@ class TestIterPartitionQueries:
         [(query_id, ts_ms)] = yielded
         assert query_id == "q-1"
         assert before_ms <= ts_ms <= after_ms
+
+    def test_an_empty_batch_between_data_does_not_end_the_read(self):
+        """Only 3 empty consume() calls in a row end the read; data in between resets the run."""
+        batches = [[_fake_kafka_message(1_000, 1)], [], [], [_fake_kafka_message(1_000, 2)]]
+
+        yielded, stats, consumer = _read(batches + [[], [], []])
+
+        assert yielded == [("q-1", 1_000), ("q-2", 1_000)]
+        assert stats.messages == 2
+        assert consumer.consume.call_count == 7
+
+    def test_stats_are_set_when_the_reader_is_closed_mid_batch(self):
+        batch = [_fake_kafka_message(1_000, offset, gateway_id="testnet-gw") for offset in (1, 2)]
+        batch += [_fake_kafka_message(1_000, offset) for offset in (3, 4, 5)]
+        consumer = MagicMock()
+        consumer.consume.side_effect = [batch, [], [], []]
+        stats = _PartitionReadStats()
+
+        with patch("confluent_kafka.Consumer", return_value=consumer):
+            reader = _iter_partition_queries(
+                "count", "gateway_queries", 0, 0, 5_000, {}, {"mainnet-gw"}, 100, {}, stats
+            )
+            query, _ = next(reader)
+            reader.close()
+
+        assert query.query_id == "q-3"
+        assert stats.messages == 3
+        assert stats.filtered == 2
+        consumer.close.assert_called_once()
