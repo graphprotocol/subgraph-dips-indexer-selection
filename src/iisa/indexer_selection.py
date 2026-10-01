@@ -431,52 +431,7 @@ class IndexerSelector:
         added_this_call: set[IndexerId] = set()
 
         while True:
-            best_swap: Optional[tuple[IndexerId, IndexerId, float]] = None
-
-            for existing_indexer in self.current_group:
-                # Don't replace indexers we just added in this call
-                if existing_indexer in added_this_call:
-                    continue
-
-                # Get current indexer's score
-                indexer_data = self.data[self.data["indexer"] == existing_indexer]
-                if indexer_data.empty:
-                    continue
-
-                current_score = indexer_data["weighted_score"].iloc[0]
-
-                # Only consider replacing indexers below the minimum threshold
-                if current_score >= MIN_INDEXER_SCORE:
-                    logger.debug(
-                        "deployment=%s indexer %s score=%.4f "
-                        ">= threshold=%.2f, no replacement needed",
-                        self.deployment_id,
-                        existing_indexer[:10],
-                        current_score,
-                        MIN_INDEXER_SCORE,
-                    )
-                    continue
-
-                # Find best candidate for replacing this specific indexer
-                candidate = self._find_best_replacement_or_select_best_indexer(
-                    replacing_indexer=existing_indexer
-                )
-
-                if not candidate:
-                    continue
-
-                # Get candidate's score
-                candidate_data = self.data[self.data["indexer"] == candidate]
-                if candidate_data.empty:
-                    continue
-
-                candidate_score = candidate_data["weighted_score"].iloc[0]
-
-                # Only replace if candidate is significantly better
-                if candidate_score > current_score + REPLACEMENT_MARGIN:
-                    improvement = candidate_score - current_score
-                    if best_swap is None or improvement > best_swap[2]:
-                        best_swap = (existing_indexer, candidate, improvement)
+            best_swap = self._find_best_swap(added_this_call)
 
             if best_swap:
                 old_indexer, new_indexer, improvement = best_swap
@@ -496,6 +451,68 @@ class IndexerSelector:
                     self.deployment_id,
                 )
                 break  # No more beneficial replacements available
+
+    def _score_of(self, indexer: IndexerId) -> Optional[float]:
+        """Weighted score from the indexer's first row, or None when it has no row."""
+        rows = self.data[self.data["indexer"] == indexer]
+        if rows.empty:
+            return None
+        return cast(float, rows["weighted_score"].iloc[0])
+
+    def _find_best_swap(
+        self, added_this_call: set[IndexerId]
+    ) -> Optional[tuple[IndexerId, IndexerId, float]]:
+        """Return (existing, candidate, improvement) for the group member whose
+        replacement gains the most, or None when no member has a beneficial swap.
+        Members in added_this_call are not replaced. On equal improvement the
+        member earlier in the group wins.
+        """
+        best_swap: Optional[tuple[IndexerId, IndexerId, float]] = None
+        for existing_indexer in self.current_group:
+            # Don't replace indexers we just added in this call
+            if existing_indexer in added_this_call:
+                continue
+            swap = self._swap_for(existing_indexer)
+            if swap is not None and (best_swap is None or swap[2] > best_swap[2]):
+                best_swap = swap
+        return best_swap
+
+    def _swap_for(
+        self, existing_indexer: IndexerId
+    ) -> Optional[tuple[IndexerId, IndexerId, float]]:
+        """Return (existing_indexer, candidate, improvement) when existing_indexer
+        scores below MIN_INDEXER_SCORE and its best replacement beats it by more
+        than REPLACEMENT_MARGIN; None otherwise.
+        """
+        current_score = self._score_of(existing_indexer)
+        if current_score is None:
+            return None
+
+        # Only consider replacing indexers below the minimum threshold
+        if current_score >= MIN_INDEXER_SCORE:
+            logger.debug(
+                "deployment=%s indexer %s score=%.4f >= threshold=%.2f, no replacement needed",
+                self.deployment_id,
+                existing_indexer[:10],
+                current_score,
+                MIN_INDEXER_SCORE,
+            )
+            return None
+
+        # Find best candidate for replacing this specific indexer
+        candidate = self._find_best_replacement_or_select_best_indexer(
+            replacing_indexer=existing_indexer
+        )
+        if not candidate:
+            return None
+        candidate_score = self._score_of(candidate)
+        if candidate_score is None:
+            return None
+
+        # Only replace if candidate is significantly better
+        if candidate_score > current_score + REPLACEMENT_MARGIN:
+            return existing_indexer, candidate, candidate_score - current_score
+        return None
 
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None

@@ -823,6 +823,44 @@ class TestReplaceUnderperformingIndexersOrder:
         assert processor.current_group == ["X", "C", "D"]
 
 
+class TestSwapHelpers:
+    """Tests for _score_of, _swap_for and _find_best_swap behind the replacement loop."""
+
+    SCORES = {"A": 0.05, "B": 0.10, "C": 0.50, "D": 0.80}
+
+    def test_score_of_returns_none_without_a_row(self):
+        processor = _selector_with_scores(self.SCORES, ["A", "B", "C"])
+
+        assert processor._score_of("D") == 0.80
+        assert processor._score_of("X") is None
+
+    @pytest.mark.parametrize(
+        "existing, scores, expected",
+        [
+            ("A", SCORES, ("A", "D", 0.75)),
+            ("C", SCORES, None),  # at or above MIN_INDEXER_SCORE
+            ("X", SCORES, None),  # no row
+            ("A", {**SCORES, "D": 0.55}, None),  # gain within REPLACEMENT_MARGIN
+        ],
+    )
+    def test_swap_for(self, existing, scores, expected):
+        processor = _selector_with_scores(scores, ["A", "B", "C", "X"])
+
+        swap = processor._swap_for(existing)
+
+        if expected is None:
+            assert swap is None
+        else:
+            assert swap[:2] == expected[:2]
+            assert swap[2] == pytest.approx(expected[2])
+
+    def test_find_best_swap_skips_indexers_added_this_call(self):
+        processor = _selector_with_scores(self.SCORES, ["A", "B", "C"])
+
+        assert processor._find_best_swap({"A", "B"}) is None
+        assert processor._find_best_swap({"A"})[:2] == ("B", "D")
+
+
 class TestAssignAction:
     """The assigning log line names the action picked from group size against target."""
 
