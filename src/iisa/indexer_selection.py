@@ -12,6 +12,8 @@ from typing import Callable, NewType, Optional, TypedDict, Union, cast
 import numpy as np
 import pandas as pd
 
+from .score_columns import SEL_LATENCY_CI
+
 __all__ = [
     "IndexerSelector",
     "DeploymentId",
@@ -640,11 +642,7 @@ def _normalize_metrics(
     """
     # (norm column, source column, normaliser), in the order the columns are added.
     metrics: list[tuple[str, str, Callable[[pd.Series], Union[pd.Series, float]]]] = [
-        (
-            "norm_lat_lin_reg_coefficient",
-            "Latency Coefficient + Error Confidence Interval",
-            _normalize_latency,
-        ),
+        ("norm_lat_lin_reg_coefficient", SEL_LATENCY_CI, _normalize_latency),
         # higher is better
         ("norm_uptime_score", "% up_x", _normalize_uptime_and_success_rate),
         ("norm_stake_to_fees", "stake_to_fees", _normalize_stake_to_fees),
