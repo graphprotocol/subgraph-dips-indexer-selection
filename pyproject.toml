@@ -29,6 +29,7 @@ dev = [
     "faker-airtravel>=0.4,<1.0",
     "mypy>=1.11,<2.0",
     "ruff>=0.1,<1.0",
+    "complexipy>=8.0,<9.0",
     "httpx>=0.24,<1.0",
     "pandas-stubs>=2.0,<3.0",
     # CronJob dependencies
@@ -72,7 +73,12 @@ line-length = 100
 extend-exclude = ["*_pb2.py"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+# C4 prefers comprehensions, ARG catches unused arguments, PD002 forbids in-place pandas edits.
+select = ["E", "F", "I", "W", "C4", "ARG", "PD002"]
+
+[tool.ruff.lint.per-file-ignores]
+# Fixtures and mock callbacks take arguments their signature requires but the test never reads.
+"tests/**" = ["ARG"]
 
 [tool.mypy]
 files = ["src/**/*.py", "cronjobs/compute_scores/**/*.py"]

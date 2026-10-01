@@ -31,6 +31,10 @@ jobs:
       - name: Lint
         run: ruff check src/ tests/ cronjobs/compute_scores/
 
+      # Fails when any function's cognitive complexity (how hard it is to follow) passes 15.
+      - name: Complexity
+        run: complexipy src/ cronjobs/compute_scores/ --max-complexity-allowed 15 --failed --plain
+
       - name: Test
         run: pytest --tb=short -q --cov=src --cov-fail-under=75
 
