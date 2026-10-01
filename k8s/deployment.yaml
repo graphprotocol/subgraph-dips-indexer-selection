@@ -81,7 +81,8 @@ spec:
             requests:
               cpu: 500m
               memory: 1Gi
-              ephemeral-storage: 256Mi
+              # GKE Autopilot lowers the disk limit to match this request, so the request sets the cap.
+              ephemeral-storage: 1Gi
             limits:
               cpu: "4"
               memory: 2Gi
