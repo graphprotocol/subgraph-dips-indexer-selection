@@ -699,6 +699,15 @@ class RedpandaProvider:
             return
         self._sample_pass(start_date, num_days, rows_to_use)
 
+    def _set_row_cache(
+        self, df: pd.DataFrame, start_date: date, num_days: int, rows_to_use: int
+    ) -> None:
+        """Store the sampled rows along with the window and cap they were sampled for."""
+        self._row_cache_df = df
+        self._row_cache_start_date = start_date
+        self._row_cache_num_days = num_days
+        self._row_cache_rows_to_use = rows_to_use
+
     # -----------------------------------------------------------------------
     # Internal: partition resolution
     # -----------------------------------------------------------------------
@@ -906,9 +915,8 @@ class RedpandaProvider:
         """
         Pass 2: reservoir sampling with cap = rows_to_use.
 
-        Uses extract_sample_fields for selective parsing, raw byte keys,
-        batch polling, cached partitions, deferred string conversion,
-        parallel partition consumption, and process-local PRNG.
+        Reuses pass 1's partitions when cached, samples each partition in a child process with
+        its own seeded PRNG, then merges the per-partition reservoirs.
         """
         end_dt, start_ts_ms, end_ts_ms = self._pass_window(start_date)
 
@@ -927,62 +935,18 @@ class RedpandaProvider:
 
         if not partitions:
             logger.warning("No valid partitions for sample pass")
-            self._row_cache_df = _empty_combined_df()
-            self._row_cache_start_date = start_date
-            self._row_cache_num_days = num_days
-            self._row_cache_rows_to_use = rows_to_use
+            self._set_row_cache(_empty_combined_df(), start_date, num_days, rows_to_use)
             return
 
         seed = int(os.environ.get("SCORING_SEED", start_date.strftime("%Y%m%d")))
         results = self._run_partition_workers(
             _sample_partition_worker, partitions, end_ts_ms, rows_to_use, seed
         )
-
-        # Merge per-partition reservoirs using Algorithm R streaming.
-        #
-        # The previous implementation extended every worker's rows into a single
-        # list per pair, then shuffled and truncated to rows_to_use. That held
-        # up to N_workers * rows_to_use rows per pair in the parent process
-        # before truncation — a transient ~8x spike that ran the 50Gi pod OOM
-        # for windows with heavy message volume.
-        #
-        # The streaming form below absorbs each worker's rows one at a time and
-        # applies Algorithm R at the parent, so the per-pair footprint is
-        # bounded by rows_to_use from the first overflow onwards. Statistical
-        # semantics are preserved: each retained row is uniformly sampled from
-        # the union of all worker reservoirs, matching the old shuffle-then-head.
-        merge_rng = random.Random(seed)
-        merged_reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
-        merged_absorbed: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
-        total_filtered = 0
-        # Pop from the list as we go so each worker's reservoir can be freed
-        # once absorbed, rather than pinning all N worker results until the
-        # loop completes.
-        while results:
-            reservoirs, _counts, filtered = results.pop()
-            for key, rows in reservoirs.items():
-                merged = merged_reservoirs[key]
-                absorbed = merged_absorbed[key]
-                for row in rows:
-                    if absorbed < rows_to_use:
-                        merged.append(row)
-                    else:
-                        j = merge_rng.randint(0, absorbed)
-                        if j < rows_to_use:
-                            merged[j] = row
-                    absorbed += 1
-                merged_absorbed[key] = absorbed
-            total_filtered += filtered
+        merged_reservoirs, total_filtered = _merge_worker_reservoirs(results, rows_to_use, seed)
 
         total_rows = sum(len(rows) for rows in merged_reservoirs.values())
-        if total_rows:
-            self._row_cache_df = _build_dataframe(merged_reservoirs)
-        else:
-            self._row_cache_df = _empty_combined_df()
-
-        self._row_cache_start_date = start_date
-        self._row_cache_num_days = num_days
-        self._row_cache_rows_to_use = rows_to_use
+        df = _build_dataframe(merged_reservoirs) if total_rows else _empty_combined_df()
+        self._set_row_cache(df, start_date, num_days, rows_to_use)
 
         logger.info(
             "Sample pass complete: %s rows buffered across %d pairs "
@@ -1033,6 +997,35 @@ class RedpandaProvider:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _merge_worker_reservoirs(
+    results: List[tuple], rows_to_use: int, seed: int
+) -> Tuple[Dict[Tuple[bytes, bytes], List[tuple]], int]:
+    """Merge worker reservoirs into 1 per pair with Algorithm R; return it and the filtered total.
+
+    Absorbing rows one at a time caps each pair at rows_to_use in the parent (holding every
+    worker's rows at once ran the pod out of memory) while each kept row stays a uniform sample
+    of all of them. Pops `results` from the end so each worker's reservoir is freed once absorbed.
+    """
+    merge_rng = random.Random(seed)
+    merged_reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
+    merged_absorbed: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+    total_filtered = 0
+    while results:
+        reservoirs, _counts, filtered = results.pop()
+        for key, rows in reservoirs.items():
+            merged = merged_reservoirs[key]
+            absorbed = merged_absorbed[key]
+            for row in rows:
+                if absorbed < rows_to_use:
+                    merged.append(row)
+                elif (j := merge_rng.randint(0, absorbed)) < rows_to_use:
+                    merged[j] = row
+                absorbed += 1
+            merged_absorbed[key] = absorbed
+        total_filtered += filtered
+    return merged_reservoirs, total_filtered
 
 
 def _build_dataframe(

@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-from redpanda import RedpandaProvider  # noqa: E402
+from redpanda import RedpandaProvider, _merge_worker_reservoirs  # noqa: E402
 
 
 class _InlineExecutor(Executor):
@@ -249,3 +249,19 @@ def test_multiple_pairs_independently_capped():
         assert pair_count == rows_to_use, (
             f"Pair got {pair_count} rows, expected exactly {rows_to_use}"
         )
+
+
+def test_merge_empties_worker_results_and_totals_filtered_counts():
+    """Under the cap every row is kept, absorbed from the last worker's result first."""
+    pair = (bytes(32), b"\x01" * 20)
+    results = [(*_build_worker_result(pair, 2, w)[:2], w + 1) for w in range(3)]
+
+    merged, total_filtered = _merge_worker_reservoirs(results, rows_to_use=10, seed=1)
+
+    assert results == []
+    assert total_filtered == 6
+    assert [row[0] for row in merged[pair]] == [
+        *("w02-r0000", "w02-r0001"),
+        *("w01-r0000", "w01-r0001"),
+        *("w00-r0000", "w00-r0001"),
+    ]
