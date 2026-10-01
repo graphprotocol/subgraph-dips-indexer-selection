@@ -956,6 +956,80 @@ def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[floa
         return None
 
 
+def _keep_with_dips_info(
+    df: pd.DataFrame, chain_id: str, max_grt_per_30_days: Optional[float]
+) -> tuple[pd.DataFrame, str]:
+    """Price filter step: keep indexers that answered their DIP info probe."""
+    initial_count = len(df)
+    df = df[df["dips_info_available"] == True]  # noqa: E712
+    logger.debug("price filter: %d/%d indexers have DIP info", len(df), initial_count)
+    if df.empty:
+        return df, f"all {initial_count} indexers lack DIP info (dips_info_available=False)"
+    return df, ""
+
+
+def _keep_supporting_chain(
+    df: pd.DataFrame, chain_id: str, max_grt_per_30_days: Optional[float]
+) -> tuple[pd.DataFrame, str]:
+    """Price filter step: keep indexers whose supported networks include the chain."""
+    if "dips_supported_networks" not in df.columns:
+        return df, ""
+    pre_filter = len(df)
+    df = df[df["dips_supported_networks"].apply(lambda v: _supports_chain(v, chain_id))]
+    logger.debug("price filter: %d/%d indexers support chain '%s'", len(df), pre_filter, chain_id)
+    if df.empty:
+        return df, f"none of {pre_filter} indexers support chain '{chain_id}'"
+    return df, ""
+
+
+def _keep_with_chain_price(
+    df: pd.DataFrame, chain_id: str, max_grt_per_30_days: Optional[float]
+) -> tuple[pd.DataFrame, str]:
+    """Price filter step: keep indexers that have a price set for the chain."""
+    if "dips_min_grt_per_30_days" not in df.columns:
+        return df, ""
+
+    def has_chain_price(prices_json: Any) -> bool:
+        return _extract_chain_price(prices_json, chain_id) is not None
+
+    pre_filter = len(df)
+    df = df[df["dips_min_grt_per_30_days"].apply(has_chain_price)]
+    if df.empty:
+        return df, f"none of {pre_filter} indexers have pricing configured for chain '{chain_id}'"
+    return df, ""
+
+
+def _keep_within_budget(
+    df: pd.DataFrame, chain_id: str, max_grt_per_30_days: Optional[float]
+) -> tuple[pd.DataFrame, str]:
+    """Price filter step: keep indexers priced at or below max_grt_per_30_days for the chain."""
+    if max_grt_per_30_days is None or "dips_min_grt_per_30_days" not in df.columns:
+        return df, ""
+    max_budget = max_grt_per_30_days
+
+    def within_budget(prices_json: Any) -> bool:
+        price = _extract_chain_price(prices_json, chain_id)
+        return price is not None and price <= max_budget
+
+    pre_filter = len(df)
+    df = df[df["dips_min_grt_per_30_days"].apply(within_budget)]
+    logger.debug(
+        "price filter: %d/%d indexers within budget of %s GRT/30d for chain '%s'",
+        len(df),
+        pre_filter,
+        max_grt_per_30_days,
+        chain_id,
+    )
+    if df.empty:
+        return (
+            df,
+            f"all {pre_filter} indexers exceed payment "
+            f"ceiling of {max_grt_per_30_days} GRT/30d "
+            f"for chain '{chain_id}'",
+        )
+    return df, ""
+
+
 def _filter_by_price(
     history: pd.DataFrame,
     chain_id: Optional[str],
@@ -971,78 +1045,21 @@ def _filter_by_price(
         return history, ""
 
     df = history.copy()
-    initial_count = len(df)
 
     # Only filter if we have the DIP info columns
     if "dips_info_available" not in df.columns:
         return df, ""
 
-    # Exclude indexers without DIP info
-    df = df[df["dips_info_available"] == True]  # noqa: E712
-    logger.debug("price filter: %d/%d indexers have DIP info", len(df), initial_count)
-
-    if df.empty:
-        return df, f"all {initial_count} indexers lack DIP info (dips_info_available=False)"
-
-    # Exclude indexers that don't support the chain
-    if "dips_supported_networks" in df.columns:
-        pre_filter = len(df)
-        df = df[df["dips_supported_networks"].apply(lambda v: _supports_chain(v, chain_id))]
-        logger.debug(
-            "price filter: %d/%d indexers support chain '%s'", len(df), pre_filter, chain_id
-        )
+    steps = (
+        _keep_with_dips_info,
+        _keep_supporting_chain,
+        _keep_with_chain_price,
+        _keep_within_budget,
+    )
+    for step in steps:
+        df, reason = step(df, chain_id, max_grt_per_30_days)
         if df.empty:
-            return df, f"none of {pre_filter} indexers support chain '{chain_id}'"
-
-    # Exclude indexers that don't have pricing for this chain
-    if "dips_min_grt_per_30_days" in df.columns:
-
-        def has_chain_price(prices_json):
-            price_str = _extract_chain_price(prices_json, chain_id)
-            return price_str is not None
-
-        pre_filter = len(df)
-        df = df[df["dips_min_grt_per_30_days"].apply(has_chain_price)]
-        if df.empty:
-            return (
-                df,
-                f"none of {pre_filter} indexers have pricing configured for chain '{chain_id}'",
-            )
-
-    if df.empty or max_grt_per_30_days is None:
-        return df, ""
-
-    # Exclude indexers whose price exceeds the budget
-    max_budget = max_grt_per_30_days
-
-    if "dips_min_grt_per_30_days" in df.columns:
-
-        def within_budget(prices_json):
-            price_str = _extract_chain_price(prices_json, chain_id)
-            if price_str is None:
-                return False
-            try:
-                return float(price_str) <= max_budget
-            except (ValueError, TypeError):
-                return False
-
-        pre_filter = len(df)
-        df = df[df["dips_min_grt_per_30_days"].apply(within_budget)]
-        logger.debug(
-            "price filter: %d/%d indexers within budget of %s GRT/30d for chain '%s'",
-            len(df),
-            pre_filter,
-            max_grt_per_30_days,
-            chain_id,
-        )
-        if df.empty:
-            return (
-                df,
-                f"all {pre_filter} indexers exceed payment "
-                f"ceiling of {max_grt_per_30_days} GRT/30d "
-                f"for chain '{chain_id}'",
-            )
-
+            return df, reason
     return df, ""
 
 

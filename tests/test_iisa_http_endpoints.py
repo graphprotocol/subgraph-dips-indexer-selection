@@ -2313,6 +2313,44 @@ class TestFilterByPrice:
         ]
 
 
+class TestPriceFilterSteps:
+    """Tests for the single price filter steps that _filter_by_price runs in order."""
+
+    @pytest.mark.parametrize(
+        "step_name", ["_keep_supporting_chain", "_keep_with_chain_price", "_keep_within_budget"]
+    )
+    def test_passes_rows_through_when_its_column_is_missing(self, step_name):
+        from iisa import iisa_http_endpoints
+
+        step = getattr(iisa_http_endpoints, step_name)
+        result, reason = step(pd.DataFrame([{"indexer": "0xA"}]), "arb", 1.0)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+    def test_keep_within_budget_passes_rows_through_without_a_ceiling(self):
+        from iisa.iisa_http_endpoints import _keep_within_budget
+
+        df = pd.DataFrame(
+            [{"indexer": "0xA", "dips_min_grt_per_30_days": json.dumps({"arb": 500})}]
+        )
+        result, reason = _keep_within_budget(df, "arb", None)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+    def test_keep_within_budget_drops_unpriced_rows(self):
+        from iisa.iisa_http_endpoints import _keep_within_budget
+
+        df = pd.DataFrame(
+            [
+                {"indexer": "0xA", "dips_min_grt_per_30_days": json.dumps({"arb": 100})},
+                {"indexer": "0xB", "dips_min_grt_per_30_days": json.dumps({"mainnet": 1})},
+            ]
+        )
+        result, reason = _keep_within_budget(df, "arb", 200.0)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+
 class TestBuildSelectedIndexers:
     """Tests for _build_selected_indexers -- extracts chain-specific price into response."""
 
