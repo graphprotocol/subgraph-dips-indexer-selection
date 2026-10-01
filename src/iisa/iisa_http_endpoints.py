@@ -1098,6 +1098,34 @@ def _enrich_with_chain_prices(
     return df
 
 
+def _indexer_prices(
+    history: pd.DataFrame, idx_id: str, chain_id: Optional[str]
+) -> tuple[Optional[float], Optional[float]]:
+    """Return (min_grt_per_30_days for the chain, min_grt_per_billion_entities_per_30_days)
+    from the indexer's first row in ``history``.
+
+    Both are None without a chain_id or a row; either is None when its column is missing.
+    """
+    rows = history[history["indexer"] == idx_id]
+    if rows.empty or chain_id is None:
+        return None, None
+    row = rows.iloc[0]
+
+    min_grt = None
+    if "dips_min_grt_per_30_days" in row.index:
+        min_grt = _extract_chain_price(row["dips_min_grt_per_30_days"], chain_id)
+
+    min_entity = None
+    if "dips_min_grt_per_billion_entities_per_30_days" in row.index:
+        val = row["dips_min_grt_per_billion_entities_per_30_days"]
+        try:
+            min_entity = float(val) if val is not None and pd.notna(val) else None
+        except (TypeError, ValueError):
+            min_entity = None
+
+    return min_grt, min_entity
+
+
 def _build_selected_indexers(
     indexer_ids: list[str],
     history: pd.DataFrame,
@@ -1106,22 +1134,7 @@ def _build_selected_indexers(
     """Build SelectedIndexer entries with pricing info."""
     results = []
     for idx_id in indexer_ids:
-        row = history[history["indexer"] == idx_id]
-        min_grt = None
-        min_entity = None
-
-        if not row.empty and chain_id is not None:
-            if "dips_min_grt_per_30_days" in row.columns:
-                min_grt = _extract_chain_price(
-                    row.iloc[0].get("dips_min_grt_per_30_days", "{}"), chain_id
-                )
-            if "dips_min_grt_per_billion_entities_per_30_days" in row.columns:
-                val = row.iloc[0].get("dips_min_grt_per_billion_entities_per_30_days")
-                try:
-                    min_entity = float(val) if val is not None and pd.notna(val) else None
-                except (TypeError, ValueError):
-                    min_entity = None
-
+        min_grt, min_entity = _indexer_prices(history, idx_id, chain_id)
         results.append(
             SelectedIndexer(
                 id=idx_id,

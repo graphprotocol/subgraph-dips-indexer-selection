@@ -2459,6 +2459,36 @@ class TestBuildSelectedIndexers:
         assert [(r.id, r.min_grt_per_30_days) for r in result] == [("0xb", 2.0), ("0xa", 1.0)]
 
 
+class TestIndexerPrices:
+    """Tests for _indexer_prices -- one indexer's chain price and entity price."""
+
+    HISTORY = pd.DataFrame(
+        [
+            {
+                "indexer": "0xa",
+                "dips_min_grt_per_30_days": json.dumps({"arb": 450.0}),
+                "dips_min_grt_per_billion_entities_per_30_days": 2000.0,
+            }
+        ]
+    )
+
+    @pytest.mark.parametrize(
+        "history, idx_id, chain_id, expected",
+        [
+            (HISTORY, "0xa", "arb", (450.0, 2000.0)),
+            (HISTORY, "0xa", "mainnet", (None, 2000.0)),
+            (HISTORY, "0xa", None, (None, None)),
+            (HISTORY, "0xother", "arb", (None, None)),
+            (HISTORY[["indexer"]], "0xa", "arb", (None, None)),
+            (HISTORY.drop(columns=["dips_min_grt_per_30_days"]), "0xa", "arb", (None, 2000.0)),
+        ],
+    )
+    def test_returns_chain_and_entity_price(self, history, idx_id, chain_id, expected):
+        from iisa.iisa_http_endpoints import _indexer_prices
+
+        assert _indexer_prices(history, idx_id, chain_id) == expected
+
+
 class TestLogSelectionReasoning:
     """Tests for _log_selection_reasoning -- one score breakdown line per selected indexer."""
 
