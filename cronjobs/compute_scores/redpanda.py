@@ -258,7 +258,7 @@ def _iter_partition_queries(
                 if msg.error():
                     continue
 
-                ts_type, ts_ms = msg.timestamp()
+                _, ts_ms = msg.timestamp()
                 if ts_ms < 0:
                     ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
