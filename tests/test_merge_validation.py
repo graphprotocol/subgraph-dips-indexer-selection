@@ -1,5 +1,6 @@
 """Merges that look up per-indexer data must fail on a duplicate key instead of copying rows."""
 
+import logging
 import sys
 from pathlib import Path
 
@@ -31,15 +32,19 @@ def test_indexer_geoip_merge_rejects_duplicate_indexer_url():
         merge_in_indexers_info(queries, indexers)
 
 
-def test_query_geolocation_merge_rejects_duplicate_airport_code(monkeypatch):
+def test_query_geolocation_keeps_first_row_for_a_repeated_airport_code(monkeypatch, caplog):
     airports = pd.DataFrame(
         {"IATA_code": ["LHR", "LHR"], "latitude": [51.5, 0.0], "longitude": [-0.4, 0.0]}
     )
     monkeypatch.setattr(processing, "load_iata_data", lambda: airports)
     queries = pd.DataFrame({"query_id": ["q1-LHR"]})
 
-    with pytest.raises(pd.errors.MergeError):
-        merge_in_query_geolocation_info(queries)
+    with caplog.at_level(logging.WARNING, logger=processing.logger.name):
+        result = merge_in_query_geolocation_info(queries)
+
+    assert len(result) == 1
+    assert result["src_lat"].iloc[0] == 51.5
+    assert "IATA code(s) more than once" in caplog.text
 
 
 def test_score_assembly_rejects_duplicate_indexer_in_a_lookup_table():

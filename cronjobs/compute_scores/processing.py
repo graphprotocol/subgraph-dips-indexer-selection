@@ -1206,11 +1206,24 @@ def merge_in_indexers_info(combined_queries: pd.DataFrame, indexers: pd.DataFram
     return pd.merge(combined_queries, right_df, on=["indexer", "url"], how="left", validate="m:1")
 
 
+def _drop_repeated_airport_codes(iata_df: pd.DataFrame) -> pd.DataFrame:
+    """Keep the first row per IATA code, so a repeat in the unpinned airportsdata package
+    can't stop the airport lookup below from running."""
+    repeated = iata_df["IATA_code"].duplicated()
+    if repeated.any():
+        logger.warning(
+            "airportsdata lists %d IATA code(s) more than once, keeping the first row of each: %s",
+            repeated.sum(),
+            ", ".join(iata_df.loc[repeated, "IATA_code"].unique()[:10]),
+        )
+    return iata_df[~repeated]
+
+
 def merge_in_query_geolocation_info(combined_queries: pd.DataFrame) -> pd.DataFrame:
     """Merge IATA geolocation info based on query_id suffix."""
     combined_queries["IATA_code"] = combined_queries["query_id"].str[-3:]
 
-    iata_info = load_iata_data()
+    iata_info = _drop_repeated_airport_codes(load_iata_data())
     right_df = iata_info.rename(columns=GEOIP_SRC_COLUMN_MAPPING)
 
     return pd.merge(combined_queries, right_df, on="IATA_code", how="left", validate="m:1")
