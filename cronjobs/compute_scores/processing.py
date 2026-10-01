@@ -38,10 +38,11 @@ logger = logging.getLogger(__name__)
 
 # Constants
 LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER = 1.5
-# Column names the latency regression uses for each indexer's coefficient and its
-# standard error.
+# Column names the latency regression uses for each indexer's coefficient, its standard
+# error, and the coefficient plus a multiple of that error (a pessimistic latency estimate).
 LATENCY_COEFFICIENT_COLUMN = "Latency Coefficient"
 STANDARD_ERROR_COLUMN = "Standard Error"
+LATENCY_UPPER_BOUND_COLUMN = "Latency Coefficient + Error Confidence Interval"
 REQUEST_STATUS_OK = "200 OK"
 REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK = "Unavailable(MissingBlock)"
 
@@ -857,7 +858,7 @@ def _neutral_latency_rankings(combined_queries: pd.DataFrame) -> tuple[pd.DataFr
             LATENCY_COEFFICIENT_COLUMN: 0.0,
             STANDARD_ERROR_COLUMN: 0.0,
             "p-value": 1.0,
-            "Latency Coefficient + Error Confidence Interval": 0.0,
+            LATENCY_UPPER_BOUND_COLUMN: 0.0,
         }
     )
     indexer_query_count = pd.DataFrame({"indexer": unique_indexers, "query_count": 0})
@@ -979,12 +980,10 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     # Latency metrics
     scores["lat_lin_reg_coefficient"] = merged.get(LATENCY_COEFFICIENT_COLUMN)
     scores["lat_coefficient_std_error"] = merged.get(STANDARD_ERROR_COLUMN)
-    scores["lat_coefficient_upper_bound"] = merged.get(
-        "Latency Coefficient + Error Confidence Interval"
-    )
+    scores["lat_coefficient_upper_bound"] = merged.get(LATENCY_UPPER_BOUND_COLUMN)
 
     # Compute normalized latency score (lower latency = higher score)
-    lat_raw = merged.get("Latency Coefficient + Error Confidence Interval")
+    lat_raw = merged.get(LATENCY_UPPER_BOUND_COLUMN)
     if lat_raw is not None:
         scores["lat_normalized_score"] = normalize_to_0_1_inverted(lat_raw)
     else:
@@ -1473,7 +1472,7 @@ def _indexer_latency_rankings(results_df: pd.DataFrame, deg_freedom: int) -> pd.
     # 0 / 0 only happens for the median indexer in an exact fit: no gap, not a missing estimate.
     indexer_rankings["p-value"] = 2 * (1 - t.cdf(np.abs(t_ratio.fillna(0.0)), deg_freedom))
 
-    indexer_rankings["Latency Coefficient + Error Confidence Interval"] = (
+    indexer_rankings[LATENCY_UPPER_BOUND_COLUMN] = (
         indexer_rankings[LATENCY_COEFFICIENT_COLUMN]
         + LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER * indexer_rankings[STANDARD_ERROR_COLUMN]
     )
