@@ -444,10 +444,8 @@ async def _fetch_single_graph_node_version_async(
             ValueError,
             AttributeError,
         ) as e:
-            # Catch tuple deliberately broad: a single misbehaving indexer
-            # returning HTML / invalid UTF-8 (a ValueError subclass) / a
-            # malformed shape would otherwise propagate through gather()
-            # and crash the whole run.
+            # Deliberately broad: 1 indexer returning HTML, invalid UTF-8 (a ValueError)
+            # or a malformed shape would otherwise crash the whole run through gather().
             last_error = e
         if _is_deterministic_client_error(last_error):
             break
@@ -734,10 +732,9 @@ def default_scoring_seed(start_date: date) -> int:
 def _resolve_geoip_or_demote(combined_queries: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
     """Merge indexer and query geolocation into the queries; return (queries, geoip_available).
 
-    When no indexer resolved to a public location (the normal local-network / Docker case,
-    where every indexer sits on a bridge-network IP) the queries are returned untouched with
-    geoip_available=False so the caller takes the partial path instead of a distance
-    pipeline that would throw anyway.
+    When no indexer resolved to a public location (normal on a local Docker network, where
+    every indexer has a private IP) the queries come back untouched with geoip_available=False,
+    so the caller takes the partial path instead of a distance step that would fail anyway.
     """
     indexers_df = resolve_indexer_geoip(combined_queries)
 
