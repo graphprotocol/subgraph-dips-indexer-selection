@@ -1397,8 +1397,10 @@ def _fit_latency_model(
         remainder="passthrough",
     )
 
+    # The pipeline is fitted once per run, so caching its fitted steps would gain nothing.
     pipeline = Pipeline(
-        [("preprocessor", preprocessor), ("regressor", LinearRegression(fit_intercept=False))]
+        [("preprocessor", preprocessor), ("regressor", LinearRegression(fit_intercept=False))],
+        memory=None,
     )
     try:
         logger.info(
