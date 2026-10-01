@@ -15,6 +15,8 @@ spec:
       labels:
         app: iisa
     spec:
+      # The service never calls the Kubernetes API, so it has no use for a service account token.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
