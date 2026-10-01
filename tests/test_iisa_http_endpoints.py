@@ -2591,6 +2591,42 @@ class TestLogSelectionReasoning:
         assert self._log_lines(self._processor(data, current_group), caplog) == []
 
 
+class TestScoreBreakdown:
+    """Tests for _score_breakdown -- one indexer's rounded score parts for the selection log."""
+
+    def test_splits_score_over_weighted_metrics(self):
+        from iisa.iisa_http_endpoints import _score_breakdown
+
+        row = pd.Series(
+            {
+                "norm_stake_to_fees": 1.0,
+                "norm_uptime_score": 0.5,
+                "norm_success_rate": float("nan"),
+                "weighted_score": 0.75,
+            }
+        )
+        weights = {"stake_to_fees": 0.25, "uptime_score": 0.25, "success_rate": 0.5}
+
+        assert _score_breakdown(row, weights) == (
+            0.75,
+            {"stake_to_fees": 1.0, "uptime": 0.5},
+            {"stake_to_fees": 0.25, "uptime": 0.25},
+            {"stake_to_fees": 0.5, "uptime": 0.25},
+        )
+
+    def test_returns_no_score_and_no_contributions_when_unweighted(self):
+        from iisa.iisa_http_endpoints import _score_breakdown
+
+        row = pd.Series({"norm_stake_to_fees": 1.0})
+
+        assert _score_breakdown(row, {"stake_to_fees": 0.0}) == (
+            None,
+            {"stake_to_fees": 1.0},
+            {"stake_to_fees": 0.0},
+            {},
+        )
+
+
 class TestEnrichWithChainPrices:
     """Tests for _enrich_with_chain_prices -- adds price columns for scoring."""
 
