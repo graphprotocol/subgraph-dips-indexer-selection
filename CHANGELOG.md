@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.9.8](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.7...v2.9.8) (2026-10-01)
+
+
+### Fixed
+
+* **k8s:** request 1Gi of local disk so the service keeps a 1Gi cap ([#280](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/280)) ([340df7d](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/340df7d4439a181ffeb9fc1b464b6dceeef33561))
+
 ## [2.9.7](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.6...v2.9.7) (2026-10-01)
 
 
