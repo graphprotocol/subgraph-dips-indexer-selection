@@ -868,7 +868,7 @@ def _attach_dips_info(merged: pd.DataFrame, indexer_urls: Dict[str, str]) -> pd.
     """Merge each indexer's DIP pricing into the scores, or fill the columns with no-data values."""
     if indexer_urls:
         dips_info_df = fetch_dips_info(indexer_urls)
-        merged = pd.merge(merged, dips_info_df, on="indexer", how="left")
+        merged = pd.merge(merged, dips_info_df, on="indexer", how="left", validate="m:1")
         merged["dips_info_available"] = merged["dips_info_available"].fillna(False)
         return merged
 
@@ -1203,7 +1203,7 @@ def adjust_rows(initial_query_results: pd.DataFrame, target_rows: int) -> int:
 def merge_in_indexers_info(combined_queries: pd.DataFrame, indexers: pd.DataFrame) -> pd.DataFrame:
     """Merge indexer GeoIP info into combined queries."""
     right_df = indexers.rename(columns=GEOIP_DST_COLUMN_MAPPING)
-    return pd.merge(combined_queries, right_df, on=["indexer", "url"], how="left")
+    return pd.merge(combined_queries, right_df, on=["indexer", "url"], how="left", validate="m:1")
 
 
 def merge_in_query_geolocation_info(combined_queries: pd.DataFrame) -> pd.DataFrame:
@@ -1213,7 +1213,7 @@ def merge_in_query_geolocation_info(combined_queries: pd.DataFrame) -> pd.DataFr
     iata_info = load_iata_data()
     right_df = iata_info.rename(columns=GEOIP_SRC_COLUMN_MAPPING)
 
-    return pd.merge(combined_queries, right_df, on="IATA_code", how="left")
+    return pd.merge(combined_queries, right_df, on="IATA_code", how="left", validate="m:1")
 
 
 def load_iata_data() -> pd.DataFrame:
@@ -1549,7 +1549,7 @@ def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> 
     observed_restricted = df_copy.groupby("indexer")["observed_duration_restricted"].sum()
 
     merged_restricted = pd.merge(
-        observed_restricted, uptime_restricted, on="indexer", how="left"
+        observed_restricted, uptime_restricted, on="indexer", how="left", validate="m:1"
     ).reset_index()
     merged_restricted["% up"] = round(
         merged_restricted["uptime_duration_restricted"]
@@ -1559,13 +1559,15 @@ def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> 
     )
     merged_restricted = merged_restricted.sort_values(by="% up", ascending=False)
 
-    merged_full = pd.merge(observed_full, uptime_full, on="indexer", how="left").reset_index()
+    merged_full = pd.merge(
+        observed_full, uptime_full, on="indexer", how="left", validate="m:1"
+    ).reset_index()
     merged_full["% up"] = round(
         merged_full["uptime_duration_full"] / merged_full["observed_duration_full"] * 100, 3
     )
     merged_full = merged_full.sort_values(by="% up", ascending=False)
 
-    return pd.merge(merged_restricted, merged_full, on="indexer", how="left")
+    return pd.merge(merged_restricted, merged_full, on="indexer", how="left", validate="m:1")
 
 
 def aggregate_indexer_info(df: pd.DataFrame) -> pd.DataFrame:
@@ -1618,7 +1620,7 @@ def merge_and_prepare_dataframes(
     columns are NaN. When False (partial mode with synthetic latency), skips
     the dropna since synthetic values have no NaN by construction.
     """
-    merged = pd.merge(indexer_uptime, indexer_rankings, on="indexer", how="left")
+    merged = pd.merge(indexer_uptime, indexer_rankings, on="indexer", how="left", validate="m:1")
 
     columns_to_drop = ["observed_duration_full", "uptime_duration_full", "% up_y"]
     merged = merged.drop(columns=[c for c in columns_to_drop if c in merged.columns])
@@ -1645,10 +1647,10 @@ def merge_and_prepare_dataframes(
                 )
             merged = merged.dropna(subset=existing)
 
-    merged = pd.merge(merged, agg_df, on="indexer", how="left")
-    merged = pd.merge(merged, indexer_success_rate, on="indexer", how="left")
-    merged = pd.merge(merged, stake_to_fees, on="indexer", how="left")
-    merged = pd.merge(merged, indexer_query_count, on="indexer", how="left")
+    merged = pd.merge(merged, agg_df, on="indexer", how="left", validate="m:1")
+    merged = pd.merge(merged, indexer_success_rate, on="indexer", how="left", validate="m:1")
+    merged = pd.merge(merged, stake_to_fees, on="indexer", how="left", validate="m:1")
+    merged = pd.merge(merged, indexer_query_count, on="indexer", how="left", validate="m:1")
 
     return merged
 
@@ -1696,7 +1698,7 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
 
     # Merge real pricing data from /dips/info
     if not dips_info_df.empty:
-        scores = pd.merge(scores, dips_info_df, on="indexer", how="left")
+        scores = pd.merge(scores, dips_info_df, on="indexer", how="left", validate="m:1")
         scores["dips_info_available"] = scores["dips_info_available"].fillna(False)
     else:
         scores["dips_info_available"] = False
