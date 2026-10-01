@@ -145,7 +145,7 @@ class TestCallersHideKey:
         provider = _provider_with_keyed_url()
 
         with patch("subgraph.requests.post", side_effect=_connection_error()):
-            result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+            result = provider.fetch_stake_to_fees()
 
         assert result.empty
         assert "Failed to fetch stake data" in caplog.text

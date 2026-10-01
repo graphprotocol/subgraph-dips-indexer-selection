@@ -846,7 +846,7 @@ class TestFetchStakeToFees:
         with patch(
             "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
         ):
-            result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+            result = provider.fetch_stake_to_fees()
 
         # Assert
         # Indexer 1: (1000000 - 0) / 100 = 10000
@@ -867,7 +867,7 @@ class TestFetchStakeToFees:
         with patch(
             "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
         ):
-            result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+            result = provider.fetch_stake_to_fees()
 
         # Assert
         assert pd.isna(result.loc[EXPECTED_INDEXER, "stake_to_fees"])
@@ -880,7 +880,7 @@ class TestFetchStakeToFees:
                 provider = RedpandaProvider()
 
         # Act
-        result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+        result = provider.fetch_stake_to_fees()
 
         # Assert
         assert result.empty
@@ -905,7 +905,7 @@ class TestFetchStakeToFees:
         with patch(
             "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
         ):
-            result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+            result = provider.fetch_stake_to_fees()
 
         # Assert
         assert result.loc[EXPECTED_INDEXER, "stake_to_fees"] == 10000.0
@@ -924,7 +924,7 @@ class TestFetchStakeToFees:
         with patch(
             "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
         ):
-            result = provider.fetch_stake_to_fees("2024-01-01T00:00:00Z")
+            result = provider.fetch_stake_to_fees()
 
         # Assert
         assert result.index.name == "indexer"

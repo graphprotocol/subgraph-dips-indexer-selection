@@ -1654,7 +1654,6 @@ class TestComputeAllScoresGeoipDemotion:
             result = compute_all_scores(
                 provider=mock_provider,
                 start_date=date(2026, 5, 1),
-                start_ts="2026-05-01T00:00:00Z",
                 num_days=28,
                 target_rows=20_000_000,
                 geoip_available=True,
@@ -1723,7 +1722,6 @@ class TestComputeAllScoresGeoipDemotion:
                 compute_all_scores(
                     provider=mock_provider,
                     start_date=date(2026, 5, 1),
-                    start_ts="2026-05-01T00:00:00Z",
                     num_days=28,
                     target_rows=20_000_000,
                     geoip_available=True,
@@ -1778,7 +1776,6 @@ class TestComputeAllScoresGeoipDemotion:
         result = compute_all_scores(
             provider=mock_provider,
             start_date=date(2026, 5, 1),
-            start_ts="2026-05-01T00:00:00Z",
             num_days=28,
             target_rows=20_000_000,
             geoip_available=False,

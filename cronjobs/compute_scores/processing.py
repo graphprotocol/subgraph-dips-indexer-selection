@@ -883,7 +883,6 @@ def _attach_dips_info(merged: pd.DataFrame, indexer_urls: Dict[str, str]) -> pd.
 def compute_all_scores(
     provider,
     start_date: date,
-    start_ts: str,
     num_days: int,
     target_rows: int,
     geoip_available: bool = True,
@@ -927,7 +926,7 @@ def compute_all_scores(
     indexer_success_rate = calculate_indexer_success_rate(combined_queries)
     indexer_uptime = calculate_indexer_uptime(data_for_uptime)
 
-    stake_to_fees = provider.fetch_stake_to_fees(start_ts)
+    stake_to_fees = provider.fetch_stake_to_fees()
 
     agg_df = aggregate_indexer_info(combined_queries)
 

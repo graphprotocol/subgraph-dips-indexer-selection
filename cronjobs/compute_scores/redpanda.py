@@ -567,7 +567,7 @@ class RedpandaProvider:
         logger.info("Combined query results from Redpanda: %d rows (%.1f MB)", len(df), memory_mb)
         return df
 
-    def fetch_stake_to_fees(self, start_ts: str) -> pd.DataFrame:
+    def fetch_stake_to_fees(self) -> pd.DataFrame:
         """
         Compute stake-to-fees ratio by combining subgraph stake data with
         fee totals accumulated during the Redpanda replay.

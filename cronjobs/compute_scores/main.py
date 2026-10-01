@@ -106,7 +106,6 @@ def _run_full_pipeline(
     """
     end_date = date.today()
     start_date = end_date - timedelta(days=NUM_DAYS)
-    start_ts = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     mode_label = "full" if geoip_available else "partial (no GeoIP)"
     logger.info("Attempting %s pipeline for %s to %s", mode_label, start_date, end_date)
@@ -114,7 +113,6 @@ def _run_full_pipeline(
         scores_df = compute_all_scores(
             provider=provider,
             start_date=start_date,
-            start_ts=start_ts,
             num_days=NUM_DAYS,
             target_rows=TARGET_ROWS,
             geoip_available=geoip_available,
