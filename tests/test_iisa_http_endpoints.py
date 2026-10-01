@@ -1,6 +1,7 @@
 """Tests for the IISA HTTP API endpoints."""
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -2188,6 +2189,172 @@ class TestFilterByPrice:
         result, reason = _filter_by_price(df, "arb", None)
         assert result.empty
 
+    def _priced(self, indexer, networks, prices, dips_info=True):
+        return {
+            "indexer": indexer,
+            "dips_info_available": dips_info,
+            "dips_supported_networks": json.dumps(networks),
+            "dips_min_grt_per_30_days": json.dumps(prices),
+        }
+
+    def test_returns_every_row_when_dips_info_column_missing(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history([{"indexer": "0xA"}, {"indexer": "0xB"}])
+        result, reason = _filter_by_price(df, "arb", 1.0)
+        assert list(result["indexer"]) == ["0xA", "0xB"]
+        assert reason == ""
+
+    def test_reason_text_when_all_lack_dips_info(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                self._priced("0xA", ["arb"], {"arb": 100}, dips_info=False),
+                self._priced("0xB", ["arb"], {"arb": 100}, dips_info=False),
+            ]
+        )
+        _, reason = _filter_by_price(df, "arb", None)
+        assert reason == "all 2 indexers lack DIP info (dips_info_available=False)"
+
+    def test_reason_text_when_none_support_chain(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                self._priced("0xA", ["mainnet"], {"arb": 100}),
+                self._priced("0xB", ["mainnet"], {"arb": 100}),
+            ]
+        )
+        result, reason = _filter_by_price(df, "arb", None)
+        assert result.empty
+        assert reason == "none of 2 indexers support chain 'arb'"
+
+    def test_reason_text_when_none_priced_for_chain(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history([self._priced("0xA", ["arb"], {"mainnet": 100})])
+        _, reason = _filter_by_price(df, "arb", None)
+        assert reason == "none of 1 indexers have pricing configured for chain 'arb'"
+
+    def test_reason_text_when_all_over_budget(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history([self._priced("0xA", ["arb"], {"arb": 500})])
+        _, reason = _filter_by_price(df, "arb", 200.0)
+        assert reason == "all 1 indexers exceed payment ceiling of 200.0 GRT/30d for chain 'arb'"
+
+    def test_unparsable_chain_price_counts_as_unpriced(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history([self._priced("0xA", ["arb"], {"arb": "abc"})])
+        result, reason = _filter_by_price(df, "arb", 200.0)
+        assert result.empty
+        assert reason == "none of 1 indexers have pricing configured for chain 'arb'"
+
+    def test_price_equal_to_budget_is_kept(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history([self._priced("0xA", ["arb"], {"arb": 200})])
+        result, reason = _filter_by_price(df, "arb", 200.0)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+    def test_skips_chain_step_when_networks_column_missing(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        row = self._priced("0xA", [], {"arb": 100})
+        del row["dips_supported_networks"]
+        result, reason = _filter_by_price(self._make_history([row]), "arb", 200.0)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+    def test_skips_price_and_budget_steps_when_price_column_missing(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        row = self._priced("0xA", ["arb"], {})
+        del row["dips_min_grt_per_30_days"]
+        result, reason = _filter_by_price(self._make_history([row]), "arb", 1.0)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+    def test_does_not_modify_the_input_frame(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                self._priced("0xA", ["arb"], {"arb": 100}),
+                self._priced("0xB", ["arb"], {"arb": 500}),
+            ]
+        )
+        _filter_by_price(df, "arb", 200.0)
+        assert list(df["indexer"]) == ["0xA", "0xB"]
+
+    def test_logs_each_step_at_debug(self, caplog):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                self._priced("0xA", ["arb"], {"arb": 100}),
+                self._priced("0xB", ["arb"], {"arb": 500}),
+                self._priced("0xC", ["arb"], {"arb": 100}, dips_info=False),
+                self._priced("0xD", ["mainnet"], {"mainnet": 100}),
+            ]
+        )
+        with caplog.at_level(logging.DEBUG, logger="iisa-service"):
+            result, reason = _filter_by_price(df, "arb", 200.0)
+
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+        assert [r.getMessage() for r in caplog.records if r.name == "iisa-service"] == [
+            "price filter: 3/4 indexers have DIP info",
+            "price filter: 2/3 indexers support chain 'arb'",
+            "price filter: 1/2 indexers within budget of 200.0 GRT/30d for chain 'arb'",
+        ]
+
+
+class TestPriceFilterSteps:
+    """Tests for the single price filter steps that _filter_by_price runs in order."""
+
+    @pytest.mark.parametrize(
+        "step_name, args",
+        [
+            ("_keep_supporting_chain", ("arb",)),
+            ("_keep_with_chain_price", ("arb",)),
+            ("_keep_within_budget", ("arb", 1.0)),
+        ],
+    )
+    def test_passes_rows_through_when_its_column_is_missing(self, step_name, args):
+        from iisa import iisa_http_endpoints
+
+        step = getattr(iisa_http_endpoints, step_name)
+        result, reason = step(pd.DataFrame([{"indexer": "0xA"}]), *args)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+    def test_keep_within_budget_passes_rows_through_without_a_ceiling(self):
+        from iisa.iisa_http_endpoints import _keep_within_budget
+
+        df = pd.DataFrame(
+            [{"indexer": "0xA", "dips_min_grt_per_30_days": json.dumps({"arb": 500})}]
+        )
+        result, reason = _keep_within_budget(df, "arb", None)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+    def test_keep_within_budget_drops_unpriced_rows(self):
+        from iisa.iisa_http_endpoints import _keep_within_budget
+
+        df = pd.DataFrame(
+            [
+                {"indexer": "0xA", "dips_min_grt_per_30_days": json.dumps({"arb": 100})},
+                {"indexer": "0xB", "dips_min_grt_per_30_days": json.dumps({"mainnet": 1})},
+            ]
+        )
+        result, reason = _keep_within_budget(df, "arb", 200.0)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
 
 class TestBuildSelectedIndexers:
     """Tests for _build_selected_indexers -- extracts chain-specific price into response."""
@@ -2246,6 +2413,223 @@ class TestBuildSelectedIndexers:
         history = pd.DataFrame([{"indexer": "0xother"}])
         result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
         assert result[0].min_grt_per_30_days is None
+
+    def test_returns_none_prices_when_price_columns_missing(self):
+        from iisa.iisa_http_endpoints import _build_selected_indexers
+
+        history = pd.DataFrame([{"indexer": "0xa"}])
+        result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
+        assert result[0].min_grt_per_30_days is None
+        assert result[0].min_grt_per_billion_entities_per_30_days is None
+
+    @pytest.mark.parametrize(
+        "entity_value, expected",
+        [(float("nan"), None), ("2000", 2000.0), ("abc", None), (0, 0.0)],
+    )
+    def test_entity_price_parsing(self, entity_value, expected):
+        from iisa.iisa_http_endpoints import _build_selected_indexers
+
+        history = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_min_grt_per_30_days": json.dumps({"arbitrum-one": 450.0}),
+                    "dips_min_grt_per_billion_entities_per_30_days": entity_value,
+                }
+            ]
+        )
+        result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
+        assert result[0].min_grt_per_billion_entities_per_30_days == expected
+
+    def test_entity_price_is_none_when_no_chain_id(self):
+        from iisa.iisa_http_endpoints import _build_selected_indexers
+
+        history = pd.DataFrame(
+            [{"indexer": "0xa", "dips_min_grt_per_billion_entities_per_30_days": 2000.0}]
+        )
+        result = _build_selected_indexers(["0xa"], history, None)
+        assert result[0].min_grt_per_billion_entities_per_30_days is None
+
+    def test_uses_first_row_and_keeps_requested_order(self):
+        from iisa.iisa_http_endpoints import _build_selected_indexers
+
+        history = pd.DataFrame(
+            [
+                {"indexer": "0xa", "dips_min_grt_per_30_days": json.dumps({"arb": 1.0})},
+                {"indexer": "0xb", "dips_min_grt_per_30_days": json.dumps({"arb": 2.0})},
+                {"indexer": "0xa", "dips_min_grt_per_30_days": json.dumps({"arb": 3.0})},
+            ]
+        )
+        result = _build_selected_indexers(["0xb", "0xa"], history, "arb")
+        assert [(r.id, r.min_grt_per_30_days) for r in result] == [("0xb", 2.0), ("0xa", 1.0)]
+
+
+class TestIndexerPrices:
+    """Tests for _indexer_prices -- one indexer's chain price and entity price."""
+
+    HISTORY = pd.DataFrame(
+        [
+            {
+                "indexer": "0xa",
+                "dips_min_grt_per_30_days": json.dumps({"arb": 450.0}),
+                "dips_min_grt_per_billion_entities_per_30_days": 2000.0,
+            }
+        ]
+    )
+
+    @pytest.mark.parametrize(
+        "history, idx_id, chain_id, expected",
+        [
+            (HISTORY, "0xa", "arb", (450.0, 2000.0)),
+            (HISTORY, "0xa", "mainnet", (None, 2000.0)),
+            (HISTORY, "0xa", None, (None, None)),
+            (HISTORY, "0xother", "arb", (None, None)),
+            (HISTORY[["indexer"]], "0xa", "arb", (None, None)),
+            (HISTORY.drop(columns=["dips_min_grt_per_30_days"]), "0xa", "arb", (None, 2000.0)),
+        ],
+    )
+    def test_returns_chain_and_entity_price(self, history, idx_id, chain_id, expected):
+        from iisa.iisa_http_endpoints import _indexer_prices
+
+        assert _indexer_prices(history, idx_id, chain_id) == expected
+
+
+class TestLogSelectionReasoning:
+    """Tests for _log_selection_reasoning -- one score breakdown line per selected indexer."""
+
+    WEIGHTS = {
+        "stake_to_fees": 0.5,
+        "base_price_per_epoch": 0.25,
+        "lat_lin_reg_coefficient": 0.25,
+        "success_rate": 0.5,
+        "price_per_entity": 0.1,
+    }
+
+    def _processor(self, data, current_group, weights=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            data=data,
+            current_group=current_group,
+            weights=self.WEIGHTS if weights is None else weights,
+        )
+
+    def _log_lines(self, processor, caplog):
+        from iisa.iisa_http_endpoints import _log_selection_reasoning
+
+        with caplog.at_level(logging.INFO, logger="iisa-service"):
+            _log_selection_reasoning(processor, "QmDeployment")
+        return [r.getMessage() for r in caplog.records if r.name == "iisa-service"]
+
+    def test_logs_breakdown_for_selected_indexers_only(self, caplog):
+        nan = float("nan")
+        data = pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "norm_stake_to_fees": 0.5,
+                    "norm_base_price_per_epoch": 1.0,
+                    "norm_lat_lin_reg_coefficient": 0.25,
+                    "norm_uptime_score": 1.0,
+                    "norm_success_rate": 0.0,
+                    "norm_price_per_entity": nan,
+                    "weighted_score": 0.123456,
+                },
+                {
+                    "indexer": "0xb",
+                    "norm_stake_to_fees": nan,
+                    "norm_base_price_per_epoch": nan,
+                    "norm_lat_lin_reg_coefficient": nan,
+                    "norm_uptime_score": nan,
+                    "norm_success_rate": nan,
+                    "norm_price_per_entity": nan,
+                    "weighted_score": nan,
+                },
+                {
+                    "indexer": "0xc",
+                    "norm_stake_to_fees": 1.0,
+                    "norm_base_price_per_epoch": 1.0,
+                    "norm_lat_lin_reg_coefficient": 1.0,
+                    "norm_uptime_score": 1.0,
+                    "norm_success_rate": 1.0,
+                    "norm_price_per_entity": 1.0,
+                    "weighted_score": 1.0,
+                },
+            ]
+        )
+
+        lines = self._log_lines(self._processor(data, ["0xb", "0xa"]), caplog)
+
+        # Uptime has no weight and price_per_entity is NaN, so both are left out.
+        assert lines == [
+            "selected indexer=0xa score=0.1235 "
+            "components={'stake_to_fees': 0.5, 'base_price': 1.0, 'latency': 0.25, "
+            "'success_rate': 0.0} "
+            "weights={'stake_to_fees': 0.5, 'base_price': 0.25, 'latency': 0.25, "
+            "'success_rate': 0.5} "
+            "contributions={'stake_to_fees': 0.1667, 'base_price': 0.1667, "
+            "'latency': 0.0417, 'success_rate': 0.0} "
+            "deployment=QmDeployment",
+            "selected indexer=0xb score=0.0000 components={} weights={} contributions={} "
+            "deployment=QmDeployment",
+        ]
+
+    def test_zero_total_weight_logs_no_contributions(self, caplog):
+        data = pd.DataFrame([{"indexer": "0xa", "norm_stake_to_fees": 0.5}])
+
+        lines = self._log_lines(self._processor(data, ["0xa"], {"stake_to_fees": 0.0}), caplog)
+
+        assert lines == [
+            "selected indexer=0xa score=0.0000 components={'stake_to_fees': 0.5} "
+            "weights={'stake_to_fees': 0.0} contributions={} deployment=QmDeployment"
+        ]
+
+    @pytest.mark.parametrize(
+        "data, current_group",
+        [
+            (None, ["0xa"]),
+            (pd.DataFrame(), ["0xa"]),
+            (pd.DataFrame([{"indexer": "0xa"}]), []),
+        ],
+    )
+    def test_logs_nothing_without_data_or_selection(self, data, current_group, caplog):
+        assert self._log_lines(self._processor(data, current_group), caplog) == []
+
+
+class TestScoreBreakdown:
+    """Tests for _score_breakdown -- one indexer's rounded score parts for the selection log."""
+
+    def test_splits_score_over_weighted_metrics(self):
+        from iisa.iisa_http_endpoints import _score_breakdown
+
+        row = pd.Series(
+            {
+                "norm_stake_to_fees": 1.0,
+                "norm_uptime_score": 0.5,
+                "norm_success_rate": float("nan"),
+                "weighted_score": 0.75,
+            }
+        )
+        weights = {"stake_to_fees": 0.25, "uptime_score": 0.25, "success_rate": 0.5}
+
+        assert _score_breakdown(row, weights) == (
+            0.75,
+            {"stake_to_fees": 1.0, "uptime": 0.5},
+            {"stake_to_fees": 0.25, "uptime": 0.25},
+            {"stake_to_fees": 0.5, "uptime": 0.25},
+        )
+
+    def test_returns_no_score_and_no_contributions_when_unweighted(self):
+        from iisa.iisa_http_endpoints import _score_breakdown
+
+        row = pd.Series({"norm_stake_to_fees": 1.0})
+
+        assert _score_breakdown(row, {"stake_to_fees": 0.0}) == (
+            None,
+            {"stake_to_fees": 1.0},
+            {"stake_to_fees": 0.0},
+            {},
+        )
 
 
 class TestEnrichWithChainPrices:
