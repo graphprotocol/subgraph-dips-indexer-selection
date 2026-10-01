@@ -841,8 +841,8 @@ class RedpandaProvider:
         """
         Pass 1: lightweight scan counting (deployment, indexer) pairs.
 
-        Uses extract_keys_and_fees for minimal parsing, raw byte keys,
-        batch polling, and parallel partition consumption.
+        Counts pairs and sums fees for each partition in a child process, keyed on raw
+        bytes, and converts the keys to CID and hex strings once after merging.
         """
         end_dt, start_ts_ms, end_ts_ms = self._pass_window(start_date)
 
