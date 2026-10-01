@@ -186,11 +186,7 @@ class IndexerSelector:
                     "last_known_slashable_stake"
                 ] / effective_fees.replace(0.0, float("nan"))
                 # Drop pre-normalised column so _normalize_metrics recomputes it
-                self.data.drop(
-                    columns=["norm_stake_to_fees"],
-                    errors="ignore",
-                    inplace=True,
-                )
+                self.data = self.data.drop(columns=["norm_stake_to_fees"], errors="ignore")
 
             adjusted_count = (dips_adjustment > 0).sum()
             logger.info(
@@ -547,10 +543,10 @@ class IndexerSelector:
         )
 
         # The candidates we could select are those that are not unpickable
-        candidates = self.data[~self.data["indexer"].isin(unpickable_indexers)].copy()
+        candidates = self.data[~self.data["indexer"].isin(unpickable_indexers)]
 
         # Sort the candidates by weighted score, highest score first
-        candidates.sort_values(by="weighted_score", ascending=False, inplace=True)
+        candidates = candidates.sort_values(by="weighted_score", ascending=False)
         logger.debug(
             "deployment=%s candidates: %d eligible out of %d total (excluded %d unpickable)",
             self.deployment_id,

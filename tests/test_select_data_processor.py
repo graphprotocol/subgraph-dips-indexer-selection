@@ -861,6 +861,34 @@ class TestSwapHelpers:
         assert processor._find_best_swap({"A"})[:2] == ("B", "D")
 
 
+class TestOptimisticDipsFees:
+    """Expected DIPs fees join the query fees before stake_to_fees is normalised."""
+
+    def test_recomputes_stake_to_fees_and_its_normalised_column(self):
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C"],
+                "destination_loc": ["loc1", "loc2", "loc3"],
+                "org": ["org1", "org2", "org3"],
+                "last_known_slashable_stake": [100.0, 200.0, 300.0],
+                "total_query_fees": [10.0, 10.0, 10.0],
+                # Stale pre-normalised values that must be recomputed, not kept.
+                "norm_stake_to_fees": [0.5, 0.5, 0.5],
+            }
+        )
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            optimistic_dips_fees={"A": 90.0},
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["stake_to_fees"]) == [1.0, 20.0, 30.0]
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([0.0, 19 / 29, 1.0])
+        assert list(history["norm_stake_to_fees"]) == [0.5, 0.5, 0.5]
+
+
 class TestAssignAction:
     """The assigning log line names the action picked from group size against target."""
 
