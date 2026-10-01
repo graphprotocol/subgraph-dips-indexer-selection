@@ -19,10 +19,10 @@ import hmac
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, Optional, cast
 
 import pandas as pd
@@ -957,9 +957,7 @@ def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[floa
         return None
 
 
-def _keep_with_dips_info(
-    df: pd.DataFrame, chain_id: str, max_grt_per_30_days: Optional[float]
-) -> tuple[pd.DataFrame, str]:
+def _keep_with_dips_info(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     """Price filter step: keep indexers that answered their DIP info probe."""
     initial_count = len(df)
     df = df[df["dips_info_available"] == True]  # noqa: E712
@@ -969,9 +967,7 @@ def _keep_with_dips_info(
     return df, ""
 
 
-def _keep_supporting_chain(
-    df: pd.DataFrame, chain_id: str, max_grt_per_30_days: Optional[float]
-) -> tuple[pd.DataFrame, str]:
+def _keep_supporting_chain(df: pd.DataFrame, chain_id: str) -> tuple[pd.DataFrame, str]:
     """Price filter step: keep indexers whose supported networks include the chain."""
     if "dips_supported_networks" not in df.columns:
         return df, ""
@@ -983,9 +979,7 @@ def _keep_supporting_chain(
     return df, ""
 
 
-def _keep_with_chain_price(
-    df: pd.DataFrame, chain_id: str, max_grt_per_30_days: Optional[float]
-) -> tuple[pd.DataFrame, str]:
+def _keep_with_chain_price(df: pd.DataFrame, chain_id: str) -> tuple[pd.DataFrame, str]:
     """Price filter step: keep indexers that have a price set for the chain."""
     if "dips_min_grt_per_30_days" not in df.columns:
         return df, ""
@@ -1051,14 +1045,14 @@ def _filter_by_price(
     if "dips_info_available" not in df.columns:
         return df, ""
 
-    steps = (
+    steps: tuple[Callable[[pd.DataFrame], tuple[pd.DataFrame, str]], ...] = (
         _keep_with_dips_info,
-        _keep_supporting_chain,
-        _keep_with_chain_price,
-        _keep_within_budget,
+        partial(_keep_supporting_chain, chain_id=chain_id),
+        partial(_keep_with_chain_price, chain_id=chain_id),
+        partial(_keep_within_budget, chain_id=chain_id, max_grt_per_30_days=max_grt_per_30_days),
     )
     for step in steps:
-        df, reason = step(df, chain_id, max_grt_per_30_days)
+        df, reason = step(df)
         if df.empty:
             return df, reason
     return df, ""

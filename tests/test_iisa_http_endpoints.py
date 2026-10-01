@@ -2317,13 +2317,18 @@ class TestPriceFilterSteps:
     """Tests for the single price filter steps that _filter_by_price runs in order."""
 
     @pytest.mark.parametrize(
-        "step_name", ["_keep_supporting_chain", "_keep_with_chain_price", "_keep_within_budget"]
+        "step_name, args",
+        [
+            ("_keep_supporting_chain", ("arb",)),
+            ("_keep_with_chain_price", ("arb",)),
+            ("_keep_within_budget", ("arb", 1.0)),
+        ],
     )
-    def test_passes_rows_through_when_its_column_is_missing(self, step_name):
+    def test_passes_rows_through_when_its_column_is_missing(self, step_name, args):
         from iisa import iisa_http_endpoints
 
         step = getattr(iisa_http_endpoints, step_name)
-        result, reason = step(pd.DataFrame([{"indexer": "0xA"}]), "arb", 1.0)
+        result, reason = step(pd.DataFrame([{"indexer": "0xA"}]), *args)
         assert list(result["indexer"]) == ["0xA"]
         assert reason == ""
 
