@@ -1,7 +1,10 @@
 """Tests for sync status loading and reverse index construction."""
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from iisa.sync_status_loader import SyncStatusData, SyncStatusLoader
 
@@ -113,6 +116,33 @@ class TestSyncStatusData:
         data = SyncStatusData(raw, staleness_threshold_hours=99999)
 
         assert data.synced_indexers_for("QmA") == {"0xaaa"}
+
+    @pytest.mark.parametrize("fetched_at", ["not-a-date", 123])
+    def test_invalid_fetched_at_excluded_with_warning(self, fetched_at, caplog):
+        raw = {"0xAAAAAAAAAAAA": {"deployments": ["QmA"], "fetched_at": fetched_at}}
+
+        with caplog.at_level(logging.WARNING, logger="iisa.sync_status_loader"):
+            data = SyncStatusData(raw)
+
+        assert data.total_indexers == 0
+        assert [r.getMessage() for r in caplog.records] == [
+            f"sync_status: invalid fetched_at for 0xAAAAAAAA: {fetched_at}"
+        ]
+
+    def test_summary_log_counts_filtered_entries(self, caplog):
+        raw = {
+            "0xFresh": {"deployments": ["QmA"], "fetched_at": _now_iso()},
+            "0xStale": {"deployments": ["QmA"], "fetched_at": _hours_ago_iso(10)},
+        }
+
+        with caplog.at_level(logging.INFO, logger="iisa.sync_status_loader"):
+            SyncStatusData(raw, staleness_threshold_hours=6.0)
+            SyncStatusData({"0xFresh": raw["0xFresh"]})
+
+        assert [r.getMessage() for r in caplog.records] == [
+            "sync_status: loaded 1 indexers, 1 deployments (1 stale entries filtered)",
+            "sync_status: loaded 1 indexers, 1 deployments",
+        ]
 
 
 class TestSyncStatusLoader:
