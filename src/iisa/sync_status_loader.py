@@ -11,11 +11,39 @@ module reads that cache file and builds a reverse index so the IISA can answer
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 __all__ = ["SyncStatusData", "SyncStatusLoader"]
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_fetched_at(indexer: str, fetched_at_str: Any) -> Optional[datetime]:
+    """Parse an entry's fetched_at as an aware datetime, taking naive values as UTC.
+
+    Returns None when it is missing, and also when it is not an ISO timestamp,
+    after logging a warning.
+    """
+    if fetched_at_str is None:
+        return None
+    try:
+        fetched_at = datetime.fromisoformat(fetched_at_str)
+    except (ValueError, TypeError):
+        logger.warning(
+            "sync_status: invalid fetched_at for %s: %s",
+            indexer[:10],
+            fetched_at_str,
+        )
+        return None
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    return fetched_at
+
+
+def _is_fresh(fetched_at: datetime, now: datetime, staleness_threshold_hours: float) -> bool:
+    """True when fetched_at is no more than staleness_threshold_hours before now."""
+    age_hours = (now - fetched_at).total_seconds() / 3600
+    return age_hours <= staleness_threshold_hours
 
 
 class SyncStatusData:
@@ -31,24 +59,8 @@ class SyncStatusData:
         self._indexer_count = 0
 
         for indexer, entry in raw.items():
-            fetched_at_str = entry.get("fetched_at")
-            if fetched_at_str is None:
-                continue
-
-            try:
-                fetched_at = datetime.fromisoformat(fetched_at_str)
-                if fetched_at.tzinfo is None:
-                    fetched_at = fetched_at.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "sync_status: invalid fetched_at for %s: %s",
-                    indexer[:10],
-                    fetched_at_str,
-                )
-                continue
-
-            age_hours = (now - fetched_at).total_seconds() / 3600
-            if age_hours > staleness_threshold_hours:
+            fetched_at = _parse_fetched_at(indexer, entry.get("fetched_at"))
+            if fetched_at is None or not _is_fresh(fetched_at, now, staleness_threshold_hours):
                 continue
 
             deployments = entry.get("deployments", [])
@@ -58,9 +70,7 @@ class SyncStatusData:
             self._indexer_count += 1
             indexer_lower = indexer.lower()
             for deployment_id in deployments:
-                if deployment_id not in self._deployment_index:
-                    self._deployment_index[deployment_id] = set()
-                self._deployment_index[deployment_id].add(indexer_lower)
+                self._deployment_index.setdefault(deployment_id, set()).add(indexer_lower)
 
         stale_count = len(raw) - self._indexer_count
         if stale_count > 0:
