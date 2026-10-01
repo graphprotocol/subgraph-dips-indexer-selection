@@ -6,7 +6,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from iisa.sync_status_loader import SyncStatusData, SyncStatusLoader
+from iisa.sync_status_loader import (
+    SyncStatusData,
+    SyncStatusLoader,
+    _is_fresh,
+    _parse_fetched_at,
+)
 
 
 def _now_iso() -> str:
@@ -143,6 +148,37 @@ class TestSyncStatusData:
             "sync_status: loaded 1 indexers, 1 deployments (1 stale entries filtered)",
             "sync_status: loaded 1 indexers, 1 deployments",
         ]
+
+
+class TestFetchedAtHelpers:
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("2026-03-24T14:00:00", datetime(2026, 3, 24, 14, tzinfo=timezone.utc)),
+            (
+                "2026-03-24T14:00:00+02:00",
+                datetime(2026, 3, 24, 14, tzinfo=timezone(timedelta(hours=2))),
+            ),
+            (None, None),
+        ],
+    )
+    def test_parse_fetched_at(self, value, expected, caplog):
+        with caplog.at_level(logging.WARNING, logger="iisa.sync_status_loader"):
+            assert _parse_fetched_at("0xAAA", value) == expected
+        assert caplog.records == []
+
+    def test_parse_fetched_at_warns_on_invalid_value(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="iisa.sync_status_loader"):
+            assert _parse_fetched_at("0xAAA", "yesterday") is None
+        assert [r.getMessage() for r in caplog.records] == [
+            "sync_status: invalid fetched_at for 0xAAA: yesterday"
+        ]
+
+    def test_is_fresh_up_to_and_including_the_threshold(self):
+        now = datetime(2026, 3, 24, 14, tzinfo=timezone.utc)
+
+        assert _is_fresh(now - timedelta(hours=6), now, 6.0)
+        assert not _is_fresh(now - timedelta(hours=6, seconds=1), now, 6.0)
 
 
 class TestSyncStatusLoader:
