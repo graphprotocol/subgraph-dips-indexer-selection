@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.9.7](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.6...v2.9.7) (2026-10-01)
+
+
+### Fixed
+
+* **k8s:** stop mounting unused API tokens and cap disk use ([#267](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/267)) ([c2a2498](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/c2a249878e2576978b6e18a2efc026b7bfcc5587))
+* **scoring:** reject repeated keys when joining score tables ([#269](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/269)) ([dcc6145](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/dcc6145537e0c96f21dad22f7d163c20c6d521ae))
+
+
+### Changed
+
+* **api:** split up the price filter and selection logging ([#270](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/270)) ([af52ec3](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/af52ec398417e587898d652a2e28128664eff874))
+* **ci:** fail CI on hard-to-follow code and in-place edits ([#274](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/274)) ([dd249f7](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/dd249f730c938d1c267bb06b4d3d2f573b4eef76))
+* **docker:** drop gcc from the image's package list ([#271](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/271)) ([e33b234](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/e33b2340302be1e76e4f9e543b15a99c53f2a65c))
+* **k8s:** update cronjob image to sha-dd249f7 ([#279](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/279)) ([ffdc0f2](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ffdc0f265f2a32d3f8e2cb8dfe8ec74da4ac5853))
+* **redpanda:** split the replay loops into smaller steps ([#272](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/272)) ([10157f3](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/10157f33e4bd9e243cd80a8e3dba9448f64d5812))
+* **scoring:** fix 8 code scanner warnings in the score job ([#268](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/268)) ([9dada35](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/9dada3574263140da9c40c68230feb20437aad6d))
+* **selection:** split up the indexer replacement loop ([#273](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/273)) ([4afd046](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/4afd046b4b5758fe5c44852c60b2b26e6f8d0966))
+
 ## [2.9.6](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.5...v2.9.6) (2026-09-30)
 
 
