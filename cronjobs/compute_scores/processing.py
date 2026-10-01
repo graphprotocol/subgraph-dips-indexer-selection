@@ -1225,12 +1225,10 @@ def load_iata_data() -> pd.DataFrame:
         na_values={"iata": [""], "country": [""]},
         keep_default_na=False,
     )
-    iata_df.rename(
+    iata_df = iata_df.rename(
         columns={"iata": "IATA_code", "lat": "latitude", "lon": "longitude"},
-        inplace=True,
     )
-    iata_df.dropna(subset=["IATA_code"], inplace=True)
-    return iata_df
+    return iata_df.dropna(subset=["IATA_code"])
 
 
 def calculate_distances(data: pd.DataFrame) -> pd.DataFrame:
@@ -1458,9 +1456,9 @@ def _indexer_latency_rankings(results_df: pd.DataFrame, deg_freedom: int) -> pd.
 
     indexer_rankings = indexer_rankings.reset_index(drop=True)
     indexer_rankings["Variable"] = indexer_rankings["Variable"].str.replace("indexer__indexer_", "")
-    indexer_rankings.rename(columns={"Variable": "indexer"}, inplace=True)
-    indexer_rankings.dropna(
-        subset=[LATENCY_COEFFICIENT_COLUMN, STANDARD_ERROR_COLUMN, "p-value"], inplace=True
+    indexer_rankings = indexer_rankings.rename(columns={"Variable": "indexer"})
+    indexer_rankings = indexer_rankings.dropna(
+        subset=[LATENCY_COEFFICIENT_COLUMN, STANDARD_ERROR_COLUMN, "p-value"]
     )
 
     # Measure each indexer from the median one; an equal shift for all leaves normalised scores
@@ -1495,7 +1493,7 @@ def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> 
     """Calculate indexer uptime based on query timestamps and statuses."""
     df_copy = df.copy()
     df_copy["timestamp"] = pd.to_datetime(df_copy["timestamp"])
-    df_copy.sort_values(by=["indexer", "timestamp"], inplace=True)
+    df_copy = df_copy.sort_values(by=["indexer", "timestamp"])
 
     df_copy["next_timestamp"] = df_copy.groupby("indexer")["timestamp"].shift(-1)
     df_copy["previous_timestamp"] = df_copy.groupby("indexer")["timestamp"].shift(1)

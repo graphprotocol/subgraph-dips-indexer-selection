@@ -529,7 +529,7 @@ class RedpandaProvider:
         ]
         df = pd.DataFrame(rows, columns=["deployment_hash", "indexer", "num_rows"])
         if not df.empty:
-            df.sort_values(by="num_rows", ascending=False, inplace=True, ignore_index=True)
+            df = df.sort_values(by="num_rows", ascending=False, ignore_index=True)
 
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
         logger.info("Initial query results from Redpanda: %d pairs (%.1f MB)", len(df), memory_mb)
@@ -615,7 +615,7 @@ class RedpandaProvider:
         )
 
         df = df[["indexer", "stake_to_fees", "total_query_fees", "last_known_slashable_stake"]]
-        df.set_index("indexer", inplace=True)
+        df = df.set_index("indexer")
 
         matched = df["stake_to_fees"].notna().sum()
         logger.info(
