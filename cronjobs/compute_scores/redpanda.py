@@ -328,6 +328,26 @@ def _count_partition_worker(args: tuple) -> tuple:
     return (counts, fees, stats.messages, stats.filtered)
 
 
+def _with_trailing_slash(url: str) -> str:
+    return url if url.endswith("/") else url + "/"
+
+
+class _InternCache(dict[str, str]):
+    """Maps a raw string to the interned form of canonical(raw), computing it on first sight.
+
+    A hit is a plain dict subscript that never calls back into Python; only a miss runs
+    __missing__, which interns, stores and returns the canonical form.
+    """
+
+    def __init__(self, canonical: Callable[[str], str]) -> None:
+        super().__init__()
+        self._canonical = canonical
+
+    def __missing__(self, raw: str) -> str:
+        interned = self[raw] = sys.intern(self._canonical(raw))
+        return interned
+
+
 def _sample_partition_worker(args: tuple) -> tuple:
     """
     Sample pass for a single partition. Runs in a child process.
@@ -350,16 +370,12 @@ def _sample_partition_worker(args: tuple) -> tuple:
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     stats = _PartitionReadStats()
 
-    # Worker-local intern caches. Protobuf hands us fresh str objects for every
-    # message even when the value is identical to one we've already seen, so
-    # `sys.intern` would otherwise run 3x per row (2.76B attempts in production,
-    # ~8B intern calls total). Caching the canonical form under the raw key
-    # collapses warm-path lookups to a single dict.get each. Cardinality in
-    # practice: ~O(10) distinct statuses, ~O(10) distinct chains, ~O(13k)
-    # distinct urls (one per indexer-pair).
-    url_cache: Dict[str, str] = {}
-    status_cache: Dict[str, str] = {}
-    chain_cache: Dict[str, str] = {}
+    # Protobuf returns a fresh str per message even for repeated values, so each value is
+    # interned once on first sight and every later row is a dict hit (2.76B attempts in
+    # production against ~10 statuses, ~10 chains and ~13k urls).
+    url_cache = _InternCache(_with_trailing_slash)
+    status_cache = _InternCache(_map_result_to_status)
+    chain_cache = _InternCache(str)
 
     queries = _iter_partition_queries(
         "sample",
@@ -386,49 +402,22 @@ def _sample_partition_worker(args: tuple) -> tuple:
                 key = (dep_bytes, idx_bytes)
                 n = counts[key]
 
-                # Hoist descriptor-based protobuf attribute access — each
-                # `attempt.<field>` lookup goes through a descriptor and
-                # costs ~200ns. Bind once per attempt and reuse.
-                raw_result = attempt.result
-                raw_chain = attempt.indexed_chain
-
-                # url/status/subgraph_network are interned via a worker-local
-                # cache (see top of worker). First sight of a value pays
-                # sys.intern + cache store; every subsequent row hits the
-                # dict-lookup fast path. query_id is unique per query so
-                # caching/interning it would burn cycles for no dedup.
-                interned_url = url_cache.get(url)
-                if interned_url is None:
-                    interned_url = sys.intern(url if url.endswith("/") else url + "/")
-                    url_cache[url] = interned_url
-
-                interned_status = status_cache.get(raw_result)
-                if interned_status is None:
-                    interned_status = sys.intern(_map_result_to_status(raw_result))
-                    status_cache[raw_result] = interned_status
-
-                interned_chain = chain_cache.get(raw_chain)
-                if interned_chain is None:
-                    interned_chain = sys.intern(raw_chain)
-                    chain_cache[raw_chain] = interned_chain
-
+                # query_id is unique per query, so interning it would cost cycles for no saving.
                 row = (
                     query.query_id,
                     attempt.fee_grt,
                     ts_ms,
                     attempt.blocks_behind,
                     attempt.response_time_ms,
-                    interned_status,
-                    interned_chain,
-                    interned_url,
+                    status_cache[attempt.result],
+                    chain_cache[attempt.indexed_chain],
+                    url_cache[url],
                 )
 
                 if n < rows_to_use:
                     reservoirs[key].append(row)
-                else:
-                    j = rng.randint(0, n)
-                    if j < rows_to_use:
-                        reservoirs[key][j] = row
+                elif (j := rng.randint(0, n)) < rows_to_use:
+                    reservoirs[key][j] = row
 
                 counts[key] += 1
 

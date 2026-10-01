@@ -19,7 +19,7 @@ jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 from gateway_queries_pb2 import ClientQueryProtobuf  # noqa: E402
-from redpanda import _sample_partition_worker  # noqa: E402
+from redpanda import _InternCache, _sample_partition_worker  # noqa: E402
 
 
 def _build_message(query_id: str, indexer: bytes, deployment: bytes) -> bytes:
@@ -183,6 +183,24 @@ def test_intern_cache_shares_string_identity_across_rows():
             "subgraph_network is equal but not identical — intern cache not canonicalising"
         )
         assert url is first_url, "url is equal but not identical — intern cache not canonicalising"
+
+
+def test_intern_cache_computes_each_value_once():
+    calls = []
+
+    def canonical(raw: str) -> str:
+        calls.append(raw)
+        return raw.upper()
+
+    cache = _InternCache(canonical)
+    # Built at runtime so neither key is already an interned constant.
+    first = cache["".join(["main", "net"])]
+    again = cache["".join(["main", "net"])]
+
+    assert first == "MAINNET"
+    assert first is sys.intern("MAINNET")
+    assert again is first
+    assert calls == ["mainnet"]
 
 
 def test_intern_cache_preserves_distinct_values_under_rotation():
