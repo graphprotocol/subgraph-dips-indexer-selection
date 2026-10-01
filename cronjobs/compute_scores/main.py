@@ -123,7 +123,7 @@ def _run_full_pipeline(
             return None, MODE_FAILED
         return scores_df, _mode_from_scores(scores_df, geoip_available)
     except Exception as e:
-        logger.warning("Pipeline failed: %s", e)
+        logger.warning("Pipeline failed: %s", e, exc_info=True)
         return None, MODE_FAILED
 
 
