@@ -10,7 +10,11 @@ jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 from gateway_queries_pb2 import ClientQueryProtobuf  # noqa: E402
-from redpanda import _iter_partition_queries, _PartitionReadStats  # noqa: E402
+from redpanda import (  # noqa: E402
+    _iter_batch_queries,
+    _iter_partition_queries,
+    _PartitionReadStats,
+)
 
 
 def _fake_kafka_message(ts_ms, offset, gateway_id="mainnet-gw", value=None, error=None):
@@ -108,3 +112,36 @@ class TestIterPartitionQueries:
         assert stats.messages == 3
         assert stats.filtered == 2
         consumer.close.assert_called_once()
+
+
+def _drain(reader):
+    """Return everything the generator yields plus its return value."""
+    yielded = []
+    while True:
+        try:
+            query, ts_ms = next(reader)
+        except StopIteration as stop:
+            return yielded, stop.value
+        yielded.append((query.query_id, ts_ms))
+
+
+class TestIterBatchQueries:
+    def test_adds_to_running_stats_and_returns_false_within_the_window(self):
+        stats = _PartitionReadStats(messages=5, filtered=1, last_offset=9)
+        batch = [_fake_kafka_message(1_000, 10), _fake_kafka_message(1_000, 11, "testnet-gw")]
+
+        yielded, past_end = _drain(_iter_batch_queries(batch, 5_000, {"mainnet-gw"}, stats))
+
+        assert yielded == [("q-10", 1_000)]
+        assert past_end is False
+        assert (stats.messages, stats.filtered, stats.last_offset) == (7, 2, 11)
+
+    def test_returns_true_at_the_first_message_past_the_window(self):
+        stats = _PartitionReadStats()
+        batch = [_fake_kafka_message(1_000, 1), _fake_kafka_message(5_001, 2)]
+
+        yielded, past_end = _drain(_iter_batch_queries(batch, 5_000, None, stats))
+
+        assert yielded == [("q-1", 1_000)]
+        assert past_end is True
+        assert (stats.messages, stats.last_offset) == (1, 1)

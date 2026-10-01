@@ -186,10 +186,59 @@ def _emit_heartbeat(
 
 @dataclass
 class _PartitionReadStats:
-    """Message and filtered counts for one partition read, set when the read ends."""
+    """Running counts for one partition read, brought up to date after each consumed batch."""
 
     messages: int = 0
     filtered: int = 0
+    last_offset: int = 0
+
+
+def _iter_batch_queries(
+    messages: list,
+    end_ts_ms: int,
+    gw_filter: Optional[set],
+    stats: _PartitionReadStats,
+) -> Generator[Tuple[ClientQueryProtobuf, int], None, bool]:
+    """Yield (query, ts_ms) per parsed message of 1 consume() batch, adding its counts to stats.
+
+    Returns True at the first message past end_ts_ms, which ends the whole partition read.
+    """
+    # Counted in locals and written back once per batch, even if the reader is closed mid-batch.
+    total_messages = stats.messages
+    filtered_count = stats.filtered
+    last_offset = stats.last_offset
+    try:
+        for msg in messages:
+            if msg.error():
+                continue
+
+            _, ts_ms = msg.timestamp()
+            if ts_ms < 0:
+                ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+            if ts_ms > end_ts_ms:
+                return True
+
+            # offset() is None only on error events, which are skipped above.
+            last_offset = msg.offset()
+            total_messages += 1
+
+            try:
+                query = ClientQueryProtobuf()
+                query.ParseFromString(msg.value())
+            except Exception:
+                continue
+
+            if gw_filter and query.gateway_id not in gw_filter:
+                filtered_count += 1
+                continue
+
+            yield query, ts_ms
+        return False
+    finally:
+        stats.messages = total_messages
+        stats.filtered = filtered_count
+        stats.last_offset = last_offset
 
 
 def _iter_partition_queries(
@@ -208,15 +257,13 @@ def _iter_partition_queries(
 
     Ends after 3 empty consume() calls in a row or at the first message past end_ts_ms.
     Skips error messages, unparseable payloads and gateways outside gw_filter. Heartbeats
-    report len(pairs); the message and filtered counts go to `stats` when the read ends.
+    report len(pairs); `stats` holds the message and filtered counts as the read goes.
     """
     from confluent_kafka import Consumer, TopicPartition
 
     consumer = Consumer(config)
-    total_messages = 0
-    filtered_count = 0
+    stats.messages, stats.filtered, stats.last_offset = 0, 0, start_offset
     consecutive_empty = 0
-    last_offset = start_offset
 
     try:
         consumer.assign([TopicPartition(topic, partition, start_offset)])
@@ -228,61 +275,27 @@ def _iter_partition_queries(
         _emit_heartbeat(label, partition, 0, 0, 0, start_offset, start_offset, end_offset, 0.0)
         last_progress_log = loop_start
 
-        while True:
+        while consecutive_empty < 3:
             now = time.monotonic()
             if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
                 _emit_heartbeat(
                     label,
                     partition,
-                    total_messages,
-                    filtered_count,
+                    stats.messages,
+                    stats.filtered,
                     len(pairs),
                     start_offset,
-                    last_offset,
+                    stats.last_offset,
                     end_offset,
                     now - loop_start,
                 )
                 last_progress_log = now
 
             messages = consumer.consume(num_messages=1000, timeout=30.0)
-
-            if not messages:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-                continue
-
-            consecutive_empty = 0
-
-            for msg in messages:
-                if msg.error():
-                    continue
-
-                _, ts_ms = msg.timestamp()
-                if ts_ms < 0:
-                    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-                if ts_ms > end_ts_ms:
-                    return
-
-                # offset() is None only on error events, which are skipped above.
-                last_offset = msg.offset()  # type: ignore[assignment]
-                total_messages += 1
-
-                try:
-                    query = ClientQueryProtobuf()
-                    query.ParseFromString(msg.value())
-                except Exception:
-                    continue
-
-                if gw_filter and query.gateway_id not in gw_filter:
-                    filtered_count += 1
-                    continue
-
-                yield query, ts_ms
+            consecutive_empty = 0 if messages else consecutive_empty + 1
+            if (yield from _iter_batch_queries(messages, end_ts_ms, gw_filter, stats)):
+                return
     finally:
-        stats.messages = total_messages
-        stats.filtered = filtered_count
         consumer.close()
 
 
