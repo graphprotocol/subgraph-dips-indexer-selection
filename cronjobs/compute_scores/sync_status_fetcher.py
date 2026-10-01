@@ -47,6 +47,7 @@ IISA_API_URL = os.environ.get("IISA_API_URL", "")
 IISA_PUSH_TOKEN: Optional[str] = get_push_token()
 
 STATUS_QUERY = "{ indexingStatuses { subgraph synced health } }"
+JSON_CONTENT_TYPE = "application/json"
 
 # Service state
 _last_write_time: Optional[str] = None
@@ -70,7 +71,7 @@ async def _fetch_single_status(
             async with session.post(
                 status_url,
                 data=payload,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": JSON_CONTENT_TYPE},
                 timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT),
             ) as resp:
                 if resp.status >= 500:
@@ -188,7 +189,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         if self.path == "/health":
             if _last_write_time is not None:
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", JSON_CONTENT_TYPE)
                 self.end_headers()
                 self.wfile.write(
                     json.dumps(
@@ -200,7 +201,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 )
             else:
                 self.send_response(503)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", JSON_CONTENT_TYPE)
                 self.end_headers()
                 self.wfile.write(b'{"status": "not_ready"}')
         else:

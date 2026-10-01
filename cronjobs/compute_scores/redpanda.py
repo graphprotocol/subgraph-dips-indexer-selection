@@ -467,9 +467,9 @@ class RedpandaProvider:
         # When set, only messages from the specified gateway(s) are processed.
         # Comma-separated, e.g. "mainnet-gw-1,mainnet-gw-2".
         _gw_ids = os.environ.get("REDPANDA_GATEWAY_IDS", "")
-        self._gateway_id_filter: Optional[set] = (
-            set(gid.strip() for gid in _gw_ids.split(",") if gid.strip()) or None
-        )
+        self._gateway_id_filter: Optional[set] = {
+            gid.strip() for gid in _gw_ids.split(",") if gid.strip()
+        } or None
         if self._gateway_id_filter:
             logger.info("Gateway ID filter active: %s", self._gateway_id_filter)
         else:
@@ -529,7 +529,7 @@ class RedpandaProvider:
         ]
         df = pd.DataFrame(rows, columns=["deployment_hash", "indexer", "num_rows"])
         if not df.empty:
-            df.sort_values(by="num_rows", ascending=False, inplace=True, ignore_index=True)
+            df = df.sort_values(by="num_rows", ascending=False, ignore_index=True)
 
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
         logger.info("Initial query results from Redpanda: %d pairs (%.1f MB)", len(df), memory_mb)
@@ -567,7 +567,7 @@ class RedpandaProvider:
         logger.info("Combined query results from Redpanda: %d rows (%.1f MB)", len(df), memory_mb)
         return df
 
-    def fetch_stake_to_fees(self, start_ts: str) -> pd.DataFrame:
+    def fetch_stake_to_fees(self) -> pd.DataFrame:
         """
         Compute stake-to-fees ratio by combining subgraph stake data with
         fee totals accumulated during the Redpanda replay.
@@ -615,7 +615,7 @@ class RedpandaProvider:
         )
 
         df = df[["indexer", "stake_to_fees", "total_query_fees", "last_known_slashable_stake"]]
-        df.set_index("indexer", inplace=True)
+        df = df.set_index("indexer")
 
         matched = df["stake_to_fees"].notna().sum()
         logger.info(
