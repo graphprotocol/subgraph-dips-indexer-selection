@@ -467,9 +467,9 @@ class RedpandaProvider:
         # When set, only messages from the specified gateway(s) are processed.
         # Comma-separated, e.g. "mainnet-gw-1,mainnet-gw-2".
         _gw_ids = os.environ.get("REDPANDA_GATEWAY_IDS", "")
-        self._gateway_id_filter: Optional[set] = (
-            set(gid.strip() for gid in _gw_ids.split(",") if gid.strip()) or None
-        )
+        self._gateway_id_filter: Optional[set] = {
+            gid.strip() for gid in _gw_ids.split(",") if gid.strip()
+        } or None
         if self._gateway_id_filter:
             logger.info("Gateway ID filter active: %s", self._gateway_id_filter)
         else:
