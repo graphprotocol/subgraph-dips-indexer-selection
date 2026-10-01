@@ -559,39 +559,8 @@ class IndexerSelector:
             len(unpickable_indexers),
         )
 
-        # Prefer already-synced candidates so queries serve right after
-        # acceptance: the first synced indexer gets in at any score, later ones
-        # must beat MIN_SYNCED_THRESHOLD or fall back to competing on merit.
-        if self.synced_indexers:
-            group_lower = {i.lower() for i in self.current_group}
-            group_has_synced = bool(group_lower & self.synced_indexers)
-            all_synced_candidates = candidates[
-                candidates["indexer"].str.lower().isin(self.synced_indexers)
-            ]
-
-            if group_has_synced:
-                # Already have a synced indexer — threshold applies
-                synced = all_synced_candidates[
-                    all_synced_candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD
-                ]
-            else:
-                # No synced indexer yet — first one gets in at any score
-                synced = all_synced_candidates
-
-            unsynced = candidates[~candidates["indexer"].isin(synced["indexer"])]
-            logger.info(
-                "deployment=%s candidates: %d synced eligible, %d unsynced (group_has_synced=%s)",
-                self.deployment_id,
-                len(synced),
-                len(unsynced),
-                group_has_synced,
-            )
-            pools = [("synced", synced), ("unsynced", unsynced)]
-        else:
-            pools = [("all", candidates)]
-
         # Iterate pools in order, checking decentralisation
-        for pool_name, pool_df in pools:
+        for pool_name, pool_df in self._candidate_pools(candidates):
             for indexer in pool_df["indexer"]:
                 if self._meets_decentralization_requirements(
                     indexer, replacing_indexer=replacing_indexer
@@ -626,6 +595,41 @@ class IndexerSelector:
             len(self.data),
         )
         return None
+
+    def _candidate_pools(self, candidates: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+        """Split score-sorted candidates into named pools, drawn from in order.
+
+        Prefer already-synced candidates so queries serve right after
+        acceptance: the first synced indexer gets in at any score, later ones
+        must beat MIN_SYNCED_THRESHOLD or fall back to competing on merit.
+        """
+        if not self.synced_indexers:
+            return [("all", candidates)]
+
+        group_lower = {i.lower() for i in self.current_group}
+        group_has_synced = bool(group_lower & self.synced_indexers)
+        all_synced_candidates = candidates[
+            candidates["indexer"].str.lower().isin(self.synced_indexers)
+        ]
+
+        if group_has_synced:
+            # Already have a synced indexer — threshold applies
+            synced = all_synced_candidates[
+                all_synced_candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD
+            ]
+        else:
+            # No synced indexer yet — first one gets in at any score
+            synced = all_synced_candidates
+
+        unsynced = candidates[~candidates["indexer"].isin(synced["indexer"])]
+        logger.info(
+            "deployment=%s candidates: %d synced eligible, %d unsynced (group_has_synced=%s)",
+            self.deployment_id,
+            len(synced),
+            len(unsynced),
+            group_has_synced,
+        )
+        return [("synced", synced), ("unsynced", unsynced)]
 
 
 def _normalize_metrics(

@@ -939,6 +939,24 @@ class TestCandidatePools:
             "(score=0.8000, meets decentralization)",
         ]
 
+    @pytest.mark.parametrize(
+        "group, synced_indexers, expected",
+        [
+            (["A"], None, [("all", ["B", "D", "C", "E"])]),
+            (["A"], {"c", "d"}, [("synced", ["D", "C"]), ("unsynced", ["B", "E"])]),
+            (["C"], {"c", "d", "e"}, [("synced", ["D"]), ("unsynced", ["A", "B", "E"])]),
+        ],
+    )
+    def test_candidate_pools(self, group, synced_indexers, expected):
+        processor = _selector_with_scores(self.SCORES, group, synced_indexers=synced_indexers)
+        candidates = processor.data[~processor.data["indexer"].isin(group)].sort_values(
+            by="weighted_score", ascending=False
+        )
+
+        pools = processor._candidate_pools(candidates)
+
+        assert [(name, list(pool["indexer"])) for name, pool in pools] == expected
+
 
 class TestNormalizeMetrics:
     @pytest.fixture
