@@ -10,6 +10,7 @@ import pytest
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
+import main  # noqa: E402
 import processing  # noqa: E402
 from processing import (  # noqa: E402
     merge_and_prepare_dataframes,
@@ -45,6 +46,20 @@ def test_query_geolocation_keeps_first_row_for_a_repeated_airport_code(monkeypat
     assert len(result) == 1
     assert result["src_lat"].iloc[0] == 51.5
     assert "IATA code(s) more than once" in caplog.text
+
+
+def test_failed_full_pipeline_logs_the_traceback(monkeypatch, caplog):
+    def raise_merge_error(**_kwargs):
+        raise pd.errors.MergeError("Merge keys are not unique in right dataset")
+
+    monkeypatch.setattr(main, "compute_all_scores", raise_merge_error)
+
+    with caplog.at_level(logging.WARNING, logger=main.logger.name):
+        scores, mode = main._run_full_pipeline(provider=None, geoip_available=True, seed=1)
+
+    assert scores is None and mode == main.MODE_FAILED
+    failure = next(r for r in caplog.records if r.getMessage().startswith("Pipeline failed"))
+    assert failure.exc_info is not None
 
 
 def test_score_assembly_rejects_duplicate_indexer_in_a_lookup_table():
