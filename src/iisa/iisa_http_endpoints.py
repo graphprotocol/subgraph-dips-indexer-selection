@@ -19,9 +19,10 @@ import hmac
 import json
 import logging
 import os
+from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, Optional, cast
 
 import pandas as pd
@@ -952,8 +953,76 @@ def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[floa
         prices = json.loads(dips_min_grt_json) if isinstance(dips_min_grt_json, str) else {}
         val = prices.get(chain_id)
         return float(val) if val is not None else None
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return None
+
+
+def _keep_with_dips_info(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """Price filter step: keep indexers that answered their DIP info probe."""
+    initial_count = len(df)
+    df = df[df["dips_info_available"] == True]  # noqa: E712
+    logger.debug("price filter: %d/%d indexers have DIP info", len(df), initial_count)
+    if df.empty:
+        return df, f"all {initial_count} indexers lack DIP info (dips_info_available=False)"
+    return df, ""
+
+
+def _keep_supporting_chain(df: pd.DataFrame, chain_id: str) -> tuple[pd.DataFrame, str]:
+    """Price filter step: keep indexers whose supported networks include the chain."""
+    if "dips_supported_networks" not in df.columns:
+        return df, ""
+    pre_filter = len(df)
+    df = df[df["dips_supported_networks"].apply(lambda v: _supports_chain(v, chain_id))]
+    logger.debug("price filter: %d/%d indexers support chain '%s'", len(df), pre_filter, chain_id)
+    if df.empty:
+        return df, f"none of {pre_filter} indexers support chain '{chain_id}'"
+    return df, ""
+
+
+def _keep_with_chain_price(df: pd.DataFrame, chain_id: str) -> tuple[pd.DataFrame, str]:
+    """Price filter step: keep indexers that have a price set for the chain."""
+    if "dips_min_grt_per_30_days" not in df.columns:
+        return df, ""
+
+    def has_chain_price(prices_json: Any) -> bool:
+        return _extract_chain_price(prices_json, chain_id) is not None
+
+    pre_filter = len(df)
+    df = df[df["dips_min_grt_per_30_days"].apply(has_chain_price)]
+    if df.empty:
+        return df, f"none of {pre_filter} indexers have pricing configured for chain '{chain_id}'"
+    return df, ""
+
+
+def _keep_within_budget(
+    df: pd.DataFrame, chain_id: str, max_grt_per_30_days: Optional[float]
+) -> tuple[pd.DataFrame, str]:
+    """Price filter step: keep indexers priced at or below max_grt_per_30_days for the chain."""
+    if max_grt_per_30_days is None or "dips_min_grt_per_30_days" not in df.columns:
+        return df, ""
+    max_budget = max_grt_per_30_days
+
+    def within_budget(prices_json: Any) -> bool:
+        price = _extract_chain_price(prices_json, chain_id)
+        return price is not None and price <= max_budget
+
+    pre_filter = len(df)
+    df = df[df["dips_min_grt_per_30_days"].apply(within_budget)]
+    logger.debug(
+        "price filter: %d/%d indexers within budget of %s GRT/30d for chain '%s'",
+        len(df),
+        pre_filter,
+        max_grt_per_30_days,
+        chain_id,
+    )
+    if df.empty:
+        return (
+            df,
+            f"all {pre_filter} indexers exceed payment "
+            f"ceiling of {max_grt_per_30_days} GRT/30d "
+            f"for chain '{chain_id}'",
+        )
+    return df, ""
 
 
 def _filter_by_price(
@@ -971,78 +1040,21 @@ def _filter_by_price(
         return history, ""
 
     df = history.copy()
-    initial_count = len(df)
 
     # Only filter if we have the DIP info columns
     if "dips_info_available" not in df.columns:
         return df, ""
 
-    # Exclude indexers without DIP info
-    df = df[df["dips_info_available"] == True]  # noqa: E712
-    logger.debug("price filter: %d/%d indexers have DIP info", len(df), initial_count)
-
-    if df.empty:
-        return df, f"all {initial_count} indexers lack DIP info (dips_info_available=False)"
-
-    # Exclude indexers that don't support the chain
-    if "dips_supported_networks" in df.columns:
-        pre_filter = len(df)
-        df = df[df["dips_supported_networks"].apply(lambda v: _supports_chain(v, chain_id))]
-        logger.debug(
-            "price filter: %d/%d indexers support chain '%s'", len(df), pre_filter, chain_id
-        )
+    steps: tuple[Callable[[pd.DataFrame], tuple[pd.DataFrame, str]], ...] = (
+        _keep_with_dips_info,
+        partial(_keep_supporting_chain, chain_id=chain_id),
+        partial(_keep_with_chain_price, chain_id=chain_id),
+        partial(_keep_within_budget, chain_id=chain_id, max_grt_per_30_days=max_grt_per_30_days),
+    )
+    for step in steps:
+        df, reason = step(df)
         if df.empty:
-            return df, f"none of {pre_filter} indexers support chain '{chain_id}'"
-
-    # Exclude indexers that don't have pricing for this chain
-    if "dips_min_grt_per_30_days" in df.columns:
-
-        def has_chain_price(prices_json):
-            price_str = _extract_chain_price(prices_json, chain_id)
-            return price_str is not None
-
-        pre_filter = len(df)
-        df = df[df["dips_min_grt_per_30_days"].apply(has_chain_price)]
-        if df.empty:
-            return (
-                df,
-                f"none of {pre_filter} indexers have pricing configured for chain '{chain_id}'",
-            )
-
-    if df.empty or max_grt_per_30_days is None:
-        return df, ""
-
-    # Exclude indexers whose price exceeds the budget
-    max_budget = max_grt_per_30_days
-
-    if "dips_min_grt_per_30_days" in df.columns:
-
-        def within_budget(prices_json):
-            price_str = _extract_chain_price(prices_json, chain_id)
-            if price_str is None:
-                return False
-            try:
-                return float(price_str) <= max_budget
-            except (ValueError, TypeError):
-                return False
-
-        pre_filter = len(df)
-        df = df[df["dips_min_grt_per_30_days"].apply(within_budget)]
-        logger.debug(
-            "price filter: %d/%d indexers within budget of %s GRT/30d for chain '%s'",
-            len(df),
-            pre_filter,
-            max_grt_per_30_days,
-            chain_id,
-        )
-        if df.empty:
-            return (
-                df,
-                f"all {pre_filter} indexers exceed payment "
-                f"ceiling of {max_grt_per_30_days} GRT/30d "
-                f"for chain '{chain_id}'",
-            )
-
+            return df, reason
     return df, ""
 
 
@@ -1081,6 +1093,34 @@ def _enrich_with_chain_prices(
     return df
 
 
+def _indexer_prices(
+    history: pd.DataFrame, idx_id: str, chain_id: Optional[str]
+) -> tuple[Optional[float], Optional[float]]:
+    """Return (min_grt_per_30_days for the chain, min_grt_per_billion_entities_per_30_days)
+    from the indexer's first row in ``history``.
+
+    Both are None without a chain_id or a row; either is None when its column is missing.
+    """
+    rows = history[history["indexer"] == idx_id]
+    if rows.empty or chain_id is None:
+        return None, None
+    row = rows.iloc[0]
+
+    min_grt = None
+    if "dips_min_grt_per_30_days" in row.index:
+        min_grt = _extract_chain_price(row["dips_min_grt_per_30_days"], chain_id)
+
+    min_entity = None
+    if "dips_min_grt_per_billion_entities_per_30_days" in row.index:
+        val = row["dips_min_grt_per_billion_entities_per_30_days"]
+        try:
+            min_entity = float(val) if val is not None and pd.notna(val) else None
+        except (TypeError, ValueError):
+            min_entity = None
+
+    return min_grt, min_entity
+
+
 def _build_selected_indexers(
     indexer_ids: list[str],
     history: pd.DataFrame,
@@ -1089,22 +1129,7 @@ def _build_selected_indexers(
     """Build SelectedIndexer entries with pricing info."""
     results = []
     for idx_id in indexer_ids:
-        row = history[history["indexer"] == idx_id]
-        min_grt = None
-        min_entity = None
-
-        if not row.empty and chain_id is not None:
-            if "dips_min_grt_per_30_days" in row.columns:
-                min_grt = _extract_chain_price(
-                    row.iloc[0].get("dips_min_grt_per_30_days", "{}"), chain_id
-                )
-            if "dips_min_grt_per_billion_entities_per_30_days" in row.columns:
-                val = row.iloc[0].get("dips_min_grt_per_billion_entities_per_30_days")
-                try:
-                    min_entity = float(val) if val is not None and pd.notna(val) else None
-                except (TypeError, ValueError):
-                    min_entity = None
-
+        min_grt, min_entity = _indexer_prices(history, idx_id, chain_id)
         results.append(
             SelectedIndexer(
                 id=idx_id,
@@ -1196,46 +1221,59 @@ def _build_selector(
     )
 
 
+# Normalised metric columns paired with the label each is logged under. The weight
+# key for each metric is its column name without the "norm_" prefix, which matches
+# the keys in IndexerSelector.weights / DEFAULT_WEIGHTS.
+_BREAKDOWN_COMPONENTS = (
+    ("norm_stake_to_fees", "stake_to_fees"),
+    ("norm_base_price_per_epoch", "base_price"),
+    ("norm_lat_lin_reg_coefficient", "latency"),
+    ("norm_uptime_score", "uptime"),
+    ("norm_success_rate", "success_rate"),
+    ("norm_price_per_entity", "price_per_entity"),
+)
+
+
+def _score_breakdown(
+    row: pd.Series, weights: Mapping[str, object]
+) -> tuple[Optional[float], dict[str, float], dict[str, float], dict[str, float]]:
+    """Return (weighted_score, components, weights, contributions) for one scored
+    indexer row, rounded for logging. Metrics the row lacks or that carry no
+    weight are left out; weighted_score is None when the row has none.
+    """
+    # Each present metric, paired with its normalised value and its active weight.
+    present = [
+        (label, float(row[col]), float(cast(float, weights[col[len("norm_") :]])))
+        for col, label in _BREAKDOWN_COMPONENTS
+        if col in row.index and pd.notna(row[col]) and col[len("norm_") :] in weights
+    ]
+    components = {label: round(value, 3) for label, value, _ in present}
+    present_weights = {label: round(weight, 3) for label, _, weight in present}
+    # Each metric's weighted contribution to the score: value * weight
+    # renormalised over the weights of the metrics this indexer has, so the
+    # contributions sum to the logged score (mirrors _calculate_weighted_scores).
+    weight_total = sum(weight for _, _, weight in present)
+    contributions = {
+        label: round(value * weight / weight_total, 4)
+        for label, value, weight in present
+        if weight_total > 0
+    }
+    weighted = (
+        round(float(row["weighted_score"]), 4)
+        if "weighted_score" in row.index and pd.notna(row["weighted_score"])
+        else None
+    )
+    return weighted, components, present_weights, contributions
+
+
 def _log_selection_reasoning(processor: IndexerSelector, deployment_id: str) -> None:
     """Log each selected indexer's score breakdown for auditability."""
     if processor.data is None or processor.data.empty or not processor.current_group:
         return
 
     scored = processor.data[processor.data["indexer"].isin(processor.current_group)]
-    # The weight key for each metric is its normalised column name without the
-    # "norm_" prefix, which matches the keys in processor.weights / DEFAULT_WEIGHTS.
-    component_cols = [
-        ("norm_stake_to_fees", "stake_to_fees"),
-        ("norm_base_price_per_epoch", "base_price"),
-        ("norm_lat_lin_reg_coefficient", "latency"),
-        ("norm_uptime_score", "uptime"),
-        ("norm_success_rate", "success_rate"),
-        ("norm_price_per_entity", "price_per_entity"),
-    ]
     for _, row in scored.iterrows():
-        # Each present metric, paired with its normalised value and its active
-        # weight. The weight key is the column name without the "norm_" prefix.
-        present = [
-            (label, float(row[col]), float(cast(float, processor.weights[col[len("norm_") :]])))
-            for col, label in component_cols
-            if col in row.index and pd.notna(row[col]) and col[len("norm_") :] in processor.weights
-        ]
-        components = {label: round(value, 3) for label, value, _ in present}
-        weights = {label: round(weight, 3) for label, _, weight in present}
-        # Each metric's weighted contribution to the score: value * weight
-        # renormalised over the weights of the metrics this indexer has, so the
-        # contributions sum to the logged score (mirrors _calculate_weighted_scores).
-        weight_total = sum(weight for _, _, weight in present)
-        contributions = {
-            label: round(value * weight / weight_total, 4)
-            for label, value, weight in present
-            if weight_total > 0
-        }
-        weighted = (
-            round(float(row["weighted_score"]), 4)
-            if "weighted_score" in row.index and pd.notna(row["weighted_score"])
-            else None
-        )
+        weighted, components, weights, contributions = _score_breakdown(row, processor.weights)
         logger.info(
             "selected indexer=%s score=%.4f components=%s weights=%s contributions=%s "
             "deployment=%s",

@@ -186,10 +186,59 @@ def _emit_heartbeat(
 
 @dataclass
 class _PartitionReadStats:
-    """Message and filtered counts for one partition read, set when the read ends."""
+    """Running counts for one partition read, brought up to date after each consumed batch."""
 
     messages: int = 0
     filtered: int = 0
+    last_offset: int = 0
+
+
+def _iter_batch_queries(
+    messages: list,
+    end_ts_ms: int,
+    gw_filter: Optional[set],
+    stats: _PartitionReadStats,
+) -> Generator[Tuple[ClientQueryProtobuf, int], None, bool]:
+    """Yield (query, ts_ms) per parsed message of 1 consume() batch, adding its counts to stats.
+
+    Returns True at the first message past end_ts_ms, which ends the whole partition read.
+    """
+    # Counted in locals and written back once per batch, even if the reader is closed mid-batch.
+    total_messages = stats.messages
+    filtered_count = stats.filtered
+    last_offset = stats.last_offset
+    try:
+        for msg in messages:
+            if msg.error():
+                continue
+
+            _, ts_ms = msg.timestamp()
+            if ts_ms < 0:
+                ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+            if ts_ms > end_ts_ms:
+                return True
+
+            # offset() is None only on error events, which are skipped above.
+            last_offset = msg.offset()
+            total_messages += 1
+
+            try:
+                query = ClientQueryProtobuf()
+                query.ParseFromString(msg.value())
+            except Exception:
+                continue
+
+            if gw_filter and query.gateway_id not in gw_filter:
+                filtered_count += 1
+                continue
+
+            yield query, ts_ms
+        return False
+    finally:
+        stats.messages = total_messages
+        stats.filtered = filtered_count
+        stats.last_offset = last_offset
 
 
 def _iter_partition_queries(
@@ -208,15 +257,13 @@ def _iter_partition_queries(
 
     Ends after 3 empty consume() calls in a row or at the first message past end_ts_ms.
     Skips error messages, unparseable payloads and gateways outside gw_filter. Heartbeats
-    report len(pairs); the message and filtered counts go to `stats` when the read ends.
+    report len(pairs); `stats` holds the message and filtered counts as the read goes.
     """
     from confluent_kafka import Consumer, TopicPartition
 
     consumer = Consumer(config)
-    total_messages = 0
-    filtered_count = 0
+    stats.messages, stats.filtered, stats.last_offset = 0, 0, start_offset
     consecutive_empty = 0
-    last_offset = start_offset
 
     try:
         consumer.assign([TopicPartition(topic, partition, start_offset)])
@@ -228,61 +275,27 @@ def _iter_partition_queries(
         _emit_heartbeat(label, partition, 0, 0, 0, start_offset, start_offset, end_offset, 0.0)
         last_progress_log = loop_start
 
-        while True:
+        while consecutive_empty < 3:
             now = time.monotonic()
             if now - last_progress_log >= PROGRESS_LOG_INTERVAL_SEC:
                 _emit_heartbeat(
                     label,
                     partition,
-                    total_messages,
-                    filtered_count,
+                    stats.messages,
+                    stats.filtered,
                     len(pairs),
                     start_offset,
-                    last_offset,
+                    stats.last_offset,
                     end_offset,
                     now - loop_start,
                 )
                 last_progress_log = now
 
             messages = consumer.consume(num_messages=1000, timeout=30.0)
-
-            if not messages:
-                consecutive_empty += 1
-                if consecutive_empty >= 3:
-                    break
-                continue
-
-            consecutive_empty = 0
-
-            for msg in messages:
-                if msg.error():
-                    continue
-
-                ts_type, ts_ms = msg.timestamp()
-                if ts_ms < 0:
-                    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-                if ts_ms > end_ts_ms:
-                    return
-
-                # offset() is None only on error events, which are skipped above.
-                last_offset = msg.offset()  # type: ignore[assignment]
-                total_messages += 1
-
-                try:
-                    query = ClientQueryProtobuf()
-                    query.ParseFromString(msg.value())
-                except Exception:
-                    continue
-
-                if gw_filter and query.gateway_id not in gw_filter:
-                    filtered_count += 1
-                    continue
-
-                yield query, ts_ms
+            consecutive_empty = 0 if messages else consecutive_empty + 1
+            if (yield from _iter_batch_queries(messages, end_ts_ms, gw_filter, stats)):
+                return
     finally:
-        stats.messages = total_messages
-        stats.filtered = filtered_count
         consumer.close()
 
 
@@ -328,6 +341,26 @@ def _count_partition_worker(args: tuple) -> tuple:
     return (counts, fees, stats.messages, stats.filtered)
 
 
+def _with_trailing_slash(url: str) -> str:
+    return url if url.endswith("/") else url + "/"
+
+
+class _InternCache(dict[str, str]):
+    """Maps a raw string to the interned form of canonical(raw), computing it on first sight.
+
+    A hit is a plain dict subscript that never calls back into Python; only a miss runs
+    __missing__, which interns, stores and returns the canonical form.
+    """
+
+    def __init__(self, canonical: Callable[[str], str]) -> None:
+        super().__init__()
+        self._canonical = canonical
+
+    def __missing__(self, raw: str) -> str:
+        interned = self[raw] = sys.intern(self._canonical(raw))
+        return interned
+
+
 def _sample_partition_worker(args: tuple) -> tuple:
     """
     Sample pass for a single partition. Runs in a child process.
@@ -350,16 +383,12 @@ def _sample_partition_worker(args: tuple) -> tuple:
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     stats = _PartitionReadStats()
 
-    # Worker-local intern caches. Protobuf hands us fresh str objects for every
-    # message even when the value is identical to one we've already seen, so
-    # `sys.intern` would otherwise run 3x per row (2.76B attempts in production,
-    # ~8B intern calls total). Caching the canonical form under the raw key
-    # collapses warm-path lookups to a single dict.get each. Cardinality in
-    # practice: ~O(10) distinct statuses, ~O(10) distinct chains, ~O(13k)
-    # distinct urls (one per indexer-pair).
-    url_cache: Dict[str, str] = {}
-    status_cache: Dict[str, str] = {}
-    chain_cache: Dict[str, str] = {}
+    # Protobuf returns a fresh str per message even for repeated values, so each value is
+    # interned once on first sight and every later row is a dict hit (2.76B attempts in
+    # production against ~10 statuses, ~10 chains and ~13k urls).
+    url_cache = _InternCache(_with_trailing_slash)
+    status_cache = _InternCache(_map_result_to_status)
+    chain_cache = _InternCache(str)
 
     queries = _iter_partition_queries(
         "sample",
@@ -386,49 +415,22 @@ def _sample_partition_worker(args: tuple) -> tuple:
                 key = (dep_bytes, idx_bytes)
                 n = counts[key]
 
-                # Hoist descriptor-based protobuf attribute access — each
-                # `attempt.<field>` lookup goes through a descriptor and
-                # costs ~200ns. Bind once per attempt and reuse.
-                raw_result = attempt.result
-                raw_chain = attempt.indexed_chain
-
-                # url/status/subgraph_network are interned via a worker-local
-                # cache (see top of worker). First sight of a value pays
-                # sys.intern + cache store; every subsequent row hits the
-                # dict-lookup fast path. query_id is unique per query so
-                # caching/interning it would burn cycles for no dedup.
-                interned_url = url_cache.get(url)
-                if interned_url is None:
-                    interned_url = sys.intern(url if url.endswith("/") else url + "/")
-                    url_cache[url] = interned_url
-
-                interned_status = status_cache.get(raw_result)
-                if interned_status is None:
-                    interned_status = sys.intern(_map_result_to_status(raw_result))
-                    status_cache[raw_result] = interned_status
-
-                interned_chain = chain_cache.get(raw_chain)
-                if interned_chain is None:
-                    interned_chain = sys.intern(raw_chain)
-                    chain_cache[raw_chain] = interned_chain
-
+                # query_id is unique per query, so interning it would cost cycles for no saving.
                 row = (
                     query.query_id,
                     attempt.fee_grt,
                     ts_ms,
                     attempt.blocks_behind,
                     attempt.response_time_ms,
-                    interned_status,
-                    interned_chain,
-                    interned_url,
+                    status_cache[attempt.result],
+                    chain_cache[attempt.indexed_chain],
+                    url_cache[url],
                 )
 
                 if n < rows_to_use:
                     reservoirs[key].append(row)
-                else:
-                    j = rng.randint(0, n)
-                    if j < rows_to_use:
-                        reservoirs[key][j] = row
+                elif (j := rng.randint(0, n)) < rows_to_use:
+                    reservoirs[key][j] = row
 
                 counts[key] += 1
 
@@ -467,9 +469,9 @@ class RedpandaProvider:
         # When set, only messages from the specified gateway(s) are processed.
         # Comma-separated, e.g. "mainnet-gw-1,mainnet-gw-2".
         _gw_ids = os.environ.get("REDPANDA_GATEWAY_IDS", "")
-        self._gateway_id_filter: Optional[set] = (
-            set(gid.strip() for gid in _gw_ids.split(",") if gid.strip()) or None
-        )
+        self._gateway_id_filter: Optional[set] = {
+            gid.strip() for gid in _gw_ids.split(",") if gid.strip()
+        } or None
         if self._gateway_id_filter:
             logger.info("Gateway ID filter active: %s", self._gateway_id_filter)
         else:
@@ -529,7 +531,7 @@ class RedpandaProvider:
         ]
         df = pd.DataFrame(rows, columns=["deployment_hash", "indexer", "num_rows"])
         if not df.empty:
-            df.sort_values(by="num_rows", ascending=False, inplace=True, ignore_index=True)
+            df = df.sort_values(by="num_rows", ascending=False, ignore_index=True)
 
         memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
         logger.info("Initial query results from Redpanda: %d pairs (%.1f MB)", len(df), memory_mb)
@@ -567,7 +569,7 @@ class RedpandaProvider:
         logger.info("Combined query results from Redpanda: %d rows (%.1f MB)", len(df), memory_mb)
         return df
 
-    def fetch_stake_to_fees(self, start_ts: str) -> pd.DataFrame:
+    def fetch_stake_to_fees(self) -> pd.DataFrame:
         """
         Compute stake-to-fees ratio by combining subgraph stake data with
         fee totals accumulated during the Redpanda replay.
@@ -615,7 +617,7 @@ class RedpandaProvider:
         )
 
         df = df[["indexer", "stake_to_fees", "total_query_fees", "last_known_slashable_stake"]]
-        df.set_index("indexer", inplace=True)
+        df = df.set_index("indexer")
 
         matched = df["stake_to_fees"].notna().sum()
         logger.info(
@@ -696,6 +698,15 @@ class RedpandaProvider:
         ):
             return
         self._sample_pass(start_date, num_days, rows_to_use)
+
+    def _set_row_cache(
+        self, df: pd.DataFrame, start_date: date, num_days: int, rows_to_use: int
+    ) -> None:
+        """Store the sampled rows along with the window and cap they were sampled for."""
+        self._row_cache_df = df
+        self._row_cache_start_date = start_date
+        self._row_cache_num_days = num_days
+        self._row_cache_rows_to_use = rows_to_use
 
     # -----------------------------------------------------------------------
     # Internal: partition resolution
@@ -830,8 +841,8 @@ class RedpandaProvider:
         """
         Pass 1: lightweight scan counting (deployment, indexer) pairs.
 
-        Uses extract_keys_and_fees for minimal parsing, raw byte keys,
-        batch polling, and parallel partition consumption.
+        Counts pairs and sums fees for each partition in a child process, keyed on raw
+        bytes, and converts the keys to CID and hex strings once after merging.
         """
         end_dt, start_ts_ms, end_ts_ms = self._pass_window(start_date)
 
@@ -904,9 +915,8 @@ class RedpandaProvider:
         """
         Pass 2: reservoir sampling with cap = rows_to_use.
 
-        Uses extract_sample_fields for selective parsing, raw byte keys,
-        batch polling, cached partitions, deferred string conversion,
-        parallel partition consumption, and process-local PRNG.
+        Reuses pass 1's partitions when cached, samples each partition in a child process with
+        its own seeded PRNG, then merges the per-partition reservoirs.
         """
         end_dt, start_ts_ms, end_ts_ms = self._pass_window(start_date)
 
@@ -925,62 +935,18 @@ class RedpandaProvider:
 
         if not partitions:
             logger.warning("No valid partitions for sample pass")
-            self._row_cache_df = _empty_combined_df()
-            self._row_cache_start_date = start_date
-            self._row_cache_num_days = num_days
-            self._row_cache_rows_to_use = rows_to_use
+            self._set_row_cache(_empty_combined_df(), start_date, num_days, rows_to_use)
             return
 
         seed = int(os.environ.get("SCORING_SEED", start_date.strftime("%Y%m%d")))
         results = self._run_partition_workers(
             _sample_partition_worker, partitions, end_ts_ms, rows_to_use, seed
         )
-
-        # Merge per-partition reservoirs using Algorithm R streaming.
-        #
-        # The previous implementation extended every worker's rows into a single
-        # list per pair, then shuffled and truncated to rows_to_use. That held
-        # up to N_workers * rows_to_use rows per pair in the parent process
-        # before truncation — a transient ~8x spike that ran the 50Gi pod OOM
-        # for windows with heavy message volume.
-        #
-        # The streaming form below absorbs each worker's rows one at a time and
-        # applies Algorithm R at the parent, so the per-pair footprint is
-        # bounded by rows_to_use from the first overflow onwards. Statistical
-        # semantics are preserved: each retained row is uniformly sampled from
-        # the union of all worker reservoirs, matching the old shuffle-then-head.
-        merge_rng = random.Random(seed)
-        merged_reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
-        merged_absorbed: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
-        total_filtered = 0
-        # Pop from the list as we go so each worker's reservoir can be freed
-        # once absorbed, rather than pinning all N worker results until the
-        # loop completes.
-        while results:
-            reservoirs, _counts, filtered = results.pop()
-            for key, rows in reservoirs.items():
-                merged = merged_reservoirs[key]
-                absorbed = merged_absorbed[key]
-                for row in rows:
-                    if absorbed < rows_to_use:
-                        merged.append(row)
-                    else:
-                        j = merge_rng.randint(0, absorbed)
-                        if j < rows_to_use:
-                            merged[j] = row
-                    absorbed += 1
-                merged_absorbed[key] = absorbed
-            total_filtered += filtered
+        merged_reservoirs, total_filtered = _merge_worker_reservoirs(results, rows_to_use, seed)
 
         total_rows = sum(len(rows) for rows in merged_reservoirs.values())
-        if total_rows:
-            self._row_cache_df = _build_dataframe(merged_reservoirs)
-        else:
-            self._row_cache_df = _empty_combined_df()
-
-        self._row_cache_start_date = start_date
-        self._row_cache_num_days = num_days
-        self._row_cache_rows_to_use = rows_to_use
+        df = _build_dataframe(merged_reservoirs) if total_rows else _empty_combined_df()
+        self._set_row_cache(df, start_date, num_days, rows_to_use)
 
         logger.info(
             "Sample pass complete: %s rows buffered across %d pairs "
@@ -1031,6 +997,35 @@ class RedpandaProvider:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _merge_worker_reservoirs(
+    results: List[tuple], rows_to_use: int, seed: int
+) -> Tuple[Dict[Tuple[bytes, bytes], List[tuple]], int]:
+    """Merge worker reservoirs into 1 per pair with Algorithm R; return it and the filtered total.
+
+    Absorbing rows one at a time caps each pair at rows_to_use in the parent (holding every
+    worker's rows at once ran the pod out of memory) while each kept row stays a uniform sample
+    of all of them. Pops `results` from the end so each worker's reservoir is freed once absorbed.
+    """
+    merge_rng = random.Random(seed)
+    merged_reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
+    merged_absorbed: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
+    total_filtered = 0
+    while results:
+        reservoirs, _counts, filtered = results.pop()
+        for key, rows in reservoirs.items():
+            merged = merged_reservoirs[key]
+            absorbed = merged_absorbed[key]
+            for row in rows:
+                if absorbed < rows_to_use:
+                    merged.append(row)
+                elif (j := merge_rng.randint(0, absorbed)) < rows_to_use:
+                    merged[j] = row
+                absorbed += 1
+            merged_absorbed[key] = absorbed
+        total_filtered += filtered
+    return merged_reservoirs, total_filtered
 
 
 def _build_dataframe(

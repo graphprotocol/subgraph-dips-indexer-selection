@@ -12,6 +12,8 @@ from typing import Callable, NewType, Optional, TypedDict, Union, cast
 import numpy as np
 import pandas as pd
 
+from .score_columns import SEL_LATENCY_CI
+
 __all__ = [
     "IndexerSelector",
     "DeploymentId",
@@ -186,11 +188,7 @@ class IndexerSelector:
                     "last_known_slashable_stake"
                 ] / effective_fees.replace(0.0, float("nan"))
                 # Drop pre-normalised column so _normalize_metrics recomputes it
-                self.data.drop(
-                    columns=["norm_stake_to_fees"],
-                    errors="ignore",
-                    inplace=True,
-                )
+                self.data = self.data.drop(columns=["norm_stake_to_fees"], errors="ignore")
 
             adjusted_count = (dips_adjustment > 0).sum()
             logger.info(
@@ -273,13 +271,12 @@ class IndexerSelector:
         Use the methods _add_indexers_to_group and _replace_underperforming_indexers to
         assign indexers to the subgraph in question.
         """
-        action = (
-            "add"
-            if len(self.current_group) < self.target_size
-            else "remove"
-            if len(self.current_group) > self.target_size
-            else "replace_check"
-        )
+        if len(self.current_group) < self.target_size:
+            action = "add"
+        elif len(self.current_group) > self.target_size:
+            action = "remove"
+        else:
+            action = "replace_check"
         logger.info(
             "deployment=%s assigning: current_size=%d target_size=%d action=%s",
             self.deployment_id,
@@ -432,52 +429,7 @@ class IndexerSelector:
         added_this_call: set[IndexerId] = set()
 
         while True:
-            best_swap: Optional[tuple[IndexerId, IndexerId, float]] = None
-
-            for existing_indexer in self.current_group:
-                # Don't replace indexers we just added in this call
-                if existing_indexer in added_this_call:
-                    continue
-
-                # Get current indexer's score
-                indexer_data = self.data[self.data["indexer"] == existing_indexer]
-                if indexer_data.empty:
-                    continue
-
-                current_score = indexer_data["weighted_score"].iloc[0]
-
-                # Only consider replacing indexers below the minimum threshold
-                if current_score >= MIN_INDEXER_SCORE:
-                    logger.debug(
-                        "deployment=%s indexer %s score=%.4f "
-                        ">= threshold=%.2f, no replacement needed",
-                        self.deployment_id,
-                        existing_indexer[:10],
-                        current_score,
-                        MIN_INDEXER_SCORE,
-                    )
-                    continue
-
-                # Find best candidate for replacing this specific indexer
-                candidate = self._find_best_replacement_or_select_best_indexer(
-                    replacing_indexer=existing_indexer
-                )
-
-                if not candidate:
-                    continue
-
-                # Get candidate's score
-                candidate_data = self.data[self.data["indexer"] == candidate]
-                if candidate_data.empty:
-                    continue
-
-                candidate_score = candidate_data["weighted_score"].iloc[0]
-
-                # Only replace if candidate is significantly better
-                if candidate_score > current_score + REPLACEMENT_MARGIN:
-                    improvement = candidate_score - current_score
-                    if best_swap is None or improvement > best_swap[2]:
-                        best_swap = (existing_indexer, candidate, improvement)
+            best_swap = self._find_best_swap(added_this_call)
 
             if best_swap:
                 old_indexer, new_indexer, improvement = best_swap
@@ -497,6 +449,68 @@ class IndexerSelector:
                     self.deployment_id,
                 )
                 break  # No more beneficial replacements available
+
+    def _score_of(self, indexer: IndexerId) -> Optional[float]:
+        """Weighted score from the indexer's first row, or None when it has no row."""
+        rows = self.data[self.data["indexer"] == indexer]
+        if rows.empty:
+            return None
+        return cast(float, rows["weighted_score"].iloc[0])
+
+    def _find_best_swap(
+        self, added_this_call: set[IndexerId]
+    ) -> Optional[tuple[IndexerId, IndexerId, float]]:
+        """Return (existing, candidate, improvement) for the group member whose
+        replacement gains the most, or None when no member has a beneficial swap.
+        Members in added_this_call are not replaced. On equal improvement the
+        member earlier in the group wins.
+        """
+        best_swap: Optional[tuple[IndexerId, IndexerId, float]] = None
+        for existing_indexer in self.current_group:
+            # Don't replace indexers we just added in this call
+            if existing_indexer in added_this_call:
+                continue
+            swap = self._swap_for(existing_indexer)
+            if swap is not None and (best_swap is None or swap[2] > best_swap[2]):
+                best_swap = swap
+        return best_swap
+
+    def _swap_for(
+        self, existing_indexer: IndexerId
+    ) -> Optional[tuple[IndexerId, IndexerId, float]]:
+        """Return (existing_indexer, candidate, improvement) when existing_indexer
+        scores below MIN_INDEXER_SCORE and its best replacement beats it by more
+        than REPLACEMENT_MARGIN; None otherwise.
+        """
+        current_score = self._score_of(existing_indexer)
+        if current_score is None:
+            return None
+
+        # Only consider replacing indexers below the minimum threshold
+        if current_score >= MIN_INDEXER_SCORE:
+            logger.debug(
+                "deployment=%s indexer %s score=%.4f >= threshold=%.2f, no replacement needed",
+                self.deployment_id,
+                existing_indexer[:10],
+                current_score,
+                MIN_INDEXER_SCORE,
+            )
+            return None
+
+        # Find best candidate for replacing this specific indexer
+        candidate = self._find_best_replacement_or_select_best_indexer(
+            replacing_indexer=existing_indexer
+        )
+        if not candidate:
+            return None
+        candidate_score = self._score_of(candidate)
+        if candidate_score is None:
+            return None
+
+        # Only replace if candidate is significantly better
+        if candidate_score > current_score + REPLACEMENT_MARGIN:
+            return existing_indexer, candidate, candidate_score - current_score
+        return None
 
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None
@@ -531,10 +545,10 @@ class IndexerSelector:
         )
 
         # The candidates we could select are those that are not unpickable
-        candidates = self.data[~self.data["indexer"].isin(unpickable_indexers)].copy()
+        candidates = self.data[~self.data["indexer"].isin(unpickable_indexers)]
 
         # Sort the candidates by weighted score, highest score first
-        candidates.sort_values(by="weighted_score", ascending=False, inplace=True)
+        candidates = candidates.sort_values(by="weighted_score", ascending=False)
         logger.debug(
             "deployment=%s candidates: %d eligible out of %d total (excluded %d unpickable)",
             self.deployment_id,
@@ -543,39 +557,8 @@ class IndexerSelector:
             len(unpickable_indexers),
         )
 
-        # Prefer already-synced candidates so queries serve right after
-        # acceptance: the first synced indexer gets in at any score, later ones
-        # must beat MIN_SYNCED_THRESHOLD or fall back to competing on merit.
-        if self.synced_indexers:
-            group_lower = {i.lower() for i in self.current_group}
-            group_has_synced = bool(group_lower & self.synced_indexers)
-            all_synced_candidates = candidates[
-                candidates["indexer"].str.lower().isin(self.synced_indexers)
-            ]
-
-            if group_has_synced:
-                # Already have a synced indexer — threshold applies
-                synced = all_synced_candidates[
-                    all_synced_candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD
-                ]
-            else:
-                # No synced indexer yet — first one gets in at any score
-                synced = all_synced_candidates
-
-            unsynced = candidates[~candidates["indexer"].isin(synced["indexer"])]
-            logger.info(
-                "deployment=%s candidates: %d synced eligible, %d unsynced (group_has_synced=%s)",
-                self.deployment_id,
-                len(synced),
-                len(unsynced),
-                group_has_synced,
-            )
-            pools = [("synced", synced), ("unsynced", unsynced)]
-        else:
-            pools = [("all", candidates)]
-
         # Iterate pools in order, checking decentralisation
-        for pool_name, pool_df in pools:
+        for pool_name, pool_df in self._candidate_pools(candidates):
             for indexer in pool_df["indexer"]:
                 if self._meets_decentralization_requirements(
                     indexer, replacing_indexer=replacing_indexer
@@ -611,6 +594,41 @@ class IndexerSelector:
         )
         return None
 
+    def _candidate_pools(self, candidates: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+        """Split score-sorted candidates into named pools, drawn from in order.
+
+        Prefer already-synced candidates so queries serve right after
+        acceptance: the first synced indexer gets in at any score, later ones
+        must beat MIN_SYNCED_THRESHOLD or fall back to competing on merit.
+        """
+        if not self.synced_indexers:
+            return [("all", candidates)]
+
+        group_lower = {i.lower() for i in self.current_group}
+        group_has_synced = bool(group_lower & self.synced_indexers)
+        all_synced_candidates = candidates[
+            candidates["indexer"].str.lower().isin(self.synced_indexers)
+        ]
+
+        if group_has_synced:
+            # Already have a synced indexer — threshold applies
+            synced = all_synced_candidates[
+                all_synced_candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD
+            ]
+        else:
+            # No synced indexer yet — first one gets in at any score
+            synced = all_synced_candidates
+
+        unsynced = candidates[~candidates["indexer"].isin(synced["indexer"])]
+        logger.info(
+            "deployment=%s candidates: %d synced eligible, %d unsynced (group_has_synced=%s)",
+            self.deployment_id,
+            len(synced),
+            len(unsynced),
+            group_has_synced,
+        )
+        return [("synced", synced), ("unsynced", unsynced)]
+
 
 def _normalize_metrics(
     merged: pd.DataFrame,
@@ -624,11 +642,7 @@ def _normalize_metrics(
     """
     # (norm column, source column, normaliser), in the order the columns are added.
     metrics: list[tuple[str, str, Callable[[pd.Series], Union[pd.Series, float]]]] = [
-        (
-            "norm_lat_lin_reg_coefficient",
-            "Latency Coefficient + Error Confidence Interval",
-            _normalize_latency,
-        ),
+        ("norm_lat_lin_reg_coefficient", SEL_LATENCY_CI, _normalize_latency),
         # higher is better
         ("norm_uptime_score", "% up_x", _normalize_uptime_and_success_rate),
         ("norm_stake_to_fees", "stake_to_fees", _normalize_stake_to_fees),

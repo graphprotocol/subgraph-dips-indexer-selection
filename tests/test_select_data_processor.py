@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -742,6 +743,247 @@ class TestIndexerSelector:
         # Verify that 'H' and 'NOT_IN_LIST' don't appear in cancelled agreements
         assert "H" not in newly_cancelled_agreements
         assert "NOT_IN_LIST" not in newly_cancelled_agreements
+
+
+def _selector_with_scores(scores, group, synced_indexers=None):
+    """Selector over indexers with distinct orgs and locations, weighted_score set by hand."""
+    indexers = list(scores)
+    processor = IndexerSelector(
+        history=pd.DataFrame(
+            {
+                "indexer": indexers,
+                "destination_loc": [f"loc{i}" for i in range(len(indexers))],
+                "org": [f"org{i}" for i in range(len(indexers))],
+            }
+        ),
+        deployment_id=DeploymentId("test_subgraph"),
+        synced_indexers=synced_indexers,
+    )
+    for indexer, score in scores.items():
+        processor.data.loc[processor.data["indexer"] == indexer, "weighted_score"] = score
+    processor.current_group = list(group)
+    return processor
+
+
+def _selection_log(caplog, *fragments):
+    """Messages from the selection module containing any of ``fragments``, in order.
+
+    The selector selects, and logs, on construction, so callers clear caplog first.
+    """
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "iisa.indexer_selection" and any(f in r.getMessage() for f in fragments)
+    ]
+
+
+class TestReplaceUnderperformingIndexersOrder:
+    """Pins the swap order, tie rule and log lines of _replace_underperforming_indexers."""
+
+    LOOP_LOG = ("no replacement needed", "replaced indexer", "no more beneficial")
+
+    def test_swaps_largest_improvement_first_and_logs_each_pass(self, caplog):
+        # B comes first in the group but A gains more from the same candidate D.
+        processor = _selector_with_scores(
+            {"A": 0.05, "B": 0.08, "C": 0.50, "D": 0.80, "E": 0.75}, ["B", "A", "C"]
+        )
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="iisa.indexer_selection"):
+            processor._replace_underperforming_indexers()
+
+        assert processor.current_group == ["C", "D", "E"]
+        threshold_line = (
+            "deployment=test_subgraph indexer C score=0.5000 >= threshold=0.15, "
+            "no replacement needed"
+        )
+        assert _selection_log(caplog, *self.LOOP_LOG) == [
+            threshold_line,
+            "deployment=test_subgraph replaced indexer A with D (improvement=0.7500)",
+            threshold_line,
+            "deployment=test_subgraph replaced indexer B with E (improvement=0.6700)",
+            threshold_line,
+            "deployment=test_subgraph no more beneficial replacements found",
+        ]
+
+    def test_equal_improvement_keeps_the_earlier_group_member(self):
+        processor = _selector_with_scores(
+            {"A": 0.05, "B": 0.05, "C": 0.50, "D": 0.80, "E": 0.10}, ["A", "B", "C"]
+        )
+
+        processor._replace_underperforming_indexers()
+
+        assert processor.current_group == ["B", "C", "D"]
+
+    def test_group_member_without_a_row_is_left_alone(self):
+        processor = _selector_with_scores({"A": 0.05, "C": 0.50, "D": 0.80}, ["X", "A", "C"])
+
+        processor._replace_underperforming_indexers()
+
+        assert processor.current_group == ["X", "C", "D"]
+
+
+class TestSwapHelpers:
+    """Tests for _score_of, _swap_for and _find_best_swap behind the replacement loop."""
+
+    SCORES = {"A": 0.05, "B": 0.10, "C": 0.50, "D": 0.80}
+
+    def test_score_of_returns_none_without_a_row(self):
+        processor = _selector_with_scores(self.SCORES, ["A", "B", "C"])
+
+        assert processor._score_of("D") == 0.80
+        assert processor._score_of("X") is None
+
+    @pytest.mark.parametrize(
+        "existing, scores, expected",
+        [
+            ("A", SCORES, ("A", "D", 0.75)),
+            ("C", SCORES, None),  # at or above MIN_INDEXER_SCORE
+            ("X", SCORES, None),  # no row
+            ("A", {**SCORES, "D": 0.55}, None),  # gain within REPLACEMENT_MARGIN
+        ],
+    )
+    def test_swap_for(self, existing, scores, expected):
+        processor = _selector_with_scores(scores, ["A", "B", "C", "X"])
+
+        swap = processor._swap_for(existing)
+
+        if expected is None:
+            assert swap is None
+        else:
+            assert swap[:2] == expected[:2]
+            assert swap[2] == pytest.approx(expected[2])
+
+    def test_find_best_swap_skips_indexers_added_this_call(self):
+        processor = _selector_with_scores(self.SCORES, ["A", "B", "C"])
+
+        assert processor._find_best_swap({"A", "B"}) is None
+        assert processor._find_best_swap({"A"})[:2] == ("B", "D")
+
+
+class TestOptimisticDipsFees:
+    """Expected DIPs fees join the query fees before stake_to_fees is normalised."""
+
+    def test_recomputes_stake_to_fees_and_its_normalised_column(self):
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C"],
+                "destination_loc": ["loc1", "loc2", "loc3"],
+                "org": ["org1", "org2", "org3"],
+                "last_known_slashable_stake": [100.0, 200.0, 300.0],
+                "total_query_fees": [10.0, 10.0, 10.0],
+                # Stale pre-normalised values that must be recomputed, not kept.
+                "norm_stake_to_fees": [0.5, 0.5, 0.5],
+            }
+        )
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            optimistic_dips_fees={"A": 90.0},
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["stake_to_fees"]) == [1.0, 20.0, 30.0]
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([0.0, 19 / 29, 1.0])
+        assert list(history["norm_stake_to_fees"]) == [0.5, 0.5, 0.5]
+
+
+class TestAssignAction:
+    """The assigning log line names the action picked from group size against target."""
+
+    @pytest.mark.parametrize(
+        "group, action",
+        [(["A"], "add"), (["A", "B", "C"], "remove"), (["A", "B"], "replace_check")],
+    )
+    def test_logs_action_for_group_size(self, group, action, caplog):
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C"],
+                "destination_loc": ["loc1", "loc2", "loc3"],
+                "org": ["org1", "org2", "org3"],
+            }
+        )
+
+        with caplog.at_level(logging.INFO, logger="iisa.indexer_selection"):
+            IndexerSelector(
+                history=history,
+                deployment_id=DeploymentId("test_subgraph"),
+                existing_agreements={DeploymentId("test_subgraph"): list(group)},
+                target_size=2,
+            )
+
+        assert _selection_log(caplog, "assigning:") == [
+            f"deployment=test_subgraph assigning: current_size={len(group)} target_size=2 "
+            f"action={action}"
+        ]
+
+
+class TestCandidatePools:
+    """Pins how _find_best_replacement_or_select_best_indexer orders synced candidates."""
+
+    SCORES = {"A": 0.90, "B": 0.80, "C": 0.50, "D": 0.65, "E": 0.30}
+
+    def test_threshold_applies_once_group_has_a_synced_indexer(self, caplog):
+        processor = _selector_with_scores(self.SCORES, ["C"], synced_indexers={"c", "d", "e"})
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="iisa.indexer_selection"):
+            result = processor._find_best_replacement_or_select_best_indexer()
+
+        assert result == "D"
+        assert _selection_log(caplog, "candidates:", "selected") == [
+            "deployment=test_subgraph candidates: 1 synced eligible, 3 unsynced "
+            "(group_has_synced=True)",
+            "deployment=test_subgraph selected synced indexer D "
+            "(score=0.6500, meets decentralization)",
+        ]
+
+    def test_first_synced_indexer_skips_the_threshold(self, caplog):
+        processor = _selector_with_scores(self.SCORES, ["A"], synced_indexers={"c", "d", "e"})
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="iisa.indexer_selection"):
+            result = processor._find_best_replacement_or_select_best_indexer()
+
+        assert result == "D"
+        assert _selection_log(caplog, "candidates:", "selected") == [
+            "deployment=test_subgraph candidates: 3 synced eligible, 1 unsynced "
+            "(group_has_synced=False)",
+            "deployment=test_subgraph selected synced indexer D "
+            "(score=0.6500, meets decentralization)",
+        ]
+
+    def test_without_synced_indexers_draws_from_one_pool(self, caplog):
+        processor = _selector_with_scores(self.SCORES, ["A"])
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="iisa.indexer_selection"):
+            result = processor._find_best_replacement_or_select_best_indexer()
+
+        assert result == "B"
+        assert _selection_log(caplog, "candidates:", "selected") == [
+            "deployment=test_subgraph selected all indexer B "
+            "(score=0.8000, meets decentralization)",
+        ]
+
+    @pytest.mark.parametrize(
+        "group, synced_indexers, expected",
+        [
+            (["A"], None, [("all", ["B", "D", "C", "E"])]),
+            (["A"], {"c", "d"}, [("synced", ["D", "C"]), ("unsynced", ["B", "E"])]),
+            (["C"], {"c", "d", "e"}, [("synced", ["D"]), ("unsynced", ["A", "B", "E"])]),
+        ],
+    )
+    def test_candidate_pools(self, group, synced_indexers, expected):
+        processor = _selector_with_scores(self.SCORES, group, synced_indexers=synced_indexers)
+        candidates = processor.data[~processor.data["indexer"].isin(group)].sort_values(
+            by="weighted_score", ascending=False
+        )
+
+        pools = processor._candidate_pools(candidates)
+
+        assert [(name, list(pool["indexer"])) for name, pool in pools] == expected
 
 
 class TestNormalizeMetrics:
