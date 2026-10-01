@@ -953,7 +953,7 @@ def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[floa
         prices = json.loads(dips_min_grt_json) if isinstance(dips_min_grt_json, str) else {}
         val = prices.get(chain_id)
         return float(val) if val is not None else None
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return None
 
 
