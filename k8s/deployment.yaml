@@ -81,9 +81,11 @@ spec:
             requests:
               cpu: 500m
               memory: 1Gi
+              ephemeral-storage: 256Mi
             limits:
               cpu: "4"
               memory: 2Gi
+              ephemeral-storage: 1Gi
           volumeMounts:
             - name: scores
               mountPath: /app/scores
