@@ -217,7 +217,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    def handle_signal(signum, frame):
+    def handle_signal(signum, _frame):
         logger.info("Received signal %d, shutting down", signum)
         _stop_event.set()
 

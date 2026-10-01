@@ -489,7 +489,7 @@ _state = IISAState()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     """FastAPI lifespan: load settings, init loader + DataManager, recover the
     last cached scores and sync-status from disk, warn if IISA_PUSH_TOKEN is unset.
 
