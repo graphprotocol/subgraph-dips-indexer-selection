@@ -1313,12 +1313,12 @@ def iterative_filter(
 
 
 def strategic_sample(
-    df: pd.DataFrame, target_rows_per_subgraph: int, rng: Optional[np.random.Generator] = None
+    df: pd.DataFrame, target_rows_per_subgraph: int, rng: np.random.Generator
 ) -> Tuple[pd.DataFrame, int]:
-    """Sample queries to create balanced representation across indexers."""
-    if rng is None:
-        rng = np.random.default_rng()
+    """Sample queries to create balanced representation across indexers.
 
+    The caller supplies a seeded generator so a run over the same data picks the same rows.
+    """
     if df.empty:
         df["sampled_query_id"] = pd.Series(dtype="float64")
         return df, 0

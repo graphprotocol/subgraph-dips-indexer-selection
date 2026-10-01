@@ -589,7 +589,9 @@ class TestStrategicSample:
 
     def test_strategic_sample_basic(self, sample_df):
         # Act
-        result_df, integer_root = strategic_sample(sample_df, target_rows_per_subgraph=30)
+        result_df, integer_root = strategic_sample(
+            sample_df, target_rows_per_subgraph=30, rng=np.random.default_rng(0)
+        )
 
         # Assert
         # Check output df length unchanged
@@ -607,7 +609,9 @@ class TestStrategicSample:
         empty_df = pd.DataFrame(columns=["deployment_hash", "indexer", "query_id"])
 
         # Act
-        result_df, integer_root = strategic_sample(empty_df, target_rows_per_subgraph=10)
+        result_df, integer_root = strategic_sample(
+            empty_df, target_rows_per_subgraph=10, rng=np.random.default_rng(0)
+        )
 
         # Assert
         assert result_df.empty
@@ -616,7 +620,9 @@ class TestStrategicSample:
 
     def test_strategic_sample_target_rows_per_subgraph_greater_than_df(self, sample_df):
         # Act - target larger than data
-        result_df, integer_root = strategic_sample(sample_df, target_rows_per_subgraph=10_000_000)
+        result_df, integer_root = strategic_sample(
+            sample_df, target_rows_per_subgraph=10_000_000, rng=np.random.default_rng(0)
+        )
 
         # Assert - should sample all unique queries
         assert len(result_df) == len(sample_df)
