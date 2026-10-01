@@ -1353,8 +1353,10 @@ def hash_sampled_queries(df: pd.DataFrame, integer_root: int) -> pd.DataFrame:
     result_df.loc[mask, "sampled_query_id_hashed_mod_integer_root"] = result_df.loc[
         mask, "sampled_query_id"
     ].apply(
-        lambda x: int.from_bytes(hashlib.sha256(str(x).encode()).digest()[:8], byteorder="big")
-        % integer_root
+        lambda x: (
+            int.from_bytes(hashlib.sha256(str(x).encode()).digest()[:8], byteorder="big")
+            % integer_root
+        )
     )
     return result_df
 
