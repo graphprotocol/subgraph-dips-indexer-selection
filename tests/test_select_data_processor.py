@@ -823,6 +823,36 @@ class TestReplaceUnderperformingIndexersOrder:
         assert processor.current_group == ["X", "C", "D"]
 
 
+class TestAssignAction:
+    """The assigning log line names the action picked from group size against target."""
+
+    @pytest.mark.parametrize(
+        "group, action",
+        [(["A"], "add"), (["A", "B", "C"], "remove"), (["A", "B"], "replace_check")],
+    )
+    def test_logs_action_for_group_size(self, group, action, caplog):
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C"],
+                "destination_loc": ["loc1", "loc2", "loc3"],
+                "org": ["org1", "org2", "org3"],
+            }
+        )
+
+        with caplog.at_level(logging.INFO, logger="iisa.indexer_selection"):
+            IndexerSelector(
+                history=history,
+                deployment_id=DeploymentId("test_subgraph"),
+                existing_agreements={DeploymentId("test_subgraph"): list(group)},
+                target_size=2,
+            )
+
+        assert _selection_log(caplog, "assigning:") == [
+            f"deployment=test_subgraph assigning: current_size={len(group)} target_size=2 "
+            f"action={action}"
+        ]
+
+
 class TestCandidatePools:
     """Pins how _find_best_replacement_or_select_best_indexer orders synced candidates."""
 

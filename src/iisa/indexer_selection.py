@@ -273,13 +273,12 @@ class IndexerSelector:
         Use the methods _add_indexers_to_group and _replace_underperforming_indexers to
         assign indexers to the subgraph in question.
         """
-        action = (
-            "add"
-            if len(self.current_group) < self.target_size
-            else "remove"
-            if len(self.current_group) > self.target_size
-            else "replace_check"
-        )
+        if len(self.current_group) < self.target_size:
+            action = "add"
+        elif len(self.current_group) > self.target_size:
+            action = "remove"
+        else:
+            action = "replace_check"
         logger.info(
             "deployment=%s assigning: current_size=%d target_size=%d action=%s",
             self.deployment_id,
