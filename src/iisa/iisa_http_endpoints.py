@@ -936,7 +936,9 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
         request.num_candidates,
         len(request.existing_indexers or []),
         len(request.blocklist or []),
-        f"{request.max_grt_per_30_days} GRT/30d" if request.max_grt_per_30_days else "none",
+        f"{request.max_grt_per_30_days} GRT/30d"
+        if request.max_grt_per_30_days is not None
+        else "none",
         f"{request.max_grt_per_billion_entities_per_30_days} GRT per billion entities/30d"
         if request.max_grt_per_billion_entities_per_30_days is not None
         else "none",
