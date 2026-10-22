@@ -26,8 +26,8 @@ from functools import lru_cache, partial
 from typing import Any, Optional, cast
 
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
@@ -108,7 +108,9 @@ class SelectionRequest(BaseModel):
     declined_indexers: Optional[dict[str, list[str]]] = None
     chain_id: Optional[str] = None  # e.g., "arbitrum-one"
     max_grt_per_30_days: Optional[float] = None  # e.g., 4500.0
-    max_grt_per_billion_entities_per_30_days: Optional[float] = None  # e.g., 2000.0
+    max_grt_per_billion_entities_per_30_days: Optional[float] = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )  # e.g., 2000.0
     optimistic_dips_fees: Optional[dict[str, float]] = None  # indexer address -> GRT per 30 days
 
 
@@ -776,7 +778,9 @@ def scores_weighted(
 def dips_indexers(
     chain: str,
     max_grt_per_30_days: Optional[float] = None,
-    max_grt_per_billion_entities_per_30_days: Optional[float] = None,
+    max_grt_per_billion_entities_per_30_days: Optional[float] = Query(
+        default=None, ge=0, allow_inf_nan=False
+    ),
     authorization: Optional[str] = Header(None),
 ) -> DipsIndexersResponse:
     """Indexers selection would pick for ``chain``: answered their DIPs probe, support
