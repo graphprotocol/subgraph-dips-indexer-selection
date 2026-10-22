@@ -1240,6 +1240,20 @@ class TestDipsIndexersEndpoint:
         assert capped.status_code == 200
         assert capped.json()["indexers"] == ["0xbbb"]
 
+    @pytest.mark.parametrize("ceiling", ["nan", "inf", "-1"])
+    def test_entity_price_ceiling_rejects_unusable_values(self, monkeypatch, ceiling):
+        """A NaN, infinite or negative ceiling would silently drop every priced indexer."""
+        from iisa.iisa_http_endpoints import app
+
+        self._seed_snapshot(monkeypatch)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get(
+            "/dips-indexers",
+            params={"chain": "mainnet", "max_grt_per_billion_entities_per_30_days": ceiling},
+        )
+        assert response.status_code == 422
+
     def test_chain_filter_excludes_advertised_but_unpriced_indexer(self, monkeypatch):
         """An indexer that lists a chain but never priced it is excluded for that
         chain, matching what the selection path would actually pick.
@@ -2914,6 +2928,22 @@ class TestSelectIndexersEndToEndPricing:
 
         assert response.status_code == 200
         assert [i["id"] for i in response.json()["indexers"]] == ["0xcheap"]
+
+    def test_negative_entity_ceiling_is_rejected(self):
+        """A negative ceiling would silently drop every indexer with a per-entity price."""
+        from iisa.iisa_http_endpoints import app
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmEntityBudgetTest",
+                "chain_id": "arb",
+                "num_candidates": 1,
+                "max_grt_per_billion_entities_per_30_days": -1,
+            },
+        )
+        assert response.status_code == 422
 
     def test_blocklist_excludes_indexers(self):
         """Blocklisted indexers must not appear in the response."""
