@@ -785,9 +785,8 @@ def dips_indexers(
 ) -> DipsIndexersResponse:
     """Indexers selection would pick for ``chain``: answered their DIPs probe, support
     the chain, and priced within the optional ``max_grt_per_30_days`` and
-    ``max_grt_per_billion_entities_per_30_days`` ceilings. ``chain`` is required::
-
-        GET /dips-indexers?chain=arbitrum-one&max_grt_per_30_days=4500 -> count 2
+    ``max_grt_per_billion_entities_per_30_days`` ceilings (omit either to skip it).
+    Omitting ``chain`` is a 422. Example: ``?chain=arbitrum-one&max_grt_per_30_days=4500``.
     """
     _require_push_token(authorization)
 
