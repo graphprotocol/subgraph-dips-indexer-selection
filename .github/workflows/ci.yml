@@ -74,11 +74,16 @@ jobs:
           python-version: "3.11"
 
       # The same install the cronjob image's Dockerfile runs. The list of what it installed
-      # lets the next step prove the test tools left every one of those versions alone.
+      # lets the test tools step prove it left every one of those versions alone.
       - name: Install cronjob dependencies
         run: |
           pip install -r cronjobs/compute_scores/requirements.txt
           pip freeze > "$RUNNER_TEMP/cronjob-packages.txt"
+
+      # The test tools add packages the image lacks (pydantic and pyyaml among them), so an
+      # import only they satisfy would pass the tests and then crash the job in its image.
+      - name: Check the cronjob imports only what its requirements install
+        run: python -I .github/scripts/check_cronjob_imports.py cronjobs/compute_scores
 
       # The dev extra brings pytest, and the iisa package that the shared conftest imports.
       - name: Install test tools
