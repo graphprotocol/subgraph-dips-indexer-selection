@@ -43,7 +43,12 @@ from iisa_client import (
     get_scores_status,
     post_scores,
 )
-from subgraph import paginate_subgraph_query, redact_url, retry_subgraph_read
+from subgraph import (
+    SubgraphResponseError,
+    paginate_subgraph_query,
+    redact_url,
+    retry_subgraph_read,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -590,10 +595,6 @@ class RedpandaProvider:
             logger.exception("Failed to fetch stake data from subgraph")
             return pd.DataFrame(columns=["stake_to_fees"])
 
-        if not indexers:
-            logger.warning("Subgraph returned no indexer records")
-            return pd.DataFrame(columns=["stake_to_fees"])
-
         df = pd.DataFrame(indexers)
         df = df.rename(columns={"id": "indexer"})
         df["last_known_slashable_stake"] = df["stakedTokens"].astype(float) - df[
@@ -972,6 +973,9 @@ class RedpandaProvider:
         indexers: List[dict] = paginate_subgraph_query(
             self.graph_network_url, query, entity="indexers"
         )
+        if not indexers:
+            # Retried: the gateway may have served the query from an indexer that is behind.
+            raise SubgraphResponseError("network subgraph returned no indexer records")
         return indexers
 
 
