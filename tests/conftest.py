@@ -6,14 +6,17 @@ See:
 - https://faker.readthedocs.io/en/master/pytest-fixtures.html
 """
 
+import os
 import random
 import string
+from datetime import timedelta
 from typing import Optional
 
 import pytest
 from faker import Faker
 from faker.providers import BaseProvider, geo, internet
 from faker_airtravel import AirTravelProvider
+from hypothesis import HealthCheck, settings
 
 from iisa.indexer_selection import (
     DeploymentId,
@@ -21,6 +24,23 @@ from iisa.indexer_selection import (
     IndexerId,
     IpfsHashStr,
     QueryIdStr,
+)
+
+# Property tests: few enough examples to keep the suite fast, a fixed seed on CI so a failure
+# there repeats, and HYPOTHESIS_PROFILE=thorough for a much deeper search locally.
+settings.register_profile(
+    "fast",
+    max_examples=50,
+    deadline=timedelta(seconds=2),
+    print_blob=True,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+settings.register_profile(
+    "ci", parent=settings.get_profile("fast"), derandomize=True, database=None
+)
+settings.register_profile("thorough", parent=settings.get_profile("fast"), max_examples=2_000)
+settings.load_profile(
+    os.environ.get("HYPOTHESIS_PROFILE", "ci" if os.environ.get("CI") else "fast")
 )
 
 
