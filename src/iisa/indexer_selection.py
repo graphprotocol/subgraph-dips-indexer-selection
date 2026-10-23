@@ -7,7 +7,7 @@ metrics including latency, uptime, success rate, and economic security.
 
 import logging
 from types import MappingProxyType
-from typing import Callable, NewType, Optional, TypedDict, Union, cast
+from typing import Any, Callable, NewType, Optional, TypedDict, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -636,9 +636,9 @@ def _normalize_metrics(
 ) -> pd.DataFrame:
     """Normalise each metric to [0, 1] where 1 is best (lower-is-better inverted).
 
-    price_ceiling, when given, caps pricing normalisation instead of using the
-    observed max, so one outlier price can't compress the rest. Missing metrics
-    normalise to NaN, then to 0.
+    price_ceiling, when given, caps pricing normalisation instead of using the observed
+    max, so one outlier price can't compress the rest. Missing metrics normalise to
+    NaN, then to 0; a value that does not read as a number, such as text, scores 0.
     """
     # (norm column, source column, normaliser), in the order the columns are added.
     metrics: list[tuple[str, str, Callable[[pd.Series], Union[pd.Series, float]]]] = [
@@ -666,7 +666,7 @@ def _normalize_metrics(
         if norm_col in merged.columns:
             continue
         if source_col in merged.columns:
-            merged[norm_col] = normalize(merged[source_col])
+            merged[norm_col] = _normalize_column(merged, source_col, normalize)
         else:
             merged[norm_col] = np.nan
 
@@ -675,6 +675,56 @@ def _normalize_metrics(
     merged[norm_columns] = merged[norm_columns].fillna(0)
 
     return merged
+
+
+def _normalize_column(
+    merged: pd.DataFrame,
+    column: str,
+    normalize: Callable[[pd.Series], Union[pd.Series, float]],
+) -> pd.Series:
+    """Normalise one metric column after reading it as numbers; unreadable values score 0."""
+    numbers, unreadable = _read_metric(merged, column)
+    scores = normalize(numbers)
+    if not isinstance(scores, pd.Series):
+        scores = pd.Series(scores, index=merged.index)
+    return scores.mask(unreadable, 0.0)
+
+
+def _read_metric(merged: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
+    """Return (numbers, unreadable) for a metric column read as floats.
+
+    None and NaN stay NaN, as missing. Any other value that does not read as a
+    number, such as text, also becomes NaN and is flagged in ``unreadable``.
+    """
+    values = merged[column]
+    if pd.api.types.is_numeric_dtype(values):
+        return values.astype(float), pd.Series(False, index=values.index)
+    numbers = values.map(_float_or_nan).astype(float)
+    unreadable = values.notna() & numbers.isna()
+    if unreadable.any():
+        _warn_scored_as_zero(merged, column, unreadable, "do not read as numbers")
+    return numbers, unreadable
+
+
+def _float_or_nan(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float("nan")
+
+
+def _warn_scored_as_zero(merged: pd.DataFrame, column: str, rows: pd.Series, why: str) -> None:
+    """Log the indexers whose ``column`` value scores 0 because of ``why``."""
+    indexers = merged.loc[rows, "indexer"].tolist() if "indexer" in merged.columns else []
+    examples = merged.loc[rows, column].head(3).tolist()
+    logger.warning(
+        "scoring %d %r value(s) as 0 because they %s: indexers=%.300s examples=%.200r",
+        int(rows.sum()),
+        column,
+        why,
+        indexers,
+        examples,
+    )
 
 
 def _normalize_latency(latency: pd.Series) -> pd.Series:

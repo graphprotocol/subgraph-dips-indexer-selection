@@ -430,6 +430,10 @@ def metric_tables(draw: st.DrawFn) -> pd.DataFrame:
 
 
 @given(table=metric_tables())
+# Text, or a column holding only None, raised inside normalisation, so selection scored
+# every indexer on whichever metrics were done before the error.
+@example(table=pd.DataFrame({"indexer": INDEXER_IDS[:2], "stake_to_fees": [0.0, "abc"]}))
+@example(table=pd.DataFrame({"indexer": INDEXER_IDS[:1], "average_status": [None]}))
 def test_normalised_metrics_are_finite_and_within_unit_range(table):
     normalized = _normalize_metrics(table.copy())
     assert len(normalized) == len(table)
@@ -544,6 +548,7 @@ def _select(case: SelectionCase) -> tuple[list[str], Optional[IndexerSelector]]:
 
 
 EXAMPLE_PRICE = 100.0
+FIRST, SECOND = INDEXER_IDS[:2]
 
 
 def _example_row(indexer: str, org: str, **overrides: Any) -> dict[str, Any]:
@@ -589,6 +594,7 @@ def _assert_selection_scores(selector: Optional[IndexerSelector]) -> None:
 
 
 @given(case=selection_cases())
+@example(case=_example_case([_example_row(FIRST, "org-a", stake_to_fees=None)], num_candidates=1))
 def test_selection_respects_size_blocklist_and_price_rules(case):
     request = case.request
     selected, selector = _select(case)
@@ -605,9 +611,6 @@ def test_selection_respects_size_blocklist_and_price_rules(case):
 
 # Properties that do not hold yet: each needs a decision, so each is a strict xfail with a
 # hand-written example that fails today. Remove the xfail once the behaviour is settled.
-FIRST, SECOND = INDEXER_IDS[:2]
-
-
 @pytest.mark.xfail(
     strict=True,
     reason="A group already bigger than num_candidates is trimmed only while it keeps 2 orgs "
