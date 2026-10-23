@@ -102,7 +102,8 @@ class SelectionRequest(BaseModel):
     """
     Request body for indexer selection endpoint.
 
-    Matches the SelectionRequest struct in the Rust HTTP client.
+    Follows the SelectionRequest struct in dipper's Rust HTTP client, which types chain_id
+    as optional. Dipper's reassess job always sets it, and a request without one is a 422.
     """
 
     deployment_id: str
