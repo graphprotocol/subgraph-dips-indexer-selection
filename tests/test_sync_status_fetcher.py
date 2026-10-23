@@ -233,13 +233,16 @@ class TestRunFetchCycle:
 
         assert result is False
 
-    def test_skips_the_cycle_when_indexer_urls_cannot_be_read(self, caplog):
-        with patch(
-            "sync_status_fetcher.discover_indexers_from_network_subgraph",
-            side_effect=ValueError("GRAPH_NETWORK_SUBGRAPH_URL is not set"),
+    def test_raises_when_indexer_urls_cannot_be_read(self):
+        """The main loop logs the error with its traceback and skips the cycle."""
+        with (
+            patch(
+                "sync_status_fetcher.discover_indexers_from_network_subgraph",
+                side_effect=ValueError("GRAPH_NETWORK_SUBGRAPH_URL is not set"),
+            ),
+            patch("sync_status_fetcher._push_sync_status") as mock_push,
         ):
-            with caplog.at_level("WARNING", logger="sync_status_fetcher"):
-                result = run_fetch_cycle()
+            with pytest.raises(ValueError):
+                run_fetch_cycle()
 
-        assert result is False
-        assert "skipping cycle" in caplog.text
+        mock_push.assert_not_called()

@@ -153,11 +153,8 @@ def run_fetch_cycle() -> bool:
     """Run one fetch cycle. Returns True on success."""
     global _last_write_time
 
-    try:
-        indexer_urls = discover_indexers_from_network_subgraph(GRAPH_NETWORK_SUBGRAPH_URL)
-    except Exception as e:
-        logger.warning("Could not read indexer URLs, skipping cycle: %s", e)
-        return False
+    # A failed read raises; the main loop logs it with its traceback and skips the cycle.
+    indexer_urls = discover_indexers_from_network_subgraph(GRAPH_NETWORK_SUBGRAPH_URL)
 
     logger.info("Fetching /status from %d indexers...", len(indexer_urls))
     data = asyncio.run(_fetch_all_statuses(indexer_urls))
