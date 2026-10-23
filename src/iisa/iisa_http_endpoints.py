@@ -19,12 +19,13 @@ import hmac
 import json
 import logging
 import math
+import numbers
 import os
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache, partial
-from typing import Any, Optional, cast
+from typing import Any, NamedTuple, Optional, cast
 
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -1006,6 +1007,38 @@ def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[floa
     return price
 
 
+_ENTITY_PRICE_COLUMN = "dips_min_grt_per_billion_entities_per_30_days"
+
+
+class _EntityPrice(NamedTuple):
+    """An indexer's per-entity price, read the same way by every step that uses it.
+
+    ``price`` is None when the indexer set none, meaning it accepts any per-entity price, and
+    when ``invalid``: a value is set but is not a finite number >= 0.
+    """
+
+    price: Optional[float]
+    invalid: bool = False
+
+
+_INVALID_ENTITY_PRICE = _EntityPrice(None, invalid=True)
+
+
+def _parse_entity_price(value: Any) -> _EntityPrice:
+    """Read one indexer's per-entity price. None or NaN is missing; anything else must be a
+    finite number >= 0, sent as a number or as text, or it is invalid.
+    """
+    if pd.api.types.is_scalar(value) and pd.isna(value):
+        return _EntityPrice(None)
+    if isinstance(value, bool) or not isinstance(value, (numbers.Real, str)):
+        return _INVALID_ENTITY_PRICE
+    try:
+        price = float(value)
+    except (ValueError, OverflowError):
+        return _INVALID_ENTITY_PRICE
+    return _EntityPrice(price) if math.isfinite(price) and price >= 0 else _INVALID_ENTITY_PRICE
+
+
 def _keep_with_dips_info(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     """Price filter step: keep indexers that answered their DIP info probe."""
     initial_count = len(df)
@@ -1079,17 +1112,21 @@ def _keep_within_entity_budget(
 ) -> tuple[pd.DataFrame, str]:
     """Price filter step: keep indexers whose per-entity price is at or below the ceiling.
 
-    An indexer with no per-entity price passes, since it is scored and offered as 0. A
-    price that is present but not a number fails, since it sets no usable floor.
+    An indexer with no per-entity price passes, since it is scored and offered as 0. An
+    invalid price fails, since it sets no usable floor.
     """
-    column = "dips_min_grt_per_billion_entities_per_30_days"
-    if max_grt_per_billion_entities_per_30_days is None or column not in df.columns:
+    if max_grt_per_billion_entities_per_30_days is None or _ENTITY_PRICE_COLUMN not in df.columns:
         return df, ""
     ceiling = max_grt_per_billion_entities_per_30_days
 
-    prices = pd.to_numeric(df[column], errors="coerce")
+    def within_budget(value: Any) -> bool:
+        entity_price = _parse_entity_price(value)
+        if entity_price.invalid:
+            return False
+        return entity_price.price is None or entity_price.price <= ceiling
+
     pre_filter = len(df)
-    df = df[df[column].isna() | (prices <= ceiling)]
+    df = df[df[_ENTITY_PRICE_COLUMN].apply(within_budget)]
     logger.debug(
         "price filter: %d/%d indexers within budget of %s GRT per billion entities/30d",
         len(df),
@@ -1168,10 +1205,17 @@ def _enrich_with_chain_prices(
 
     df["base_price_per_epoch"] = df["dips_min_grt_per_30_days"].apply(extract_price)
 
-    if "dips_min_grt_per_billion_entities_per_30_days" in df.columns:
-        df["price_per_entity"] = pd.to_numeric(
-            df["dips_min_grt_per_billion_entities_per_30_days"], errors="coerce"
-        ).fillna(0.0)
+    def entity_price_for_scoring(value: Any) -> float:
+        # A missing price scores as 0. An invalid one scores as NaN, which ranks worst.
+        entity_price = _parse_entity_price(value)
+        if entity_price.invalid:
+            return math.nan
+        return 0.0 if entity_price.price is None else entity_price.price
+
+    if _ENTITY_PRICE_COLUMN in df.columns:
+        df["price_per_entity"] = (
+            df[_ENTITY_PRICE_COLUMN].map(entity_price_for_scoring).astype(float)
+        )
     else:
         df["price_per_entity"] = 0.0
 
@@ -1184,7 +1228,8 @@ def _indexer_prices(
     """Return (min_grt_per_30_days for the chain, min_grt_per_billion_entities_per_30_days)
     from the indexer's first row in ``history``.
 
-    Both are None without a chain_id or a row; either is None when its column is missing.
+    Both are None without a chain_id or a row; either is None when its column is missing. The
+    per-entity price is also None when the indexer set none or set an invalid one.
     """
     rows = history[history["indexer"] == idx_id]
     if rows.empty or chain_id is None:
@@ -1196,12 +1241,8 @@ def _indexer_prices(
         min_grt = _extract_chain_price(row["dips_min_grt_per_30_days"], chain_id)
 
     min_entity = None
-    if "dips_min_grt_per_billion_entities_per_30_days" in row.index:
-        val = row["dips_min_grt_per_billion_entities_per_30_days"]
-        try:
-            min_entity = float(val) if val is not None and pd.notna(val) else None
-        except (TypeError, ValueError):
-            min_entity = None
+    if _ENTITY_PRICE_COLUMN in row.index:
+        min_entity = _parse_entity_price(row[_ENTITY_PRICE_COLUMN]).price
 
     return min_grt, min_entity
 
