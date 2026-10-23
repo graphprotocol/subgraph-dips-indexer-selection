@@ -3,17 +3,19 @@
 Schemathesis reads the schema FastAPI publishes, generates requests that fit it and requests
 that break it, and sends them to the app in process. A test fails on any 5xx response and on
 any answer the schema does not list. Each request meets freshly seeded scores and sync status,
-and carries the push token, or in the last test any bearer token, so the endpoints do real work.
+and carries the push token, or in one test any bearer token, so the endpoints do real work.
+Since each request starts afresh, a last test pushes unusual scores and then reads them back.
 """
 
 import copy
 import json
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 import schemathesis
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from schemathesis.checks import CheckFunction
 from schemathesis.specs.openapi.checks import (
@@ -123,11 +125,9 @@ def _seed_state() -> None:
 
 
 @pytest.fixture(scope="module")
-def api_schema(tmp_path_factory: pytest.TempPathFactory) -> Iterator[schemathesis.BaseSchema]:
-    """The app's OpenAPI schema, loaded in process with the push token and cache paths set.
-
-    Loading it starts the app's startup code once for the whole process, so this runs it with
-    the cache files in a temporary folder, then puts the app's state back afterwards.
+def app_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """The push token and cache paths the app reads, set for the whole module, with the cache
+    files in a temporary folder. Puts the app's state back afterwards.
     """
     cache_dir = tmp_path_factory.mktemp("iisa-cache")
     with pytest.MonkeyPatch.context() as mp:
@@ -137,10 +137,18 @@ def api_schema(tmp_path_factory: pytest.TempPathFactory) -> Iterator[schemathesi
         mp.setattr(score_loader, "SCORES_FILE_PATH", str(cache_dir / "indexer_scores.json"))
         iisa_http_endpoints.get_settings.cache_clear()
         try:
-            yield schemathesis.openapi.from_asgi("/openapi.json", iisa_http_endpoints.app)
+            yield
         finally:
             iisa_http_endpoints._state = IISAState()
             iisa_http_endpoints.get_settings.cache_clear()
+
+
+@pytest.fixture(scope="module")
+def api_schema(app_settings: None) -> schemathesis.BaseSchema:
+    """The app's OpenAPI schema, loaded in process. Loading it starts the app's startup code
+    once for the whole process, so it runs with the settings above.
+    """
+    return schemathesis.openapi.from_asgi("/openapi.json", iisa_http_endpoints.app)
 
 
 @pytest.fixture(scope="module")
@@ -260,3 +268,75 @@ def test_any_bearer_token_gets_an_answer_the_schema_lists(case: schemathesis.Cas
         case.headers = {**case.headers, "authorization": f"Bearer {header}"}
     response = case.call()
     case.validate_response(response, excluded_checks=_known_gaps(case, response))
+
+
+# Values the score job never sends. Each case puts one in a column of the first record, or
+# takes the column out of every record, and pushes the result.
+UNUSUAL_VALUES = [None, 5, "x", [1], {"a": 1}]
+ABSENT = "absent"
+# The reads that use pushed scores, sent once a push is accepted.
+SCORE_READS: list[tuple[str, str, Optional[dict[str, Any]]]] = [
+    (
+        "POST",
+        "/select-indexers",
+        {
+            "deployment_id": DEPLOYMENT,
+            "num_candidates": 3,
+            "chain_id": CHAIN,
+            "existing_indexers": [SCORE_RECORDS[0]["indexer"]],
+            "max_grt_per_30_days": 5_000.0,
+            "max_grt_per_billion_entities_per_30_days": 1_000.0,
+            "optimistic_dips_fees": {SCORE_RECORDS[1]["indexer"]: 50.0},
+        },
+    ),
+    ("POST", "/get-score", {"indexer_id": SCORE_RECORDS[0]["indexer"]}),
+    ("GET", "/scores", None),
+    ("GET", "/scores/weighted", None),
+    ("GET", f"/dips-indexers?chain={CHAIN}", None),
+]
+# With DIPs fees in the request, selection recomputes stake to fees from stake and query fees,
+# and text, a list or an object in either answers 500. How to score an unreadable stake needs
+# a decision (see test_selection_survives_unreadable_stake_or_query_fees), so these are xfail.
+UNREADABLE_FEES_OR_STAKE = pytest.mark.xfail(
+    strict=True, raises=AssertionError, reason="unreadable stake or query fees need a decision"
+)
+
+
+def _unusual_push_cases() -> Iterator[Any]:
+    for column in SCORE_RECORDS[0]:
+        yield pytest.param(column, ABSENT, id=f"{column}-absent")
+        for value in UNUSUAL_VALUES:
+            known_gap = column in ("total_query_fees", "last_known_slashable_stake") and (
+                isinstance(value, (str, list, dict))
+            )
+            marks = [UNREADABLE_FEES_OR_STAKE] if known_gap else []
+            yield pytest.param(column, value, id=f"{column}-{value!r}", marks=marks)
+
+
+@pytest.fixture(scope="module")
+def client(app_settings: None) -> Iterator[TestClient]:
+    """A client kept open for the module, which runs the app's startup code once and saves
+    starting a thread for every request.
+    """
+    with TestClient(iisa_http_endpoints.app, raise_server_exceptions=False) as client:
+        yield client
+
+
+@pytest.mark.parametrize(("column", "value"), _unusual_push_cases())
+def test_every_accepted_push_can_be_served(client: TestClient, column: str, value: Any) -> None:
+    """A push holding a value the score job never sends is refused with a 422 or accepted,
+    and once accepted, every read of the scores answers without a 5xx.
+    """
+    _seed_state()
+    records = copy.deepcopy(SCORE_RECORDS)
+    for record in records if value == ABSENT else []:
+        del record[column]
+    if value != ABSENT:
+        records[0][column] = value
+
+    push = client.post("/scores", json=records, headers=AUTH_HEADERS)
+
+    assert push.status_code in (200, 422), push.text
+    for method, path, body in SCORE_READS if push.status_code == 200 else []:
+        response = client.request(method, path, json=body, headers=AUTH_HEADERS)
+        assert response.status_code < 500, f"{method} {path}: {response.text}"
