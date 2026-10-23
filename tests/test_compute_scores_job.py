@@ -1633,7 +1633,6 @@ class TestComputeAllScoresGeoipDemotion:
                 "last_known_slashable_stake": [100.0, 200.0, 300.0],
             }
         )
-        mock_provider.graph_network_url = "http://graph-network:8000"
 
         def fake_resolve_geoip(_combined_queries):
             # Simulate the local-network case: every URL resolves to a
@@ -1701,7 +1700,6 @@ class TestComputeAllScoresGeoipDemotion:
                 "last_known_slashable_stake": [100.0, 200.0, 300.0],
             }
         )
-        mock_provider.graph_network_url = "http://graph-network:8000"
 
         def fake_resolve_geoip(_combined_queries):
             # One public resolution → full mode must stay engaged.
@@ -1769,7 +1767,6 @@ class TestComputeAllScoresGeoipDemotion:
                 "last_known_slashable_stake": [100.0, 200.0, 300.0],
             }
         )
-        mock_provider.graph_network_url = "http://graph-network:8000"
 
         def fail_if_called(*_args, **_kwargs):
             raise AssertionError("GeoIP resolution must not run in partial mode")
@@ -1865,7 +1862,7 @@ class TestRunScoringModeReporting:
         monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
         monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
         monkeypatch.setattr(main, "compute_all_scores", raise_pipeline_error)
-        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: degraded_df)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda urls: degraded_df)
 
         with caplog.at_level("INFO", logger=main.logger.name):
             result = main.run_scoring()
@@ -1884,7 +1881,7 @@ class TestRunScoringModeReporting:
         monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
         monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
         monkeypatch.setattr(main, "compute_all_scores", lambda **kwargs: pd.DataFrame())
-        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: None)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda urls: None)
 
         with caplog.at_level("INFO", logger=main.logger.name):
             result = main.run_scoring()
@@ -1903,7 +1900,7 @@ class TestRunScoringModeReporting:
         monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
         monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
         monkeypatch.setattr(main, "compute_all_scores", lambda **kwargs: None)
-        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: degraded_df)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda urls: degraded_df)
 
         with caplog.at_level("INFO", logger=main.logger.name):
             result = main.run_scoring()
