@@ -116,8 +116,72 @@ def test_degraded_scoring_raises_instead_of_scoring_without_urls(no_retry_wait):
             processing.compute_degraded_scores(SUBGRAPH_URL)
 
 
-def test_job_pushes_nothing_when_indexer_urls_cannot_be_read(monkeypatch, no_retry_wait):
-    """The service keeps its last scores rather than ones where every indexer fails DIPs."""
+def test_full_pipeline_raises_instead_of_scoring_without_urls(monkeypatch, no_retry_wait):
+    indexer_ids = ["0x" + c * 40 for c in "abc"]
+    queries = pd.DataFrame(
+        [
+            {
+                "query_id": f"q-{indexer[2:8]}-{i:03d}-LAX",
+                "deployment_hash": "QmTestDeployment",
+                "fee": 1.0,
+                "timestamp": pd.Timestamp("2026-05-01") + pd.Timedelta(minutes=i),
+                "blocks_behind": 0,
+                "response_time_ms": 100.0,
+                "indexer": indexer,
+                "status": 200,
+                "day_partition": "2026-05-01",
+                "subgraph_network": "arbitrum",
+                "url": f"http://{indexer[2:8]}-svc:7601",
+            }
+            for indexer in indexer_ids
+            for i in range(20)
+        ]
+    )
+    provider = MagicMock()
+    provider.fetch_initial_query_results.return_value = pd.DataFrame(
+        {"deployment_hash": ["QmTestDeployment"] * 3, "indexer": indexer_ids, "num_rows": [20] * 3}
+    )
+    provider.fetch_combined_query_results.return_value = queries
+    provider.fetch_stake_to_fees.return_value = pd.DataFrame(
+        {
+            "indexer": indexer_ids,
+            "stake_to_fees": [1.0, 2.0, 3.0],
+            "total_query_fees": [10.0, 20.0, 30.0],
+            "last_known_slashable_stake": [100.0, 200.0, 300.0],
+        }
+    )
+    provider.graph_network_url = SUBGRAPH_URL
+    geoip = pd.DataFrame(
+        {
+            "indexer": indexer_ids,
+            "url": [f"http://{i[2:8]}-svc:7601" for i in indexer_ids],
+            "ip_addr": ["172.18.0.5", "172.18.0.6", "172.18.0.7"],
+            "org": [None] * 3,
+            "dst_country": [None] * 3,
+            "dst_lat": [float("nan")] * 3,
+            "dst_lon": [float("nan")] * 3,
+            "indexer_network": ["arbitrum"] * 3,
+        }
+    )
+    monkeypatch.setattr(processing, "resolve_indexer_geoip", lambda _queries: geoip)
+
+    with patch("subgraph.requests.post", side_effect=requests.ConnectionError("refused")):
+        with pytest.raises(requests.ConnectionError):
+            processing.compute_all_scores(
+                provider=provider,
+                start_date=pd.Timestamp("2026-05-01").date(),
+                num_days=28,
+                target_rows=20_000_000,
+                geoip_available=True,
+            )
+
+
+def test_job_pushes_nothing_while_the_subgraph_stays_down(monkeypatch, no_retry_wait):
+    """The service keeps its last scores rather than ones where every indexer fails DIPs.
+
+    The degraded fallback reads the subgraph again; if it has recovered by then, the job
+    pushes degraded scores, which carry real URLs and DIPs results.
+    """
     mock_provider = MagicMock()
 
     def full_pipeline(**_kwargs):
