@@ -233,11 +233,13 @@ class TestRunFetchCycle:
 
         assert result is False
 
-    def test_skips_when_no_indexers(self):
+    def test_skips_the_cycle_when_indexer_urls_cannot_be_read(self, caplog):
         with patch(
             "sync_status_fetcher.discover_indexers_from_network_subgraph",
-            return_value={},
+            side_effect=ValueError("GRAPH_NETWORK_SUBGRAPH_URL is not set"),
         ):
-            result = run_fetch_cycle()
+            with caplog.at_level("WARNING", logger="sync_status_fetcher"):
+                result = run_fetch_cycle()
 
         assert result is False
+        assert "skipping cycle" in caplog.text

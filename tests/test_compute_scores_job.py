@@ -1546,8 +1546,70 @@ class TestValidateConfigurationIISAURL:
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
         monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
         monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x")
 
         # Act / Assert — should not raise
+        main.validate_configuration()
+
+
+class TestValidateConfigurationSubgraphURL:
+    """validate_configuration() must refuse to run without a usable network subgraph URL.
+
+    Without one every indexer fails its DIPs probe, so selection would pick no one and
+    dipper would cancel every agreement.
+    """
+
+    FAKE_KEY = "0123456789abcdef0123456789abcdef"
+
+    def _satisfy_the_rest(self, monkeypatch):
+        monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
+        monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            ("", "GRAPH_NETWORK_SUBGRAPH_URL is required"),
+            ("graph-node:8000/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("ftp://graph-node/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("https://", "must be an http(s) URL"),
+        ],
+        ids=["empty", "no_scheme", "wrong_scheme", "no_host"],
+    )
+    def test_unusable_url_raises_configuration_error(self, monkeypatch, caplog, url, expected):
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
+
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError):
+                main.validate_configuration()
+
+        assert expected in caplog.text
+
+    def test_error_hides_the_api_key(self, monkeypatch, caplog):
+        self._satisfy_the_rest(monkeypatch)
+        keyed = f"htps://gateway.thegraph.com/api/{self.FAKE_KEY}/subgraphs/id/QmNetwork"
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", keyed)
+
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError):
+                main.validate_configuration()
+
+        assert "<redacted>" in caplog.text
+        assert self.FAKE_KEY not in caplog.text
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://gateway.thegraph.com/api/key/subgraphs/id/QmNetwork",
+            "http://graph-node:8000/subgraphs/name/graph-network",
+        ],
+        ids=["gateway", "local_graph_node"],
+    )
+    def test_usable_url_passes(self, monkeypatch, url):
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
+
         main.validate_configuration()
 
 

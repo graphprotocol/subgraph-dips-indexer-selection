@@ -13,6 +13,7 @@ import sys
 import time
 from datetime import date, timedelta
 from typing import Dict, Optional
+from urllib.parse import urlparse
 
 import pandas as pd
 from iisa_client import IISAPushError, get_push_token
@@ -23,6 +24,7 @@ from processing import (
     validate_geoip_databases,
 )
 from redpanda import RedpandaProvider
+from subgraph import redact_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +73,17 @@ def validate_configuration() -> None:
 
     if not IISA_API_URL:
         errors.append("IISA_API_URL is required")
+
+    # Without indexer URLs every indexer fails its DIPs probe, selection picks no one and
+    # dipper cancels every agreement, so refuse to start rather than score without them.
+    subgraph_url = urlparse(GRAPH_NETWORK_SUBGRAPH_URL)
+    if not GRAPH_NETWORK_SUBGRAPH_URL:
+        errors.append("GRAPH_NETWORK_SUBGRAPH_URL is required")
+    elif subgraph_url.scheme not in ("http", "https") or not subgraph_url.netloc:
+        errors.append(
+            "GRAPH_NETWORK_SUBGRAPH_URL must be an http(s) URL with a host, got "
+            f"{redact_url(GRAPH_NETWORK_SUBGRAPH_URL)}"
+        )
 
     if errors:
         for error in errors:

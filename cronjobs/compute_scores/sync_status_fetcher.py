@@ -153,9 +153,10 @@ def run_fetch_cycle() -> bool:
     """Run one fetch cycle. Returns True on success."""
     global _last_write_time
 
-    indexer_urls = discover_indexers_from_network_subgraph(GRAPH_NETWORK_SUBGRAPH_URL)
-    if not indexer_urls:
-        logger.warning("No indexers discovered, skipping cycle")
+    try:
+        indexer_urls = discover_indexers_from_network_subgraph(GRAPH_NETWORK_SUBGRAPH_URL)
+    except Exception as e:
+        logger.warning("Could not read indexer URLs, skipping cycle: %s", e)
         return False
 
     logger.info("Fetching /status from %d indexers...", len(indexer_urls))
