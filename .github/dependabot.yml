@@ -15,9 +15,11 @@ updates:
     schedule:
       interval: weekly
     versioning-strategy: increase
+    # Majors stay out of the group, so 1 breaking release can't hold up the rest.
     groups:
       service-python:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # The cronjob image installs from its own requirements.txt. Each merged bump rebuilds
   # the image, which then needs a manual kubectl apply (see CLAUDE.md).
@@ -29,6 +31,7 @@ updates:
     groups:
       cronjob-python:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: docker
     directories:
