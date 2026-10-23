@@ -253,6 +253,9 @@ def _assert_unit_interval(values: Any, *, allow_nan: bool = False) -> None:
 
 
 @given(cell_and_price=chain_price_cells())
+# Valid JSON that is not an object raised AttributeError, failing selection with a 500.
+@example(cell_and_price=("null", None))
+@example(cell_and_price=("[1, 2]", None))
 def test_chain_price_reads_as_a_usable_number_or_none(cell_and_price):
     cell, expected = cell_and_price
     price = _extract_chain_price(cell, CHAIN)

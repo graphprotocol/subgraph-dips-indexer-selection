@@ -1003,6 +1003,8 @@ def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[floa
     """
     try:
         prices = json.loads(dips_min_grt_json) if isinstance(dips_min_grt_json, str) else {}
+        if not isinstance(prices, dict):
+            raise TypeError(f"price map is a JSON {type(prices).__name__}, not an object")
         val = prices.get(chain_id)
         if val is None:
             return None
