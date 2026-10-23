@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import aiohttp
+import pandas as pd
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -190,7 +191,7 @@ def test_invalid_base_price_leaves_chain_unpriced(bad_price, caplog):
         record = _fetch_record(body)
 
     assert record["dips_info_available"] is True
-    assert json.loads(record["dips_min_grt_per_30_days"]) == {"mainnet": "45"}
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"mainnet": 45.0}
     assert json.loads(record["dips_supported_networks"]) == ["arbitrum-one", "mainnet"]
     warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
     assert "0xindexer" in warning and "arbitrum-one" in warning and repr(bad_price) in warning
@@ -213,7 +214,7 @@ def test_finite_non_negative_base_price_is_kept(good_price, caplog):
     with caplog.at_level(logging.WARNING, logger="processing"):
         record = _fetch_record(body)
 
-    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": good_price}
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": float(good_price)}
     assert json.loads(record["dips_supported_networks"]) == ["arbitrum-one"]
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -242,7 +243,7 @@ def test_invalid_per_entity_price_makes_dips_info_unusable(bad_price, caplog):
 
 
 @pytest.mark.parametrize(
-    ("entity_price", "stored"), [(None, None), ("0", "0"), (200, "200"), ("2.5", "2.5")]
+    ("entity_price", "stored"), [(None, None), ("0", "0.0"), (200, "200.0"), ("2.5", "2.5")]
 )
 def test_missing_or_valid_per_entity_price_keeps_dips_info(entity_price, stored):
     body = {
@@ -254,7 +255,38 @@ def test_missing_or_valid_per_entity_price_keeps_dips_info(entity_price, stored)
 
     assert record["dips_info_available"] is True
     assert record["dips_min_grt_per_billion_entities_per_30_days"] == stored
-    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": "450"}
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": 450.0}
+
+
+# float() reads text such as "1_000_000" or non-ASCII digits that pandas.to_numeric, which the
+# selection service scores per-entity prices with, reads as no number. Storing the raw text let
+# an indexer be scored as free while dipper was offered its real price.
+PRICES_ONLY_FLOAT_READS = [
+    pytest.param("1_000_000", 1_000_000.0, id="underscores"),
+    pytest.param("\u0661\u0662\u0663", 123.0, id="arabic-indic-digits"),
+    pytest.param("\u00a0450\u00a0", 450.0, id="non-breaking-spaces"),
+]
+
+
+@pytest.mark.parametrize(("raw", "number"), PRICES_ONLY_FLOAT_READS)
+def test_per_entity_price_is_stored_as_the_number_the_service_reads(raw, number):
+    body = {
+        "min_grt_per_30_days": {"arbitrum-one": "450"},
+        "min_grt_per_billion_entities_per_30_days": raw,
+    }
+
+    stored = _fetch_record(body)["dips_min_grt_per_billion_entities_per_30_days"]
+
+    as_scored = pd.to_numeric(pd.Series([stored], dtype=object), errors="coerce")
+    assert as_scored.tolist() == [number]
+    assert float(stored) == number
+
+
+@pytest.mark.parametrize(("raw", "number"), PRICES_ONLY_FLOAT_READS)
+def test_base_price_is_stored_as_a_number(raw, number):
+    record = _fetch_record({"min_grt_per_30_days": {"arbitrum-one": raw}})
+
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": number}
 
 
 # --- Surviving a /dips/info body that is not a JSON object ----------------------------------
@@ -317,4 +349,4 @@ def test_json_object_from_server_is_read():
     )
 
     assert record["dips_info_available"] is True
-    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": "450"}
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": 450.0}

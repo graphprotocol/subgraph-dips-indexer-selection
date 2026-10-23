@@ -252,30 +252,32 @@ def _extract_dips_prices(data: dict) -> tuple:
     return min_prices, min_entity_price
 
 
-def _is_valid_price(value: object) -> bool:
-    """True when an advertised price is a finite number >= 0, sent as a JSON number or as text.
+def _parse_price(value: object) -> Optional[float]:
+    """An advertised price (JSON number or text) as a float if finite and >= 0, else None.
 
-    Any indexer can serve arbitrary JSON from /dips/info. A price of NaN was scored as the
-    cheapest and a negative one passed every price ceiling, so both won selection.
+    Any indexer can serve arbitrary JSON from /dips/info: NaN was scored as the cheapest price
+    and a negative one passed every ceiling. Store the float, not the raw value: float() reads
+    text like "1_000" that the selection service's per-entity parser reads as no price.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        return False
+        return None
     try:
         price = float(value)
     except (ValueError, OverflowError):
-        return False
-    return math.isfinite(price) and price >= 0
+        return None
+    return price if math.isfinite(price) and price >= 0 else None
 
 
 def _valid_chain_prices(indexer: str, min_prices: dict) -> dict:
-    """Drop each per-chain base price that is not a valid price, logging what was dropped.
+    """Keep each per-chain base price as a float, dropping and logging any that is not valid.
 
     The selection service treats a chain with no price as unpriced and excludes the indexer there.
     """
     valid = {}
     for chain, price in min_prices.items():
-        if _is_valid_price(price):
-            valid[chain] = price
+        parsed = _parse_price(price)
+        if parsed is not None:
+            valid[chain] = parsed
         else:
             logger.warning(
                 "Ignoring invalid DIPs base price from indexer %s for chain %s: %r",
@@ -307,7 +309,8 @@ def _dips_info_record(indexer: str, data: object) -> dict:
         )
         return _unavailable_dips_info(indexer)
     min_prices, min_entity_price = _extract_dips_prices(data)
-    if min_entity_price is not None and not _is_valid_price(min_entity_price):
+    entity_price = None if min_entity_price is None else _parse_price(min_entity_price)
+    if min_entity_price is not None and entity_price is None:
         # A missing per-entity price means the indexer accepts any price: it passes every ceiling
         # and is offered 0. Dropping only the bad value would reward it, so the whole response is
         # treated as unusable instead.
@@ -327,9 +330,9 @@ def _dips_info_record(indexer: str, data: object) -> dict:
         "indexer": indexer,
         "dips_info_available": True,
         "dips_min_grt_per_30_days": json.dumps(chain_prices),
-        "dips_min_grt_per_billion_entities_per_30_days": str(min_entity_price)
-        if min_entity_price is not None
-        else None,
+        "dips_min_grt_per_billion_entities_per_30_days": None
+        if entity_price is None
+        else str(entity_price),
         "dips_supported_networks": json.dumps(supported_networks),
     }
 
