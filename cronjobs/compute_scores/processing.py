@@ -899,6 +899,7 @@ def _attach_dips_info(merged: pd.DataFrame, indexer_urls: Dict[str, str]) -> pd.
 
 def compute_all_scores(
     provider,
+    indexer_urls: Dict[str, str],
     start_date: date,
     num_days: int,
     target_rows: int,
@@ -909,6 +910,7 @@ def compute_all_scores(
 
     Full (geoip_available=True): GeoIP + latency regression + uptime + success + stake.
     Partial: latency neutral (0.5), other metrics from real Redpanda data.
+    indexer_urls is the network subgraph's {address: url}, probed for DIP pricing.
     """
     # Fetch initial query results to determine sampling
     initial_query_results = provider.fetch_initial_query_results(start_date, num_days)
@@ -958,10 +960,7 @@ def compute_all_scores(
         drop_missing_latency=geoip_available,
     )
 
-    # DIP pricing fetched directly from indexers; the indexer list comes from
-    # the network subgraph (Redpanda only has indexers the gateway has queried,
-    # so newly registered ones would be invisible without this lookup).
-    indexer_urls = discover_indexers_from_network_subgraph(provider.graph_network_url)
+    # DIP pricing fetched directly from indexers
     merged = _attach_dips_info(merged, indexer_urls)
 
     # Attach graph-node versions and drop indexers below the configured
@@ -1685,16 +1684,12 @@ def merge_and_prepare_dataframes(
     return merged
 
 
-def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
+def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     """Equal quality metrics for every indexer, real per-indexer pricing from /dips/info.
 
-    Last-resort fallback when the full pipeline can't run. Indexer list comes
-    from the network subgraph; per-indexer pricing from /dips/info.
+    Last-resort fallback when the full pipeline can't run. indexer_urls is the network
+    subgraph's {address: url}; per-indexer pricing comes from /dips/info.
     """
-    indexer_urls = discover_indexers_from_network_subgraph(graph_network_subgraph_url)
-    if not indexer_urls:
-        return pd.DataFrame()
-
     dips_info_df = fetch_dips_info(indexer_urls)
     now = datetime.now(timezone.utc)
 
