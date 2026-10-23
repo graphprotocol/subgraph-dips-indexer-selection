@@ -1561,6 +1561,21 @@ class TestDecentralizationBestEffort:
         # Assert - Should still select 3 indexers even though decentralization not met
         assert len(processor.current_group) == 3
 
+    def test_lists_and_objects_count_as_orgs_and_locations(self):
+        """A pushed org or location can be any JSON value. A list or object counts as one
+        value like any other, rather than failing every check that compares them.
+        """
+        processor = _selector_with_scores({"A": 0.9, "B": 0.8, "C": 0.7, "D": 0.6}, [])
+        processor.data["org"] = [["o", 1], {"o": 1}, {"o": 1}, "o"]
+        processor.data["destination_loc"] = [{"l": 1}, ["l"], ["l"], None]
+
+        processor.current_group = ["A"]
+        assert processor._meets_decentralization_requirements("B")
+        processor.current_group = ["B"]
+        assert not processor._meets_decentralization_requirements("C")
+        assert processor._meets_decentralization_requirements_indexer_removal(["A", "D"])
+        assert not processor._meets_decentralization_requirements_indexer_removal(["B", "C"])
+
 
 class TestRowWiseWeightedScoreReference:
     """Pins the reference oracle's semantics, the spec the vectorised version meets."""

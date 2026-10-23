@@ -28,7 +28,7 @@ from functools import lru_cache, partial
 from typing import Annotated, Any, NamedTuple, Optional, cast
 
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -259,6 +259,24 @@ class SyncStatusAcceptedResponse(BaseModel):
     indexers: int
 
 
+class ErrorResponse(BaseModel):
+    """Body of each error answer other than a 422: what went wrong, in words."""
+
+    detail: str
+
+
+_ERROR_RESPONSES: dict[int, dict[str, Any]] = {
+    400: {"model": ErrorResponse, "description": "The body could not be read as text"},
+    401: {"model": ErrorResponse, "description": "The bearer token is missing or wrong"},
+    503: {"model": ErrorResponse, "description": "The service has not started or has no scores"},
+}
+
+
+def _documented_errors(*codes: int) -> dict[int | str, dict[str, Any]]:
+    """OpenAPI entries for the error answers a route gives besides FastAPI's own 422."""
+    return {code: _ERROR_RESPONSES[code] for code in codes}
+
+
 # =============================================================================
 # Service State
 # =============================================================================
@@ -486,9 +504,9 @@ def _supports_chain(networks_json: Any, chain_id: str) -> bool:
 def _require_push_token(authorization: Optional[str]) -> None:
     """Validate the bearer token against IISA_PUSH_TOKEN.
 
-    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). Uses
-    hmac.compare_digest to dodge timing oracles. "Bearer" prefix matched
-    case-insensitively per RFC 6750 §2.1; the token itself is case-sensitive.
+    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). "Bearer" is
+    matched in any letter case per RFC 6750 §2.1, the token exactly. hmac.compare_digest
+    dodges timing oracles; it compares bytes, since it refuses text with non-ASCII letters.
     """
     expected = get_settings().push_token
     if not expected:
@@ -496,7 +514,7 @@ def _require_push_token(authorization: Optional[str]) -> None:
     if not authorization or authorization[:7].lower() != "bearer ":
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
     provided = authorization[7:].strip()
-    if not hmac.compare_digest(provided, expected):
+    if not hmac.compare_digest(provided.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
@@ -636,9 +654,11 @@ async def health_check() -> HealthResponse:
     )
 
 
-@app.post("/scores", response_model=ScoresAcceptedResponse)
+@app.post(
+    "/scores", response_model=ScoresAcceptedResponse, responses=_documented_errors(400, 401, 503)
+)
 def push_scores(
-    payload: list[dict[str, Any]],
+    payload: Annotated[list[dict[str, Any]], Body(min_length=1)],
     authorization: Optional[str] = Header(None),
 ) -> ScoresAcceptedResponse:
     """Accept a pushed scores snapshot from the cronjob.
@@ -649,12 +669,6 @@ def push_scores(
     """
     _require_push_token(authorization)
 
-    if not payload:
-        raise HTTPException(
-            status_code=422,
-            detail="scores payload must be a non-empty list of records",
-        )
-
     if not _state._initialized:
         raise HTTPException(
             status_code=503,
@@ -664,9 +678,9 @@ def push_scores(
     try:
         rows = _state.load_scores_from_records(payload)
     except ScoresPayloadError as e:
-        # Wrong-shape body: the caller's problem, so 422 not 500.
+        # Wrong-shape body: the caller's problem, so a 422 in the error list every 422 carries.
         logger.warning("Rejected pushed scores: %s", e)
-        raise HTTPException(status_code=422, detail=str(e)) from e
+        raise RequestValidationError(e.errors) from e
     except Exception:
         logger.exception("Failed to accept pushed scores")
         raise HTTPException(status_code=500, detail="Failed to accept scores")
@@ -675,7 +689,7 @@ def push_scores(
     return ScoresAcceptedResponse(status="success", rows=rows)
 
 
-@app.get("/scores/status", response_model=ScoresStatusResponse)
+@app.get("/scores/status", response_model=ScoresStatusResponse, responses=_documented_errors(401))
 def scores_status(
     authorization: Optional[str] = Header(None),
 ) -> ScoresStatusResponse:
@@ -697,7 +711,7 @@ def scores_status(
     return ScoresStatusResponse(computed_at=computed_at, rows=rows)
 
 
-@app.get("/scores", response_model=ScoresSnapshotResponse)
+@app.get("/scores", response_model=ScoresSnapshotResponse, responses=_documented_errors(401))
 def scores_snapshot(
     authorization: Optional[str] = Header(None),
 ) -> ScoresSnapshotResponse:
@@ -733,7 +747,9 @@ def scores_snapshot(
     )
 
 
-@app.get("/scores/weighted", response_model=WeightedScoresResponse)
+@app.get(
+    "/scores/weighted", response_model=WeightedScoresResponse, responses=_documented_errors(401)
+)
 def scores_weighted(
     authorization: Optional[str] = Header(None),
 ) -> WeightedScoresResponse:
@@ -811,7 +827,7 @@ def scores_weighted(
     )
 
 
-@app.get("/dips-indexers", response_model=DipsIndexersResponse)
+@app.get("/dips-indexers", response_model=DipsIndexersResponse, responses=_documented_errors(401))
 def dips_indexers(
     chain: str,
     max_grt_per_30_days: Optional[float] = Query(default=None, ge=0, allow_inf_nan=False),
@@ -858,7 +874,11 @@ def dips_indexers(
     )
 
 
-@app.post("/sync-status", response_model=SyncStatusAcceptedResponse)
+@app.post(
+    "/sync-status",
+    response_model=SyncStatusAcceptedResponse,
+    responses=_documented_errors(400, 401, 503),
+)
 def push_sync_status(
     payload: dict[str, Any],
     authorization: Optional[str] = Header(None),
@@ -887,7 +907,7 @@ def push_sync_status(
     return SyncStatusAcceptedResponse(status="success", indexers=indexer_count)
 
 
-@app.post("/get-score", response_model=ScoreResponse)
+@app.post("/get-score", response_model=ScoreResponse, responses=_documented_errors(400, 401, 503))
 async def get_score(
     request: ScoreRequest,
     authorization: Optional[str] = Header(None),
@@ -951,7 +971,9 @@ async def get_score(
     )
 
 
-@app.post("/select-indexers", response_model=SelectionResponse)
+@app.post(
+    "/select-indexers", response_model=SelectionResponse, responses=_documented_errors(400, 503)
+)
 async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     """Select N indexers for a deployment via weighted scoring.
 
