@@ -1240,18 +1240,18 @@ class TestDipsIndexersEndpoint:
         assert capped.status_code == 200
         assert capped.json()["indexers"] == ["0xbbb"]
 
+    @pytest.mark.parametrize(
+        "field", ["max_grt_per_30_days", "max_grt_per_billion_entities_per_30_days"]
+    )
     @pytest.mark.parametrize("ceiling", ["nan", "inf", "-1"])
-    def test_entity_price_ceiling_rejects_unusable_values(self, monkeypatch, ceiling):
+    def test_price_ceilings_reject_unusable_values(self, monkeypatch, field, ceiling):
         """A NaN, infinite or negative ceiling would silently drop every priced indexer."""
         from iisa.iisa_http_endpoints import app
 
         self._seed_snapshot(monkeypatch)
         client = TestClient(app, raise_server_exceptions=False)
 
-        response = client.get(
-            "/dips-indexers",
-            params={"chain": "mainnet", "max_grt_per_billion_entities_per_30_days": ceiling},
-        )
+        response = client.get("/dips-indexers", params={"chain": "mainnet", field: ceiling})
         assert response.status_code == 422
 
     def test_chain_filter_excludes_advertised_but_unpriced_indexer(self, monkeypatch):
@@ -2929,18 +2929,21 @@ class TestSelectIndexersEndToEndPricing:
         assert response.status_code == 200
         assert [i["id"] for i in response.json()["indexers"]] == ["0xcheap"]
 
-    def test_negative_entity_ceiling_is_rejected(self):
-        """A negative ceiling would silently drop every indexer with a per-entity price."""
+    @pytest.mark.parametrize(
+        "field", ["max_grt_per_30_days", "max_grt_per_billion_entities_per_30_days"]
+    )
+    def test_negative_price_ceiling_is_rejected(self, field):
+        """A negative ceiling would silently drop every indexer with a price."""
         from iisa.iisa_http_endpoints import app
 
         client = TestClient(app, raise_server_exceptions=False)
         response = client.post(
             "/select-indexers",
             json={
-                "deployment_id": "QmEntityBudgetTest",
+                "deployment_id": "QmCeilingTest",
                 "chain_id": "arb",
                 "num_candidates": 1,
-                "max_grt_per_billion_entities_per_30_days": -1,
+                field: -1,
             },
         )
         assert response.status_code == 422

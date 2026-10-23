@@ -107,7 +107,9 @@ class SelectionRequest(BaseModel):
     blocklist: Optional[list[str]] = None
     declined_indexers: Optional[dict[str, list[str]]] = None
     chain_id: Optional[str] = None  # e.g., "arbitrum-one"
-    max_grt_per_30_days: Optional[float] = None  # e.g., 4500.0
+    max_grt_per_30_days: Optional[float] = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )  # e.g., 4500.0
     max_grt_per_billion_entities_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
     )  # e.g., 2000.0
@@ -777,7 +779,7 @@ def scores_weighted(
 @app.get("/dips-indexers", response_model=DipsIndexersResponse)
 def dips_indexers(
     chain: str,
-    max_grt_per_30_days: Optional[float] = None,
+    max_grt_per_30_days: Optional[float] = Query(default=None, ge=0, allow_inf_nan=False),
     max_grt_per_billion_entities_per_30_days: Optional[float] = Query(
         default=None, ge=0, allow_inf_nan=False
     ),
