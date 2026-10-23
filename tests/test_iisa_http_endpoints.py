@@ -2025,6 +2025,23 @@ class TestPushSyncStatusEndpoint:
         assert response.status_code == 200
         assert response.json()["indexers"] == 0
 
+    def test_push_sync_status_skips_entries_that_are_not_objects(self, tmp_path):
+        """An entry that is a list or null is skipped rather than failing the push with a 500."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        settings = Settings()
+        settings.sync_status_file_path = str(tmp_path / "sync_status.json")
+        iisa_http_endpoints._state.initialize(settings)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        payload = {**self._sample_payload(), "0xBBB": [], "0xCCC": None}
+        response = client.post("/sync-status", json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "success", "indexers": 1}
+
     def test_push_sync_status_rejects_wrong_token(self, monkeypatch):
         monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
         from iisa import iisa_http_endpoints
