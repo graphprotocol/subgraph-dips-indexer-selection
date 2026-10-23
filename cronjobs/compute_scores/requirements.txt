@@ -14,7 +14,7 @@ geoip2>=5.0,<6.0
 tenacity>=8.2,<10.0
 
 # Airport data (for IATA geolocation)
-airportsdata>=20230101
+airportsdata>=20260905
 
 # Redpanda / Kafka consumer
 confluent-kafka>=2.3,<3.0
