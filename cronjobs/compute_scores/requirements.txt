@@ -20,7 +20,7 @@ airportsdata>=20230101
 confluent-kafka>=2.3,<3.0
 
 # GraphQL HTTP calls for Graph Network subgraph stake data
-requests>=2.33.0,<3.0
+requests>=2.34.2,<3.0
 
 # Protobuf runtime for gateway_queries message parsing
 protobuf>=5.0,<7.0
