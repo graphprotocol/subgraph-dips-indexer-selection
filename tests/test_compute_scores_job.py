@@ -1477,6 +1477,15 @@ import main  # noqa: E402
 from iisa_client import IISAPushError  # noqa: E402
 
 
+@pytest.fixture
+def indexer_urls_read(monkeypatch):
+    """Stand in for the network subgraph read run_scoring makes before any scoring."""
+    monkeypatch.setattr(
+        main, "discover_indexers_from_network_subgraph", lambda _url: {"0xAAA": "https://a.example"}
+    )
+
+
+@pytest.mark.usefixtures("indexer_urls_read")
 class TestRunScoringPushFailure:
     """run_scoring() must return False when IISAPushError escapes write_scores."""
 
@@ -1788,6 +1797,7 @@ class TestComputeAllScoresGeoipDemotion:
         assert (result["dips_info_available"] == False).all()  # noqa: E712
 
 
+@pytest.mark.usefixtures("indexer_urls_read")
 class TestRunScoringModeReporting:
     """The summary log must reflect the published scoring_mode, not the input flag.
 
