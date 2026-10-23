@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import reprlib
 import socket
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -252,6 +253,20 @@ def _extract_dips_prices(data: dict) -> tuple:
     return min_prices, min_entity_price
 
 
+_LOG_REPR = reprlib.Repr()
+_LOG_REPR.maxlevel = 2
+_LOG_REPR.maxstring = _LOG_REPR.maxlong = _LOG_REPR.maxother = 60
+_MAX_LOGGED_CHARS = 200
+
+
+def _for_log(value: object) -> str:
+    """Quote a value an indexer sent for a log line: escaped, so a line break in it cannot start a
+    fake log line, and cut short, so a huge value cannot flood the log on every run.
+    """
+    text = _LOG_REPR.repr(value)
+    return text if len(text) <= _MAX_LOGGED_CHARS else text[:_MAX_LOGGED_CHARS] + "..."
+
+
 def _parse_price(value: object) -> Optional[float]:
     """An advertised price (JSON number or text) as a float if finite and >= 0, else None.
 
@@ -280,10 +295,10 @@ def _valid_chain_prices(indexer: str, min_prices: dict) -> dict:
             valid[chain] = parsed
         else:
             logger.warning(
-                "Ignoring invalid DIPs base price from indexer %s for chain %s: %r",
+                "Ignoring invalid DIPs base price from indexer %s for chain %s: %s",
                 indexer,
-                chain,
-                price,
+                _for_log(chain),
+                _for_log(price),
             )
     return valid
 
@@ -315,9 +330,9 @@ def _dips_info_record(indexer: str, data: object) -> dict:
         # and is offered 0. Dropping only the bad value would reward it, so the whole response is
         # treated as unusable instead.
         logger.warning(
-            "Ignoring DIPs info from indexer %s: invalid per-entity price %r",
+            "Ignoring DIPs info from indexer %s: invalid per-entity price %s",
             indexer,
-            min_entity_price,
+            _for_log(min_entity_price),
         )
         return _unavailable_dips_info(indexer)
 
