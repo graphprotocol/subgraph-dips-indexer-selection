@@ -14,7 +14,10 @@ import logging
 import sys
 from pathlib import Path
 
+import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
@@ -251,4 +254,67 @@ def test_missing_or_valid_per_entity_price_keeps_dips_info(entity_price, stored)
 
     assert record["dips_info_available"] is True
     assert record["dips_min_grt_per_billion_entities_per_30_days"] == stored
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": "450"}
+
+
+# --- Surviving a /dips/info body that is not a JSON object ----------------------------------
+#
+# 1 indexer's bad body used to raise out of the fetch, through asyncio.gather, and fail the DIPs
+# fetch for every indexer, so no scores were pushed while that indexer kept serving it. These
+# tests serve the body from a local aiohttp server so the real response decoding runs.
+
+UNUSABLE_RECORD = {
+    "indexer": "0xindexer",
+    "dips_info_available": False,
+    "dips_min_grt_per_30_days": "{}",
+    "dips_min_grt_per_billion_entities_per_30_days": None,
+    "dips_supported_networks": "[]",
+}
+
+
+def _fetch_record_from_server(raw: bytes, content_type: str):
+    async def handler(request):
+        return web.Response(body=raw, headers={"Content-Type": content_type})
+
+    async def run():
+        app = web.Application()
+        app.router.add_get("/dips/info", handler)
+        async with TestServer(app) as server, aiohttp.ClientSession() as session:
+            return await _fetch_single_dips_info_async(
+                session, "0xindexer", str(server.make_url("/")), asyncio.Semaphore(1)
+            )
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("raw", "content_type"),
+    [
+        pytest.param(b"", "application/json", id="empty"),
+        pytest.param(b"null", "application/json", id="null"),
+        pytest.param(b"[]", "application/json", id="array"),
+        pytest.param(b'"x"', "application/json", id="string"),
+        pytest.param(b"5", "application/json", id="number"),
+        pytest.param(b"<html>bad gateway</html>", "application/json", id="not-json"),
+        pytest.param(b"\xff\xfe", "application/json", id="not-utf8"),
+        pytest.param(b"1" * 5_000, "application/json", id="integer-too-long-to-read"),
+        pytest.param(b"[" * 100_000 + b"]" * 100_000, "application/json", id="nested-too-deep"),
+        pytest.param(b"{}", "application/json; charset=hex", id="charset-not-for-text"),
+    ],
+)
+def test_body_that_is_not_a_json_object_makes_dips_info_unusable(raw, content_type, caplog):
+    with caplog.at_level(logging.WARNING, logger="processing"):
+        record = _fetch_record_from_server(raw, content_type)
+
+    assert record == UNUSABLE_RECORD
+    warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "0xindexer" in warning
+
+
+def test_json_object_from_server_is_read():
+    record = _fetch_record_from_server(
+        b'{"min_grt_per_30_days": {"arbitrum-one": "450"}}', "application/json"
+    )
+
+    assert record["dips_info_available"] is True
     assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": "450"}

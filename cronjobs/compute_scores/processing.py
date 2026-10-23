@@ -297,8 +297,15 @@ def _unavailable_dips_info(indexer: str) -> dict:
     }
 
 
-def _dips_info_record(indexer: str, data: dict) -> dict:
+def _dips_info_record(indexer: str, data: object) -> dict:
     """Turn one indexer's /dips/info response into the row stored for it."""
+    if not isinstance(data, dict):
+        logger.warning(
+            "Ignoring DIPs info from indexer %s: /dips/info body is %s, not a JSON object",
+            indexer,
+            "empty or null" if data is None else type(data).__name__,
+        )
+        return _unavailable_dips_info(indexer)
     min_prices, min_entity_price = _extract_dips_prices(data)
     if min_entity_price is not None and not _is_valid_price(min_entity_price):
         # A missing per-entity price means the indexer accepts any price: it passes every ceiling
@@ -338,7 +345,7 @@ async def _fetch_single_dips_info_async(
 
     dips_url = url.rstrip("/") + "/dips/info"
 
-    async def do_fetch() -> dict:
+    async def do_fetch() -> object:
         async with semaphore:
             async with session.get(
                 dips_url,
@@ -352,14 +359,12 @@ async def _fetch_single_dips_info_async(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                body: dict = await resp.json()
-                return body
+                return await resp.json()
 
     last_error: Optional[Exception] = None
     for attempt in range(DIPS_INFO_MAX_RETRIES):
         try:
             data = await do_fetch()
-            return _dips_info_record(indexer, data)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = e
             if attempt < DIPS_INFO_MAX_RETRIES - 1:
@@ -368,6 +373,19 @@ async def _fetch_single_dips_info_async(
                     DIPS_INFO_RETRY_BACKOFF_MULTIPLIER * (2**attempt),
                 )
                 await asyncio.sleep(delay)
+            continue
+        except (ValueError, LookupError, RecursionError) as e:
+            # Not JSON, not in its declared charset, or nested too deep. That is the indexer's
+            # answer, not a network fault, so it is not retried. Uncaught, it would fail the
+            # fetch for every indexer.
+            logger.warning(
+                "Ignoring DIPs info from indexer %s: unreadable /dips/info body (%s: %s)",
+                indexer,
+                type(e).__name__,
+                e,
+            )
+            return _unavailable_dips_info(indexer)
+        return _dips_info_record(indexer, data)
 
     logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {last_error}")
     return _unavailable_dips_info(indexer)
