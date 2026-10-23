@@ -481,6 +481,17 @@ def test_an_unreadable_value_scores_0_and_leaves_other_scores_unchanged(
     np.testing.assert_array_equal(scores, _scores(column, values))
 
 
+@pytest.mark.parametrize("column", [SEL_LATENCY_CI, "% up_x", "average_status"])
+@given(values=st.lists(st.one_of(raw_values, unreadable_text), min_size=1, max_size=8))
+# A missing latency, uptime or success rate scored 1, the best, so an indexer with no data
+# outranked one with a real reading.
+@example(values=[99.0, 50.0, None])
+@example(values=[None])
+def test_a_missing_latency_uptime_or_success_rate_scores_0(column, values):
+    missing = np.array([value is None or value != value for value in values])
+    assert (_scores(column, values)[missing] == 0).all()
+
+
 norm_values = st.one_of(st.floats(min_value=0, max_value=1), st.just(math.nan))
 weights = st.one_of(
     st.just(dict(DEFAULT_WEIGHTS)),

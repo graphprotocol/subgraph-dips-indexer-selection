@@ -741,8 +741,8 @@ def _warn_scored_as_zero(merged: pd.DataFrame, column: str, rows: pd.Series, why
 
 
 def _normalize_latency(latency: pd.Series) -> pd.Series:
-    """Normalise the latency linear regression score."""
-    return 1 - _normalize_generic(latency)  # lower is better
+    """Normalise the latency linear regression score. A missing latency scores 0, the worst."""
+    return (1 - _normalize_generic(latency)).mask(latency.isna(), 0.0)  # lower is better
 
 
 def _normalize_stake_to_fees(stake_to_fees: pd.Series) -> pd.Series:
@@ -821,18 +821,11 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
     # Threshold whereby indexers that have less uptime/success rate than this get no score.
     threshold = best * NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD
 
-    # Linear score between the threshold and the best.
-    normalized = series.apply(
-        lambda x: max(
-            0,
-            min(1, (x - threshold) / (best - threshold)),
-        )
-    )
+    # Linear score between the threshold and the best. A missing value, or a best of 0 that
+    # leaves nothing to scale by, comes out NaN and scores 0.
+    normalized = ((series - threshold) / (best - threshold)).clip(0, 1)
 
-    # Reindex and fill NaN's with 0.
-    normalized = normalized.reindex(series.index).fillna(0)
-
-    return cast(pd.Series, normalized)
+    return cast(pd.Series, normalized.fillna(0))
 
 
 def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Series:
