@@ -2932,19 +2932,22 @@ class TestSelectIndexersEndToEndPricing:
     @pytest.mark.parametrize(
         "field", ["max_grt_per_30_days", "max_grt_per_billion_entities_per_30_days"]
     )
-    def test_negative_price_ceiling_is_rejected(self, field):
-        """A negative ceiling would silently drop every indexer with a price."""
+    @pytest.mark.parametrize("ceiling", ["-1", "NaN", "Infinity"])
+    def test_unusable_price_ceiling_is_rejected(self, field, ceiling):
+        """A NaN, infinite or negative ceiling would silently drop every indexer with a price.
+
+        Sent as raw JSON, since the test client refuses to encode NaN or Infinity itself.
+        """
         from iisa.iisa_http_endpoints import app
 
         client = TestClient(app, raise_server_exceptions=False)
         response = client.post(
             "/select-indexers",
-            json={
-                "deployment_id": "QmCeilingTest",
-                "chain_id": "arb",
-                "num_candidates": 1,
-                field: -1,
-            },
+            content=(
+                '{"deployment_id": "QmCeilingTest", "chain_id": "arb", '
+                f'"num_candidates": 1, "{field}": {ceiling}}}'
+            ),
+            headers={"content-type": "application/json"},
         )
         assert response.status_code == 422
 
