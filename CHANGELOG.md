@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.9.9](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.8...v2.9.9) (2026-10-23)
+
+
+### Changed
+
+* **deps:** bump aiohttp, certifi and multidict for advisories ([#285](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/285)) ([ac3ac30](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ac3ac30355df3b562d1fbaf72d8345ecdc1806e0))
+* **deps:** bump mypy from 1.19.1 to 2.4.0 ([#296](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/296)) ([ea5e42d](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ea5e42ddae4d045a92982c88626ba5a46d2b7a41))
+* **deps:** bump pandas from 2.3.3 to 3.0.6 ([#297](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/297)) ([e6c6ae3](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/e6c6ae3f51356b282e581f31618bc19d6a3859ad))
+* **deps:** bump pandas-stubs from 2.3.3.260113 to 3.0.5.260914 ([#299](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/299)) ([21036a3](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/21036a326fe4ca6e1f0c3960dc9d73e765bb3bb9))
+* **deps:** bump the actions group across 1 directory with 3 updates ([#293](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/293)) ([20f4014](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/20f4014b3ce816258816474d41ee101a2c07b4b2))
+* **deps:** bump the service-python group with 17 updates ([#295](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/295)) ([65e2750](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/65e275062646d9d4aaf655de70532fafb10a5396))
+* **deps:** bump types-requests from 2.33.0.20260408 to 2.33.0.20261006 ([#298](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/298)) ([c1beefa](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/c1beefa38e0bf080abdb5df3ad4af23ef4ee0ec9))
+* **deps:** have Dependabot bump Python deps and base images ([#286](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/286)) ([d5456d2](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/d5456d2a2047be06650d484aeeed7ef960fbcf22))
+* **deps:** update airportsdata requirement in /cronjobs/compute_scores ([#292](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/292)) ([13d76c8](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/13d76c84084814e5b0d0f343c74f2be08ccd5d88))
+* **deps:** update confluent-kafka requirement ([#290](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/290)) ([d970efb](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/d970efbc6721ade7765bdf2aeb0e4479eeb494d5))
+* **deps:** update idna requirement in /cronjobs/compute_scores ([#289](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/289)) ([ba25ed5](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ba25ed54299e14354e2d1407687dfe4d74a9c23f))
+* **deps:** update protobuf requirement in /cronjobs/compute_scores ([#288](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/288)) ([0f00e98](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/0f00e98404487144e5eab6f3a13a55376263f4c1))
+* **deps:** update requests requirement in /cronjobs/compute_scores ([#291](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/291)) ([b233591](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/b2335913dfcdc16a1a1a8ef04cb0eaa235413a16))
+
 ## [2.9.8](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.7...v2.9.8) (2026-10-01)
 
 
