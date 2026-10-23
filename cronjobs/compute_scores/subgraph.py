@@ -85,7 +85,7 @@ def is_retryable_subgraph_error(error: BaseException) -> bool:
 retry_subgraph_read = retry(
     retry=retry_if_exception(is_retryable_subgraph_error),
     stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=2, max=60),
+    wait=wait_exponential(multiplier=2),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
