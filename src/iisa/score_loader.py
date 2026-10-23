@@ -191,11 +191,11 @@ class DataManager:
     def transform_scores_df(self, scores_df: pd.DataFrame) -> pd.DataFrame:
         """Pure column-mapping transform, returned without touching state.
 
-        The push path dry-runs this before writing, so an empty payload (raises
-        ValueError) or one missing required columns (raises ScoresPayloadError)
-        fails here with no side effects and can never poison the cache.
+        The push path dry-runs this first, so a payload with no rows (ValueError) or missing
+        required columns (ScoresPayloadError, also for rows holding no fields, which pandas
+        calls empty) fails here with no side effects and can never poison the cache.
         """
-        if scores_df.empty:
+        if len(scores_df.index) == 0:
             raise ValueError("transform_scores_df called with empty DataFrame")
         missing = missing_required_columns(scores_df)
         if missing:

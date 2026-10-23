@@ -191,6 +191,17 @@ class TestDataManager:
         with pytest.raises(ValueError, match="empty DataFrame"):
             data_manager.transform_scores_df(pd.DataFrame())
 
+    def test_transform_scores_df_rows_without_fields_raise_payload_error(self):
+        """Records that hold no fields make a frame with rows but no columns. That is a payload
+        missing every required column, not an empty one, so the push can answer 422.
+        """
+        from iisa.score_loader import ScoresPayloadError
+
+        data_manager = DataManager(MagicMock())
+
+        with pytest.raises(ScoresPayloadError, match="indexer"):
+            data_manager.transform_scores_df(pd.DataFrame([{}, {}]))
+
     def test_transform_scores_df_missing_required_column_raises(self, mock_scores_df):
         """A frame missing a required column raises ScoresPayloadError, naming it."""
         from iisa.score_loader import ScoresPayloadError
