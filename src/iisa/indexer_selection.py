@@ -346,22 +346,30 @@ class IndexerSelector:
         if len(new_group) < 2:
             return True
 
-        # Get unique locations and organizations for the resulting group
-        locations = self.data[self.data["indexer"].isin(new_group)]["destination_loc"].unique()
-        orgs = self.data[self.data["indexer"].isin(new_group)]["org"].unique()
+        locations, orgs = self._count_locations_and_orgs(new_group)
 
         # Return True if decentralisation requirements are met
-        meets = len(locations) >= 2 and len(orgs) >= 2
+        meets = locations >= 2 and orgs >= 2
         if not meets:
             logger.debug(
                 "deployment=%s decentralization check failed for %s: "
                 "locations=%d orgs=%d (need 2 each)",
                 self.deployment_id,
                 new_indexer[:10],
-                len(locations),
-                len(orgs),
+                locations,
+                orgs,
             )
         return meets
+
+    def _count_locations_and_orgs(self, group: list[IndexerId]) -> tuple[int, int]:
+        """Count the distinct locations and orgs among the group's rows. Values are compared
+        as text, since a pushed list or object cannot be compared as it is.
+        """
+        rows = self.data[self.data["indexer"].isin(group)]
+        return (
+            rows["destination_loc"].astype(str).nunique(dropna=False),
+            rows["org"].astype(str).nunique(dropna=False),
+        )
 
     def _remove_indexers_from_group(self):
         """
@@ -408,11 +416,10 @@ class IndexerSelector:
         if len(group) < 2:
             return False
 
-        locations = self.data[self.data["indexer"].isin(group)]["destination_loc"].unique()
-        orgs = self.data[self.data["indexer"].isin(group)]["org"].unique()
+        locations, orgs = self._count_locations_and_orgs(group)
 
         # Return 'True' if decentralisation requirements are hit
-        if len(locations) >= 2 and len(orgs) >= 2:
+        if locations >= 2 and orgs >= 2:
             return True
 
         # Otherwise 'False'
