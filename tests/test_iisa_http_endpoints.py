@@ -3120,8 +3120,8 @@ class TestSelectIndexersEndToEndPricing:
 
     @pytest.mark.parametrize("fees", ["-1", "NaN", "Infinity"])
     def test_unusable_optimistic_dips_fees_are_rejected(self, fees):
-        """A negative fee would inflate an indexer's stake-to-fees score and NaN would make
-        it NaN. Sent as raw JSON, since the test client refuses to encode NaN or Infinity.
+        """A negative or infinite fee would skew an indexer's stake-to-fees score and a NaN one
+        was silently treated as 0. Sent as raw JSON, since the test client can't encode NaN.
         """
         from iisa.iisa_http_endpoints import app
 

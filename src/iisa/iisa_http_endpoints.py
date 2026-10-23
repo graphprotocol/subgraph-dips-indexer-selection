@@ -122,8 +122,9 @@ class SelectionRequest(BaseModel):
     max_grt_per_billion_entities_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
     )  # e.g., 2000.0
-    # indexer address -> GRT per 30 days. A negative fee would inflate the indexer's
-    # stake-to-fees score and a NaN one would make it NaN, so both are a 422.
+    # indexer address -> GRT per 30 days, added to the indexer's query fees before its
+    # stake-to-fees is scored. A negative or infinite fee would skew that score and a NaN
+    # one would be silently treated as 0, so each is a 422.
     optimistic_dips_fees: Optional[
         dict[str, Annotated[float, Field(ge=0, allow_inf_nan=False)]]
     ] = None
