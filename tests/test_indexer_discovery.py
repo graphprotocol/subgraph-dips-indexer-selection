@@ -197,6 +197,18 @@ def test_does_not_retry_errors_that_cannot_clear(no_retry_wait, post_kwargs):
     assert post.call_count == 1
 
 
+def test_retries_a_reply_without_data(no_retry_wait):
+    empty_reply = MagicMock()
+    empty_reply.json.return_value = {"data": None}
+    page = _page([{"id": "0xaaa", "url": "https://indexer-a.example.com"}])
+
+    with patch("subgraph.requests.post", side_effect=[empty_reply, page]) as post:
+        result = discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 2
+    assert result == {"0xaaa": "https://indexer-a.example.com"}
+
+
 def test_raises_when_no_indexer_has_a_url(no_retry_wait):
     page = _page([{"id": "0xaaa", "url": ""}])
 

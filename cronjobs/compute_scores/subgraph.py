@@ -119,7 +119,10 @@ def paginate_subgraph_query(
                 retryable=not _graphql_errors_are_permanent(data["errors"]),
             )
 
-        page = data.get("data", {}).get(entity, [])
+        payload = data.get("data")
+        if not isinstance(payload, dict):
+            raise SubgraphResponseError(f"subgraph reply has no data: {data}")
+        page = payload.get(entity) or []
         elapsed = time.monotonic() - t0
         logger.info(
             "Fetched page %d: %d entities in %.2fs (cumulative=%d)",
