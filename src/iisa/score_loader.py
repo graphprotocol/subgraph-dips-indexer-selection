@@ -89,22 +89,25 @@ def _check_indexers_are_text(df: pd.DataFrame) -> None:
     can only match and return an indexer by its address. pandas reads a null or absent
     indexer as NaN, so the error reports that input as null.
     """
-    errors = [
-        {
-            "type": "string_type",
-            "loc": ("body", position, cols.INDEXER),
-            "msg": "Input should be a valid string",
-            "input": None if isinstance(indexer, float) and math.isnan(indexer) else indexer,
-        }
-        for position, indexer in enumerate(df[cols.INDEXER])
-        if not isinstance(indexer, str)
-    ]
-    if errors:
-        raise ScoresPayloadError(
-            f"pushed scores payload has {len(errors)} indexer(s) that are not text, "
-            f"first in record {errors[0]['loc'][1]}",
-            errors,
+    positions = [i for i, indexer in enumerate(df[cols.INDEXER]) if not isinstance(indexer, str)]
+    if not positions:
+        return
+    errors = []
+    for position in positions:
+        indexer = df[cols.INDEXER].iloc[position]
+        errors.append(
+            {
+                "type": "string_type",
+                "loc": ("body", position, cols.INDEXER),
+                "msg": "Input should be a valid string",
+                "input": None if isinstance(indexer, float) and math.isnan(indexer) else indexer,
+            }
         )
+    raise ScoresPayloadError(
+        f"pushed scores payload has {len(positions)} indexer(s) that are not text, "
+        f"first in record {positions[0]}",
+        errors,
+    )
 
 
 class FileScoreLoader:
