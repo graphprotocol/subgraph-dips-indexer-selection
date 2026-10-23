@@ -18,6 +18,7 @@ Endpoints:
 import hmac
 import json
 import logging
+import math
 import os
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
@@ -26,7 +27,10 @@ from functools import lru_cache, partial
 from typing import Any, Optional, cast
 
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -562,6 +566,26 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+def _json_safe(value: Any) -> Any:
+    """Replace NaN and infinite floats, at any depth, with their text form."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's own 422 echoes the rejected input, and a NaN or infinite float there
+    can't be written as JSON, which turns the 422 into a 500.
+    """
+    errors = _json_safe(jsonable_encoder(exc.errors()))
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 # =============================================================================
