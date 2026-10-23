@@ -668,10 +668,28 @@ def test_selection_respects_size_blocklist_and_price_rules(case):
     _assert_selection_scores(selector)
 
 
+@given(case=selection_cases(existing_meets_rules=False))
+def test_selection_adds_only_eligible_indexers_to_any_existing_group(case):
+    request = case.request
+    existing = set(request.existing_indexers or [])
+    selected, selector = _select(case)
+    note(f"selected={selected}")
+    assert len(set(selected)) == len(selected)
+    assert len(selected) <= max(request.num_candidates, len(existing))
+    for indexer in set(selected) - existing:
+        assert indexer not in (request.blocklist or [])
+        assert case.truths[indexer].passes(
+            request.max_grt_per_30_days, request.max_grt_per_billion_entities_per_30_days
+        ), f"added {indexer} despite an invalid or over-ceiling price"
+    _assert_selection_scores(selector)
+
+
 # Properties that do not hold yet: each needs a decision, so each is a strict xfail with a
-# hand-written example that fails today. Remove the xfail once the behaviour is settled.
+# hand-written example that fails today. Remove the xfail once the behaviour is settled. Each
+# names the error it expects, so a new crash still fails the run.
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="A group already bigger than num_candidates is trimmed only while it keeps 2 orgs "
     "and 2 locations, so it can stay bigger than asked. Trimming anyway cancels a live "
     "agreement, which needs a decision.",
@@ -691,6 +709,7 @@ def test_selection_never_returns_more_than_asked_when_the_group_is_too_big(case)
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="An indexer already in the group stays selected when the request blocklists it. "
     "Dropping it makes dipper cancel its live agreement, which needs a decision.",
 )
@@ -710,6 +729,7 @@ def test_selection_never_returns_a_blocklisted_indexer_already_in_the_group(case
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="An indexer already in the group stays selected when the price filter drops it, "
     "even for an invalid price. Dropping it makes dipper cancel its live agreement, which "
     "needs a decision.",
@@ -737,6 +757,7 @@ def test_selection_never_returns_an_invalid_price_already_in_the_group(case):
 
 @pytest.mark.xfail(
     strict=True,
+    raises=TypeError,
     reason="With optimistic DIPs fees the selector recomputes stake_to_fees from stake and "
     "query fees, and text in either raises. A missing stake already scores as the best "
     "ratio, so how to score an unreadable one needs a decision.",
