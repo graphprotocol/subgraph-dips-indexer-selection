@@ -1588,16 +1588,25 @@ class TestValidateConfigurationSubgraphURL:
 
         assert expected in caplog.text
 
-    def test_error_hides_the_api_key(self, monkeypatch, caplog):
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"htps://gateway.thegraph.com/api/{FAKE_KEY}/subgraphs/id/QmNetwork",
+            f"htps://indexer:{FAKE_KEY}@graph-node.internal/subgraphs/name/graph-network",
+            f"https//graph-node.internal/subgraphs/id/QmNetwork?api_key={FAKE_KEY}",
+        ],
+        ids=["gateway_key_in_path", "password_in_url", "key_in_query"],
+    )
+    def test_error_never_repeats_the_url(self, monkeypatch, caplog, url):
+        """The URL may carry an API key or credentials, wherever in it they sit."""
         self._satisfy_the_rest(monkeypatch)
-        keyed = f"htps://gateway.thegraph.com/api/{self.FAKE_KEY}/subgraphs/id/QmNetwork"
-        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", keyed)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
 
         with caplog.at_level("ERROR", logger=main.logger.name):
             with pytest.raises(main.ConfigurationError):
                 main.validate_configuration()
 
-        assert "<redacted>" in caplog.text
+        assert "GRAPH_NETWORK_SUBGRAPH_URL" in caplog.text
         assert self.FAKE_KEY not in caplog.text
 
     @pytest.mark.parametrize(

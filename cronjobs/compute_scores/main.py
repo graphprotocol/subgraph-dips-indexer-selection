@@ -24,7 +24,6 @@ from processing import (
     validate_geoip_databases,
 )
 from redpanda import RedpandaProvider
-from subgraph import redact_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,10 +79,8 @@ def validate_configuration() -> None:
     if not GRAPH_NETWORK_SUBGRAPH_URL:
         errors.append("GRAPH_NETWORK_SUBGRAPH_URL is required")
     elif subgraph_url.scheme not in ("http", "https") or not subgraph_url.netloc:
-        errors.append(
-            "GRAPH_NETWORK_SUBGRAPH_URL must be an http(s) URL with a host, got "
-            f"{redact_url(GRAPH_NETWORK_SUBGRAPH_URL)}"
-        )
+        # Not repeating the URL: it can carry an API key or credentials anywhere in it.
+        errors.append("GRAPH_NETWORK_SUBGRAPH_URL must be an http(s) URL with a host")
 
     if errors:
         for error in errors:
