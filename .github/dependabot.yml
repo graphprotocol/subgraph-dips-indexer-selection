@@ -7,3 +7,35 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # Service deps: pyproject.toml and uv.lock. "increase" raises each minimum to the new
+  # release, since the service image and CI install from pyproject, not the lock.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    versioning-strategy: increase
+    groups:
+      service-python:
+        patterns: ["*"]
+
+  # The cronjob image installs from its own requirements.txt. Each merged bump rebuilds
+  # the image, which then needs a manual kubectl apply (see CLAUDE.md).
+  - package-ecosystem: pip
+    directory: /cronjobs/compute_scores
+    schedule:
+      interval: weekly
+    versioning-strategy: increase
+    groups:
+      cronjob-python:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directories:
+      - /
+      - /cronjobs/compute_scores
+    schedule:
+      interval: weekly
+    groups:
+      docker-images:
+        patterns: ["*"]
