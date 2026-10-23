@@ -1,19 +1,25 @@
 """
 Tests for `_extract_dips_prices`, the shape-tolerant price parser for the
-`/dips/info` endpoint published by `indexer-rs`.
+`/dips/info` endpoint published by `indexer-rs`, and for the checks that drop
+prices an indexer advertises but that cannot be real.
 
 Two response shapes are live in the indexer fleet at the same time during
 rollout. The parser must accept either without losing data; these tests
 pin that behaviour.
 """
 
+import asyncio
+import json
+import logging
 import sys
 from pathlib import Path
+
+import pytest
 
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-from processing import _extract_dips_prices  # noqa: E402
+from processing import _extract_dips_prices, _fetch_single_dips_info_async  # noqa: E402
 
 
 def test_extracts_from_flat_shape():
@@ -110,3 +116,100 @@ def test_entity_price_only_in_flat_shape():
     # Assert
     assert min_prices == {}
     assert min_entity_price == "200"
+
+
+# --- Rejecting prices an indexer advertises but that cannot be real -------------------------
+#
+# Any indexer can serve arbitrary JSON from /dips/info. A base price of "NaN" was scored as the
+# cheapest on chains without a price ceiling, and a negative one passed every ceiling, so both
+# won selection. These tests drive `_fetch_single_dips_info_async` through a stub session.
+
+
+class _StubResponse:
+    status = 200
+
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        return None
+
+    async def json(self):
+        return self._body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _StubSession:
+    def __init__(self, body):
+        self._body = body
+
+    def get(self, url, timeout=None):
+        return _StubResponse(self._body)
+
+
+def _fetch_record(body):
+    async def run():
+        session = _StubSession(body)
+        return await _fetch_single_dips_info_async(
+            session, "0xindexer", "http://indexer.example", asyncio.Semaphore(1)
+        )
+
+    return asyncio.run(run())
+
+
+INVALID_PRICES = [
+    pytest.param("NaN", id="nan-text"),
+    pytest.param(float("nan"), id="nan-number"),
+    pytest.param(float("inf"), id="infinite"),
+    pytest.param("-Infinity", id="negative-infinite-text"),
+    pytest.param(-500, id="negative-number"),
+    pytest.param("-500", id="negative-text"),
+    pytest.param("cheap", id="not-a-number"),
+    pytest.param(True, id="boolean"),
+    pytest.param(10**400, id="too-large-for-a-float"),
+]
+
+
+@pytest.mark.parametrize("bad_price", INVALID_PRICES)
+def test_invalid_base_price_leaves_chain_unpriced(bad_price, caplog):
+    body = {
+        "min_grt_per_30_days": {"arbitrum-one": bad_price, "mainnet": "45"},
+        "min_grt_per_billion_entities_per_30_days": "200",
+        "supported_networks": ["arbitrum-one", "mainnet"],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="processing"):
+        record = _fetch_record(body)
+
+    assert record["dips_info_available"] is True
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"mainnet": "45"}
+    assert json.loads(record["dips_supported_networks"]) == ["arbitrum-one", "mainnet"]
+    warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "0xindexer" in warning and "arbitrum-one" in warning and repr(bad_price) in warning
+
+
+@pytest.mark.parametrize("bad_price", INVALID_PRICES)
+def test_invalid_base_price_is_not_inferred_as_supported_network(bad_price):
+    body = {"min_grt_per_30_days": {"arbitrum-one": bad_price, "mainnet": 45}}
+
+    record = _fetch_record(body)
+
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"mainnet": 45}
+    assert json.loads(record["dips_supported_networks"]) == ["mainnet"]
+
+
+@pytest.mark.parametrize("good_price", ["0", 0, "450.5", 450.5, "1e3"])
+def test_finite_non_negative_base_price_is_kept(good_price, caplog):
+    body = {"min_grt_per_30_days": {"arbitrum-one": good_price}}
+
+    with caplog.at_level(logging.WARNING, logger="processing"):
+        record = _fetch_record(body)
+
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": good_price}
+    assert json.loads(record["dips_supported_networks"]) == ["arbitrum-one"]
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

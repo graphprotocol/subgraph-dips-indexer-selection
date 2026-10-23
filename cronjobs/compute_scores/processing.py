@@ -10,6 +10,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import socket
 from datetime import date, datetime, timezone
@@ -251,6 +252,70 @@ def _extract_dips_prices(data: dict) -> tuple:
     return min_prices, min_entity_price
 
 
+def _is_valid_price(value: object) -> bool:
+    """True when an advertised price is a finite number >= 0, sent as a JSON number or as text.
+
+    Any indexer can serve arbitrary JSON from /dips/info. A price of NaN was scored as the
+    cheapest and a negative one passed every price ceiling, so both won selection.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return False
+    try:
+        price = float(value)
+    except (ValueError, OverflowError):
+        return False
+    return math.isfinite(price) and price >= 0
+
+
+def _valid_chain_prices(indexer: str, min_prices: dict) -> dict:
+    """Drop each per-chain base price that is not a valid price, logging what was dropped.
+
+    The selection service treats a chain with no price as unpriced and excludes the indexer there.
+    """
+    valid = {}
+    for chain, price in min_prices.items():
+        if _is_valid_price(price):
+            valid[chain] = price
+        else:
+            logger.warning(
+                "Ignoring invalid DIPs base price from indexer %s for chain %s: %r",
+                indexer,
+                chain,
+                price,
+            )
+    return valid
+
+
+def _unavailable_dips_info(indexer: str) -> dict:
+    """The stored row for an indexer whose DIPs info is missing or unusable."""
+    return {
+        "indexer": indexer,
+        "dips_info_available": False,
+        "dips_min_grt_per_30_days": "{}",
+        "dips_min_grt_per_billion_entities_per_30_days": None,
+        "dips_supported_networks": "[]",
+    }
+
+
+def _dips_info_record(indexer: str, data: dict) -> dict:
+    """Turn one indexer's /dips/info response into the row stored for it."""
+    min_prices, min_entity_price = _extract_dips_prices(data)
+    chain_prices = _valid_chain_prices(indexer, min_prices) if isinstance(min_prices, dict) else {}
+    supported_networks = data.get("supported_networks", [])
+    # If supported_networks not explicitly provided, infer from the valid price keys
+    if not supported_networks:
+        supported_networks = list(chain_prices.keys())
+    return {
+        "indexer": indexer,
+        "dips_info_available": True,
+        "dips_min_grt_per_30_days": json.dumps(chain_prices),
+        "dips_min_grt_per_billion_entities_per_30_days": str(min_entity_price)
+        if min_entity_price is not None
+        else None,
+        "dips_supported_networks": json.dumps(supported_networks),
+    }
+
+
 async def _fetch_single_dips_info_async(
     session: "aiohttp.ClientSession",
     indexer: str,
@@ -283,22 +348,7 @@ async def _fetch_single_dips_info_async(
     for attempt in range(DIPS_INFO_MAX_RETRIES):
         try:
             data = await do_fetch()
-            min_prices, min_entity_price = _extract_dips_prices(data)
-            supported_networks = data.get("supported_networks", [])
-            # If supported_networks not explicitly provided, infer from price keys
-            if not supported_networks and isinstance(min_prices, dict):
-                supported_networks = list(min_prices.keys())
-            return {
-                "indexer": indexer,
-                "dips_info_available": True,
-                "dips_min_grt_per_30_days": json.dumps(min_prices)
-                if isinstance(min_prices, dict)
-                else "{}",
-                "dips_min_grt_per_billion_entities_per_30_days": str(min_entity_price)
-                if min_entity_price is not None
-                else None,
-                "dips_supported_networks": json.dumps(supported_networks),
-            }
+            return _dips_info_record(indexer, data)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = e
             if attempt < DIPS_INFO_MAX_RETRIES - 1:
@@ -309,13 +359,7 @@ async def _fetch_single_dips_info_async(
                 await asyncio.sleep(delay)
 
     logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {last_error}")
-    return {
-        "indexer": indexer,
-        "dips_info_available": False,
-        "dips_min_grt_per_30_days": "{}",
-        "dips_min_grt_per_billion_entities_per_30_days": None,
-        "dips_supported_networks": "[]",
-    }
+    return _unavailable_dips_info(indexer)
 
 
 async def _fetch_all_dips_info_async(indexer_urls: Dict[str, str]) -> List[dict]:
