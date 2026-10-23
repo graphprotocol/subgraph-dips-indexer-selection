@@ -21,8 +21,8 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
-  # The cronjob image installs from its own requirements.txt; CI installs it with pyproject.toml,
-  # so a major release both files cap (e.g. pyarrow 26) fails CI until both caps go up together.
+  # The cronjob's tests install this list and pyproject.toml, which share pandas, numpy and pyarrow,
+  # so a major release both cap (e.g. pyarrow 26) fails CI until both caps go up together.
   # Each merged bump rebuilds the image, which then needs a manual kubectl apply (see CLAUDE.md).
   - package-ecosystem: pip
     directory: /cronjobs/compute_scores

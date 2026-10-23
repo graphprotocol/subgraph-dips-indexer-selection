@@ -36,14 +36,9 @@ dev = [
     "complexipy>=8.0,<9.0",
     "httpx>=0.24,<1.0",
     "pandas-stubs>=2.0,<4.0",
-    # CronJob dependencies
-    "scipy>=1.11,<2.0",
-    "scikit-learn>=1.3,<2.0",
-    "requests>=2.33.0,<3.0",
+    # Types for the cronjob's requests calls. The cronjob's own packages live only in its
+    # requirements.txt, which CI installs wherever the cronjob is type-checked or tested.
     "types-requests>=2.28,<3.0",
-    "aiohttp>=3.14.5,<4.0",
-    "tenacity>=8.0,<10.0",
-    "airportsdata>=20230101",
     # Transitive pins to keep the vulnerability scanner happy.
     "idna>=3.15",
     "urllib3>=2.8.0",
