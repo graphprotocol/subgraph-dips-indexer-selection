@@ -30,15 +30,28 @@ class SubgraphResponseError(RuntimeError):
     """The subgraph answered, but with GraphQL errors or without the data asked for."""
 
 
+# Failures of the connection or the reply rather than of the request: no connection, a timeout,
+# a reply cut off or corrupted in transit, or a body that isn't JSON (such as a proxy's error page).
+_TRANSIENT_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+    requests.exceptions.JSONDecodeError,
+    ConnectionError,
+    SubgraphResponseError,
+)
+
+
 def is_retryable_subgraph_error(error: BaseException) -> bool:
-    """True for failures a retry can clear: no connection, a timeout, a 429 or 5xx reply, or
-    a SubgraphResponseError (the gateway reports a failing indexer as a GraphQL error).
+    """True for failures a retry can clear: _TRANSIENT_ERRORS, a 429 or 5xx reply, or a
+    SubgraphResponseError (the gateway reports a failing indexer as a GraphQL error).
     A rejected key, a wrong URL or a malformed one fails the same way every time.
     """
     if isinstance(error, requests.HTTPError):
         status = error.response.status_code if error.response is not None else None
         return status is None or status == 429 or status >= 500
-    return isinstance(error, (requests.ConnectionError, requests.Timeout, SubgraphResponseError))
+    return isinstance(error, _TRANSIENT_ERRORS)
 
 
 def paginate_subgraph_query(

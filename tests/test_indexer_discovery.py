@@ -121,6 +121,34 @@ def test_retries_rate_limits_and_server_errors(no_retry_wait, status):
     assert result == {"0xaaa": "https://indexer-a.example.com"}
 
 
+def _unreadable_reply():
+    response = MagicMock()
+    response.json.side_effect = requests.exceptions.JSONDecodeError(
+        "Expecting value", "<html>maintenance</html>", 0
+    )
+    return response
+
+
+@pytest.mark.parametrize(
+    "first_reply",
+    [
+        requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead"),
+        requests.exceptions.ContentDecodingError("Received response with content-encoding: gzip"),
+        ConnectionResetError("Connection reset by peer"),
+        _unreadable_reply(),
+    ],
+    ids=["dropped_mid_reply", "corrupt_encoding", "socket_reset", "not_json"],
+)
+def test_retries_replies_cut_off_or_unreadable(no_retry_wait, first_reply):
+    page = _page([{"id": "0xaaa", "url": "https://indexer-a.example.com"}])
+
+    with patch("subgraph.requests.post", side_effect=[first_reply, page]) as post:
+        result = discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 2
+    assert result == {"0xaaa": "https://indexer-a.example.com"}
+
+
 @pytest.mark.parametrize(
     "post_kwargs",
     [
