@@ -1,9 +1,15 @@
 """Tests for the subgraph pagination helper."""
 
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from subgraph import paginate_subgraph_query
+
+jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
+sys.path.insert(0, str(jobs_path))
+
+from subgraph import paginate_subgraph_query  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # paginate_subgraph_query
