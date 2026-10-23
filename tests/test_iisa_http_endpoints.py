@@ -2098,6 +2098,33 @@ class TestExtractChainPrice:
         prices_json = json.dumps({"arbitrum-one": "450.5"})
         assert _extract_chain_price(prices_json, "arbitrum-one") == 450.5
 
+    @pytest.mark.parametrize(
+        "bad_price",
+        [
+            "NaN",
+            float("nan"),
+            "Infinity",
+            float("inf"),
+            float("-inf"),
+            -500.0,
+            "-500",
+            True,
+            10**400,
+        ],
+    )
+    def test_returns_none_for_unusable_price(self, bad_price):
+        """A NaN or negative base price was scored as the cheapest and won selection."""
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        prices_json = json.dumps({"arbitrum-one": bad_price, "mainnet": 200.0})
+        assert _extract_chain_price(prices_json, "arbitrum-one") is None
+        assert _extract_chain_price(prices_json, "mainnet") == 200.0
+
+    def test_accepts_zero_price(self):
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        assert _extract_chain_price(json.dumps({"arbitrum-one": "0"}), "arbitrum-one") == 0.0
+
 
 class TestFilterByPrice:
     """Tests for _filter_by_price -- excludes indexers by DIP info, chain, and budget."""
@@ -2950,6 +2977,38 @@ class TestSelectIndexersEndToEndPricing:
             headers={"content-type": "application/json"},
         )
         assert response.status_code == 422
+
+    @pytest.mark.parametrize("ceiling", [None, 1000.0])
+    @pytest.mark.parametrize("bad_price", ["NaN", float("nan"), -500.0, "-500"])
+    def test_unusable_advertised_base_price_never_wins(self, bad_price, ceiling):
+        """An indexer advertising a NaN or negative base price used to be scored as the
+        cheapest, so it won on chains without a ceiling (NaN) or under any ceiling (negative).
+        """
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row("0xhonest", "arb", 100.0, loc="US", org="org1"),
+                self._row("0xcheat", "arb", bad_price, loc="EU", org="org2"),
+            ]
+        )
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmBadPriceTest",
+                "chain_id": "arb",
+                "num_candidates": 2,
+                "max_grt_per_30_days": ceiling,
+            },
+        )
+
+        assert response.status_code == 200
+        assert [i["id"] for i in response.json()["indexers"]] == ["0xhonest"]
 
     def test_blocklist_excludes_indexers(self):
         """Blocklisted indexers must not appear in the response."""
