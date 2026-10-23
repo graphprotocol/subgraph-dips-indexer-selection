@@ -2404,6 +2404,39 @@ class TestFilterByPrice:
             "all 1 indexers exceed payment ceiling of 2000.0 GRT per billion entities/30d"
         )
 
+    @pytest.mark.parametrize("bad_price", ["-5", "abc", float("inf")])
+    def test_invalid_entity_price_is_dropped_without_an_entity_ceiling(self, bad_price, caplog):
+        """A per-entity price that is set but invalid sets no usable floor, so the indexer is
+        dropped even when the request sends no per-entity ceiling. A missing price still passes.
+        """
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                self._entity_priced("0xA", bad_price),
+                self._entity_priced("0xB", "100"),
+                self._entity_priced("0xC", None),
+            ]
+        )
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            result, reason = _filter_by_price(df, "arb", None, None)
+
+        assert list(result["indexer"]) == ["0xB", "0xC"]
+        assert reason == ""
+        assert [r.getMessage() for r in caplog.records if r.name == "iisa-service"] == [
+            f"price filter: dropping indexer 0xA with invalid per-entity price {bad_price!r}"
+        ]
+
+    def test_reason_text_when_every_entity_price_is_invalid(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [self._entity_priced("0xA", "-5"), self._entity_priced("0xB", "abc")]
+        )
+        result, reason = _filter_by_price(df, "arb", None, None)
+        assert result.empty
+        assert reason == "all 2 indexers have an invalid per-entity price"
+
     def test_logs_each_step_at_debug(self, caplog):
         from iisa.iisa_http_endpoints import _filter_by_price
 
@@ -2436,6 +2469,7 @@ class TestPriceFilterSteps:
             ("_keep_supporting_chain", ("arb",)),
             ("_keep_with_chain_price", ("arb",)),
             ("_keep_within_budget", ("arb", 1.0)),
+            ("_keep_with_valid_entity_price", ()),
             ("_keep_within_entity_budget", (1.0,)),
         ],
     )
@@ -2805,6 +2839,71 @@ class TestEnrichWithChainPrices:
         assert result.iloc[0]["base_price_per_epoch"] == 0.0
 
 
+class TestEntityPriceReadOneWay:
+    """The per-entity price ceiling, scoring and the price returned to dipper all read an
+    indexer's per-entity price the same way: missing, a finite number >= 0, or invalid.
+    """
+
+    COLUMN = "dips_min_grt_per_billion_entities_per_30_days"
+    INVALID = ["-5", -5.0, "inf", float("inf"), "1e400", "nan", "abc", "", True, [100]]
+    MISSING_OR_VALID = [
+        (None, None),
+        (float("nan"), None),
+        ("1500", 1500.0),
+        (1500, 1500.0),
+        ("1_000", 1000.0),
+        ("0", 0.0),
+    ]
+
+    def _history(self, entity_price):
+        return pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 100.0}),
+                    self.COLUMN: entity_price,
+                }
+            ]
+        )
+
+    @pytest.mark.parametrize("entity_price", INVALID)
+    def test_invalid_price_fails_the_entity_ceiling(self, entity_price):
+        from iisa.iisa_http_endpoints import _keep_within_entity_budget
+
+        result, _ = _keep_within_entity_budget(self._history(entity_price), 2000.0)
+        assert result.empty
+
+    @pytest.mark.parametrize("entity_price", INVALID)
+    def test_invalid_price_is_not_scored_as_a_price(self, entity_price):
+        """Scored as NaN, which ranks worst, not as missing (0), which ranks cheapest."""
+        from iisa.iisa_http_endpoints import _enrich_with_chain_prices
+
+        result = _enrich_with_chain_prices(self._history(entity_price), "arb")
+        assert pd.isna(result.iloc[0]["price_per_entity"])
+
+    @pytest.mark.parametrize("entity_price", INVALID)
+    def test_invalid_price_is_not_returned_to_dipper(self, entity_price):
+        from iisa.iisa_http_endpoints import _indexer_prices
+
+        assert _indexer_prices(self._history(entity_price), "0xa", "arb") == (100.0, None)
+
+    @pytest.mark.parametrize("entity_price, price", MISSING_OR_VALID)
+    def test_missing_or_valid_price_reads_the_same_in_every_step(self, entity_price, price):
+        """A missing price passes any ceiling and scores as 0; it is returned to dipper as None."""
+        from iisa.iisa_http_endpoints import (
+            _enrich_with_chain_prices,
+            _indexer_prices,
+            _keep_within_entity_budget,
+        )
+
+        history = self._history(entity_price)
+        kept, _ = _keep_within_entity_budget(history, 2000.0)
+        assert list(kept["indexer"]) == ["0xa"]
+        scored = _enrich_with_chain_prices(history, "arb").iloc[0]["price_per_entity"]
+        assert scored == (0.0 if price is None else price)
+        assert _indexer_prices(history, "0xa", "arb") == (100.0, price)
+
+
 class TestSelectIndexersEndToEndPricing:
     """Integration test: /select-indexers must not return indexers with None pricing."""
 
@@ -2925,6 +3024,32 @@ class TestSelectIndexersEndToEndPricing:
         assert "0xexpensive" not in indexer_ids, (
             "indexer priced at 5000 GRT/30d should be excluded with budget of 400"
         )
+
+    @pytest.mark.parametrize("bad_price", ["-5", "abc", "NaN"])
+    def test_invalid_entity_price_is_never_selected_without_an_entity_ceiling(self, bad_price):
+        """With no per-entity ceiling in the request, nothing used to drop an indexer whose
+        per-entity price is invalid, and scoring read that price as 0, the cheapest.
+        """
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row("0xhonest", "arb", 100.0, loc="US", org="org1", entity_price=2000.0),
+                self._row("0xcheat", "arb", 100.0, loc="EU", org="org2", entity_price=bad_price),
+            ]
+        )
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            json={"deployment_id": "QmBadEntityPriceTest", "chain_id": "arb", "num_candidates": 2},
+        )
+
+        assert response.status_code == 200
+        assert [i["id"] for i in response.json()["indexers"]] == ["0xhonest"]
 
     def test_entity_budget_enforcement_excludes_expensive_indexers(self):
         """Indexers whose per-entity price exceeds the per-entity ceiling must be excluded."""

@@ -1217,6 +1217,21 @@ class TestNormalizeMetrics:
         # 200 GRT: 1 - (200/200) = 0.0
         assert scores.iloc[2] == pytest.approx(0.0)
 
+    @pytest.mark.parametrize(
+        "prices, expected",
+        [
+            ([100.0, 200.0, np.nan, -5.0, np.inf], [0.5, 0.0, 0.0, 0.0, 0.0]),
+            ([100.0, 100.0, np.nan], [0.5, 0.5, 0.0]),
+            ([np.nan, np.nan], [0.0, 0.0]),
+        ],
+    )
+    def test_unusable_price_per_entity_scores_worst(self, prices, expected):
+        """The service scores a missing per-entity price as 0, so a value that is still not a
+        finite number >= 0 is unreadable. It must rank worst, never as the cheapest.
+        """
+        result = _normalize_metrics(pd.DataFrame({"price_per_entity": prices}))
+        assert result["norm_price_per_entity"].tolist() == pytest.approx(expected)
+
 
 class TestTargetSize:
     """Tests for variable target_size parameter in IndexerSelector."""
