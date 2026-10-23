@@ -8,6 +8,7 @@ asked, a blocklisted indexer, or one whose price is invalid or over the request'
 
 import json
 import math
+import sys
 from types import SimpleNamespace
 from typing import Any, NamedTuple, Optional
 from unittest.mock import patch
@@ -210,10 +211,18 @@ def priced_rows(draw: st.DrawFn) -> tuple[list[dict[str, Any]], dict[str, PriceT
         if with_networks:
             row["dips_supported_networks"], supports = draw(network_cells(supports=valid))
         if with_entity:
-            row[ENTITY_COLUMN], entity = draw(entity_price_cells(valid=valid))
+            cells = entity_price_cells(valid=valid).filter(lambda cell: _fits_a_table(cell[0]))
+            row[ENTITY_COLUMN], entity = draw(cells)
         rows.append(row)
         truths[indexer] = PriceTruth(available, supports, price, entity)
     return rows, truths
+
+
+def _fits_a_table(value: Any) -> bool:
+    """pandas can't build a table holding a whole number beyond the float range, such as
+    10**400, so no score column the service loads can hold one.
+    """
+    return not (isinstance(value, int) and abs(value) > sys.float_info.max)
 
 
 def _table(rows: list[dict[str, Any]]) -> pd.DataFrame:
