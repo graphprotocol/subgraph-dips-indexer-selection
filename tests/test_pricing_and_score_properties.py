@@ -248,8 +248,8 @@ def _assert_unit_interval(values: Any, *, allow_nan: bool = False) -> None:
     array = np.atleast_1d(np.asarray(values, dtype=float))
     if allow_nan:
         array = array[~np.isnan(array)]
-    assert np.isfinite(array).all(), f"non-finite score in {array}"
-    assert ((array >= 0) & (array <= 1)).all(), f"score outside [0, 1] in {array}"
+    assert np.isfinite(array).all(), f"non-finite score in {array.tolist()}"
+    assert ((array >= 0) & (array <= 1)).all(), f"score outside [0, 1] in {array.tolist()}"
 
 
 # --- Price readers ---------------------------------------------------------------------------
@@ -505,6 +505,10 @@ weights = st.one_of(
     rows=st.lists(st.lists(norm_values, min_size=6, max_size=6), min_size=1, max_size=8),
     weights=weights,
 )
+# The two sums of a weighted average were added up in different orders, so a row of full
+# scores with gaps came out just above 1.
+@example(rows=[[1.0, 1.0, math.nan, math.nan, 1.0, 1.0]], weights=dict(DEFAULT_WEIGHTS))
+@example(rows=[[1.0, 1.0, math.nan, 1.0, 1.0, math.nan]], weights=dict(DEFAULT_WEIGHTS))
 def test_weighted_scores_are_finite_and_within_unit_range(rows, weights):
     norms = pd.DataFrame(rows, columns=NORM_COLUMNS)
     weight_vector = np.array([weights[metric] for metric in DEFAULT_WEIGHTS])

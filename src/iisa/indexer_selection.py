@@ -830,9 +830,10 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
 
 def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Series:
     """Weighted average of each row's present norm_* metrics by `weights`.
-    One matrix multiply over the present norm_* columns: NaN cells drop out of
-    both the numerator and the per-row weight total, so each row renormalises
-    over the metrics it has. Raises ValueError if any row has no usable column.
+    NaN cells drop out of both the numerator and the per-row weight total, so each
+    row renormalises over the metrics it has. Both sums add their terms in the same
+    order, so scores within [0, 1] cannot round to an average above 1.
+    Raises ValueError if any row has no usable column.
     """
     columns = []
     column_weights = []
@@ -851,8 +852,8 @@ def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Ser
     weight_vector = np.array(column_weights, dtype=float)
     matrix = df[columns].to_numpy(dtype=float)
     present = ~np.isnan(matrix)
-    weighted_sum = np.nansum(matrix * weight_vector, axis=1)
-    weight_total = present @ weight_vector  # weights of the columns each row has
+    weighted_sum = (np.where(present, matrix, 0.0) * weight_vector).sum(axis=1)
+    weight_total = (present * weight_vector).sum(axis=1)  # weights of the columns each row has
 
     if (weight_total == 0).any():
         logger.error("Total sum of weights is 0. Sum of weights should be non-zero, ideally 1.")
