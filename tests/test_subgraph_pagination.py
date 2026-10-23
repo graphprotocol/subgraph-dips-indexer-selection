@@ -36,7 +36,7 @@ def _mock_response(json_data, status_code=200):
 
 @patch("subgraph.requests.post")
 def test_pagination_two_pages(mock_post):
-    """Two full pages followed by an empty page -- all results collected."""
+    """A full page then a short one: all results collected, the short page ends paging."""
     page1 = [{"id": f"0x{i:04x}"} for i in range(1000)]
     page2 = [{"id": f"0x{i:04x}"} for i in range(1000, 1500)]
 
@@ -61,6 +61,23 @@ def test_pagination_two_pages(mock_post):
     second_call_vars = mock_post.call_args_list[1].kwargs.get(
         "json", mock_post.call_args_list[1][1].get("json", {})
     )["variables"]
+    assert second_call_vars["lastId"] == page1[-1]["id"]
+
+
+@patch("subgraph.requests.post")
+def test_pagination_full_page_then_empty_page(mock_post):
+    """Exactly 1,000 entities: a full page, then an empty one asked for after the last id."""
+    page1 = [{"id": f"0x{i:04x}"} for i in range(1000)]
+    mock_post.side_effect = [
+        _mock_response({"data": {"indexers": page1}}),
+        _mock_response({"data": {"indexers": []}}),
+    ]
+
+    result = paginate_subgraph_query(DUMMY_URL, DUMMY_QUERY, entity="indexers")
+
+    assert result == page1
+    assert mock_post.call_count == 2
+    second_call_vars = mock_post.call_args_list[1].kwargs["json"]["variables"]
     assert second_call_vars["lastId"] == page1[-1]["id"]
 
 
