@@ -111,8 +111,9 @@ class SelectionRequest(BaseModel):
     num_candidates: int  # Target group size (required)
     blocklist: Optional[list[str]] = None
     declined_indexers: Optional[dict[str, list[str]]] = None
-    # Required: the DIPs-info, chain-support and price filters all key on the chain,
-    # so a request without one would be scored with none of them applied.
+    # Required: the DIPs-info, chain-support and price filters all key on the chain, so a
+    # request without one would skip them all. They also skip any step whose DIPs column is
+    # missing from the loaded scores, and every step when dips_info_available is missing.
     chain_id: str = Field(min_length=1)  # e.g., "arbitrum-one"
     max_grt_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
