@@ -1107,6 +1107,28 @@ def _keep_within_budget(
     return df, ""
 
 
+def _keep_with_valid_entity_price(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """Price filter step: drop indexers whose per-entity price is set but invalid.
+
+    Runs whether or not the request sets a per-entity ceiling, since such a price sets no
+    usable floor to score the indexer on or to offer it. A missing price passes.
+    """
+    if _ENTITY_PRICE_COLUMN not in df.columns:
+        return df, ""
+    invalid = df[_ENTITY_PRICE_COLUMN].apply(lambda v: _parse_entity_price(v).invalid).astype(bool)
+    for indexer, value in zip(df.loc[invalid, "indexer"], df.loc[invalid, _ENTITY_PRICE_COLUMN]):
+        logger.warning(
+            "price filter: dropping indexer %s with invalid per-entity price %.200r",
+            indexer,
+            value,
+        )
+    pre_filter = len(df)
+    df = df[~invalid]
+    if df.empty:
+        return df, f"all {pre_filter} indexers have an invalid per-entity price"
+    return df, ""
+
+
 def _keep_within_entity_budget(
     df: pd.DataFrame, max_grt_per_billion_entities_per_30_days: Optional[float]
 ) -> tuple[pd.DataFrame, str]:
@@ -1148,11 +1170,11 @@ def _filter_by_price(
     max_grt_per_30_days: Optional[float],
     max_grt_per_billion_entities_per_30_days: Optional[float] = None,
 ) -> tuple[pd.DataFrame, str]:
-    """Drop indexers that lack DIP info, don't support the chain, lack a chain price,
-    exceed max_grt_per_30_days for the chain, or exceed the per-entity ceiling.
+    """Drop indexers that lack DIP info, don't support the chain, lack a chain price, exceed
+    max_grt_per_30_days for the chain, set an invalid per-entity price, or exceed the
+    per-entity ceiling.
 
-    Returns (filtered_df, reason). ``reason`` is empty unless filtering left
-    no candidates, in which case it explains why.
+    Returns (filtered_df, reason). ``reason`` says why if no candidates are left, else is empty.
     """
     if chain_id is None:
         return history, ""
@@ -1168,6 +1190,7 @@ def _filter_by_price(
         partial(_keep_supporting_chain, chain_id=chain_id),
         partial(_keep_with_chain_price, chain_id=chain_id),
         partial(_keep_within_budget, chain_id=chain_id, max_grt_per_30_days=max_grt_per_30_days),
+        _keep_with_valid_entity_price,
         partial(
             _keep_within_entity_budget,
             max_grt_per_billion_entities_per_30_days=max_grt_per_billion_entities_per_30_days,
