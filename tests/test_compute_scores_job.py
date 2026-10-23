@@ -1643,7 +1643,6 @@ class TestComputeAllScoresGeoipDemotion:
             )
 
         monkeypatch.setattr(processing, "resolve_indexer_geoip", fake_resolve_geoip)
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
         monkeypatch.setattr(
             processing,
             "fetch_and_filter_graph_node_versions",
@@ -1653,6 +1652,7 @@ class TestComputeAllScoresGeoipDemotion:
         with caplog.at_level("WARNING", logger="processing"):
             result = compute_all_scores(
                 provider=mock_provider,
+                indexer_urls={},
                 start_date=date(2026, 5, 1),
                 num_days=28,
                 target_rows=20_000_000,
@@ -1710,7 +1710,6 @@ class TestComputeAllScoresGeoipDemotion:
             )
 
         monkeypatch.setattr(processing, "resolve_indexer_geoip", fake_resolve_geoip)
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
         monkeypatch.setattr(
             processing,
             "fetch_and_filter_graph_node_versions",
@@ -1721,6 +1720,7 @@ class TestComputeAllScoresGeoipDemotion:
             try:
                 compute_all_scores(
                     provider=mock_provider,
+                    indexer_urls={},
                     start_date=date(2026, 5, 1),
                     num_days=28,
                     target_rows=20_000_000,
@@ -1766,7 +1766,6 @@ class TestComputeAllScoresGeoipDemotion:
             raise AssertionError("GeoIP resolution must not run in partial mode")
 
         monkeypatch.setattr(processing, "resolve_indexer_geoip", fail_if_called)
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
         monkeypatch.setattr(
             processing,
             "fetch_and_filter_graph_node_versions",
@@ -1775,6 +1774,7 @@ class TestComputeAllScoresGeoipDemotion:
 
         result = compute_all_scores(
             provider=mock_provider,
+            indexer_urls={},
             start_date=date(2026, 5, 1),
             num_days=28,
             target_rows=20_000_000,
