@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
+jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 from iisa_client import RETRY_ATTEMPTS, IISAPushError, _request_with_retry  # noqa: E402
