@@ -390,6 +390,52 @@ def mock_history_df():
     )
 
 
+class TestOpenApiErrorResponses:
+    """The OpenAPI schema lists each error answer a route can give, besides FastAPI's 422."""
+
+    @pytest.mark.parametrize(
+        "method, path, codes",
+        [
+            ("get", "/health", set()),
+            ("post", "/scores", {"400", "401", "503"}),
+            ("get", "/scores", {"401"}),
+            ("get", "/scores/status", {"401"}),
+            ("get", "/scores/weighted", {"401"}),
+            ("get", "/dips-indexers", {"401"}),
+            ("post", "/sync-status", {"400", "401", "503"}),
+            ("post", "/get-score", {"400", "401", "503"}),
+            ("post", "/select-indexers", {"400", "503"}),
+        ],
+    )
+    def test_lists_each_error_answer(self, method, path, codes):
+        from iisa.iisa_http_endpoints import app
+
+        responses = app.openapi()["paths"][path][method]["responses"]
+
+        assert set(responses) - {"200", "422"} == codes
+        for code in codes:
+            assert responses[code]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/ErrorResponse"
+            }
+
+    @pytest.mark.parametrize("body", [b"\xff\xfe\xfd", b"caf\xe9"], ids=["not-utf8", "latin1-text"])
+    def test_unreadable_body_answer_matches_the_listed_error_shape(self, body):
+        """FastAPI answers a body it cannot decode with its own 400, which the schema lists."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/sync-status", content=body, headers={"Content-Type": "application/json"}
+        )
+
+        assert response.status_code == 400
+        assert set(response.json()) == {"detail"}
+        assert isinstance(response.json()["detail"], str)
+
+
 class TestHealthEndpoint:
     """Tests for GET /health endpoint."""
 
