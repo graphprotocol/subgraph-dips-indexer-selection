@@ -583,6 +583,10 @@ class TestPushScoresEndpoint:
 
         response = client.post("/scores", json=[])
         assert response.status_code == 422
+        # The same error list FastAPI gives any invalid body, as the OpenAPI schema documents.
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert error["type"] == "too_short"
 
     def test_push_scores_rejects_missing_token_when_required(self, monkeypatch):
         """IISA_PUSH_TOKEN set + no header → 401."""
@@ -808,7 +812,9 @@ class TestPushScoresEndpoint:
 
         # Assert
         assert response.status_code == 422
-        assert "uptime_score" in response.json()["detail"]
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert "uptime_score" in error["msg"]
         assert not scores_path.exists()
 
     def test_push_scores_missing_indexer_rejected(self, tmp_path, monkeypatch):
@@ -831,7 +837,9 @@ class TestPushScoresEndpoint:
 
         # Assert
         assert response.status_code == 422
-        assert "indexer" in response.json()["detail"]
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert "indexer" in error["msg"]
         assert not scores_path.exists()
 
     def test_push_scores_records_without_fields_rejected(self, tmp_path, monkeypatch):
@@ -848,7 +856,9 @@ class TestPushScoresEndpoint:
         response = client.post("/scores", json=[{}])
 
         assert response.status_code == 422
-        assert "indexer" in response.json()["detail"]
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert "indexer" in error["msg"]
         assert not scores_path.exists()
 
     def test_push_scores_full_payload_accepted_end_to_end(self, tmp_path, monkeypatch):

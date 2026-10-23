@@ -28,7 +28,7 @@ from functools import lru_cache, partial
 from typing import Annotated, Any, NamedTuple, Optional, cast
 
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -638,7 +638,7 @@ async def health_check() -> HealthResponse:
 
 @app.post("/scores", response_model=ScoresAcceptedResponse)
 def push_scores(
-    payload: list[dict[str, Any]],
+    payload: Annotated[list[dict[str, Any]], Body(min_length=1)],
     authorization: Optional[str] = Header(None),
 ) -> ScoresAcceptedResponse:
     """Accept a pushed scores snapshot from the cronjob.
@@ -649,12 +649,6 @@ def push_scores(
     """
     _require_push_token(authorization)
 
-    if not payload:
-        raise HTTPException(
-            status_code=422,
-            detail="scores payload must be a non-empty list of records",
-        )
-
     if not _state._initialized:
         raise HTTPException(
             status_code=503,
@@ -664,9 +658,11 @@ def push_scores(
     try:
         rows = _state.load_scores_from_records(payload)
     except ScoresPayloadError as e:
-        # Wrong-shape body: the caller's problem, so 422 not 500.
+        # Wrong-shape body: the caller's problem, so a 422 in the error list every 422 carries.
         logger.warning("Rejected pushed scores: %s", e)
-        raise HTTPException(status_code=422, detail=str(e)) from e
+        raise RequestValidationError(
+            [{"type": "missing", "loc": ("body",), "msg": str(e), "input": None}]
+        ) from e
     except Exception:
         logger.exception("Failed to accept pushed scores")
         raise HTTPException(status_code=500, detail="Failed to accept scores")
