@@ -60,10 +60,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra dev
 
-      # mypy checks the cronjob too, and only its requirements.txt lists its packages. Any
-      # package the lock already satisfies is left at its locked version.
+      # mypy checks the cronjob too, and only its requirements.txt lists its packages. The lock
+      # holds every package both lists share at its locked version, and fails the step if the
+      # cronjob needs a version the lock doesn't have.
       - name: Install cronjob dependencies
-        run: uv pip install -r cronjobs/compute_scores/requirements.txt
+        run: |
+          uv export --locked --extra dev --no-hashes --no-emit-project -o "$RUNNER_TEMP/locked.txt"
+          uv pip install -r cronjobs/compute_scores/requirements.txt -c "$RUNNER_TEMP/locked.txt"
 
       - name: mypy
         run: mypy
