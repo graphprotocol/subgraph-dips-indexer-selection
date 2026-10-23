@@ -23,7 +23,11 @@ from aiohttp.test_utils import TestServer
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-from processing import _extract_dips_prices, _fetch_single_dips_info_async  # noqa: E402
+from processing import (  # noqa: E402
+    _extract_dips_prices,
+    _fetch_single_dips_info_async,
+    _for_log,
+)
 
 
 def test_extracts_from_flat_shape():
@@ -194,7 +198,7 @@ def test_invalid_base_price_leaves_chain_unpriced(bad_price, caplog):
     assert json.loads(record["dips_min_grt_per_30_days"]) == {"mainnet": 45.0}
     assert json.loads(record["dips_supported_networks"]) == ["arbitrum-one", "mainnet"]
     warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
-    assert "0xindexer" in warning and "arbitrum-one" in warning and repr(bad_price) in warning
+    assert "0xindexer" in warning and "arbitrum-one" in warning and _for_log(bad_price) in warning
 
 
 @pytest.mark.parametrize("bad_price", INVALID_PRICES)
@@ -239,7 +243,7 @@ def test_invalid_per_entity_price_makes_dips_info_unusable(bad_price, caplog):
         "dips_supported_networks": "[]",
     }
     warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
-    assert "0xindexer" in warning and repr(bad_price) in warning
+    assert "0xindexer" in warning and _for_log(bad_price) in warning
 
 
 @pytest.mark.parametrize(
@@ -350,3 +354,50 @@ def test_json_object_from_server_is_read():
 
     assert record["dips_info_available"] is True
     assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": 450.0}
+
+
+# --- Keeping what an indexer sends from flooding or forging CronJob log lines ---------------
+#
+# The warnings for a dropped price quote the chain name and value the indexer sent. A line break
+# in either would start a fake log line, and a multi-megabyte value would be logged in full on
+# every run, so both are quoted with escapes and cut to a fixed length.
+
+HUGE_TEXT = "9" * 1_000_000 + "x"
+HUGE_OBJECT = {f"key{i}": {"nested": ["v" * 1_000] * 100} for i in range(1_000)}
+
+
+def test_line_break_in_a_chain_name_cannot_start_a_fake_log_line(caplog):
+    body = {"min_grt_per_30_days": {"arb\nINFO - Pushed scores to iisa": "NaN", "mainnet": 45}}
+
+    with caplog.at_level(logging.WARNING, logger="processing"):
+        _fetch_record(body)
+
+    warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "\n" not in warning
+    assert "arb\\nINFO" in warning
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"min_grt_per_30_days": {"arbitrum-one": HUGE_TEXT}}, id="base-price-text"),
+        pytest.param(
+            {"min_grt_per_30_days": {"arbitrum-one": HUGE_OBJECT}}, id="base-price-object"
+        ),
+        pytest.param({"min_grt_per_30_days": {HUGE_TEXT: "NaN"}}, id="chain-name"),
+        pytest.param(
+            {"min_grt_per_billion_entities_per_30_days": HUGE_TEXT}, id="per-entity-price-text"
+        ),
+        pytest.param(
+            {"min_grt_per_billion_entities_per_30_days": HUGE_OBJECT},
+            id="per-entity-price-object",
+        ),
+    ],
+)
+def test_huge_advertised_value_is_cut_short_in_the_warning(body, caplog):
+    with caplog.at_level(logging.WARNING, logger="processing"):
+        _fetch_record(body)
+
+    warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "0xindexer" in warning
+    assert len(warning) < 500
