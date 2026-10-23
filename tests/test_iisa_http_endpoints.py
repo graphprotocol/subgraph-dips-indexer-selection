@@ -3505,3 +3505,25 @@ class TestSelectIndexersGroupMembers:
         ]
         selected = self._select(rows, num_candidates=2, existing_indexers=["0xquiet", "0xunscored"])
         assert sorted(selected) == ["0xquiet", "0xunscored"]
+
+    def test_keeps_members_with_no_price_data_when_no_candidate_is_left(self):
+        # The day the score job reaches no indexer's /dips/info, every row lacks DIPs info.
+        rows = [
+            {**self._row(address, "arb", 100.0), "dips_info_available": False}
+            for address in ("0xa", "0xb", "0xc")
+        ]
+        selected = self._select(rows, num_candidates=2, existing_indexers=["0xa", "0xb"])
+        assert sorted(selected) == ["0xa", "0xb"]
+
+    def test_drops_failing_members_when_no_candidate_is_left(self):
+        rows = [
+            {**self._row("0xa", "arb", 100.0), "dips_info_available": False},
+            self._row("0xb", "arb", 5000.0, "EU", "org2"),
+        ]
+        selected = self._select(
+            rows,
+            num_candidates=2,
+            existing_indexers=["0xa", "0xb"],
+            max_grt_per_30_days=400,
+        )
+        assert selected == ["0xa"]

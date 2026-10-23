@@ -1518,10 +1518,16 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
     request = _without_failing_members(_state.history, request)
 
-    # Filter by price constraints before scoring
+    # Filter by price constraints before scoring. With no candidate left, the members that
+    # may stay are the answer, since an empty one makes dipper cancel every agreement.
     filtered_history = _price_filtered_candidates(_state.history, request)
     if filtered_history is None:
-        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+        return SelectionResponse(
+            deployment_id=request.deployment_id,
+            indexers=_build_selected_indexers(
+                list(request.existing_indexers or []), _state.history, request.chain_id
+            ),
+        )
 
     # Enrich with chain-specific price columns for normalization
     enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
