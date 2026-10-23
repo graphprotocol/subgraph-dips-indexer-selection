@@ -22,7 +22,6 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
-import requests
 from numpy.linalg import pinv
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
@@ -30,14 +29,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from subgraph import paginate_subgraph_query
-from tenacity import (
-    before_sleep_log,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from subgraph import SubgraphResponseError, paginate_subgraph_query, retry_subgraph_read
 
 if TYPE_CHECKING:
     import aiohttp
@@ -217,14 +209,7 @@ query($first: Int!, $lastId: String!) {
 """
 
 
-@retry(
-    # RuntimeError covers GraphQL errors and an answer that lists no indexers.
-    retry=retry_if_exception_type((requests.RequestException, RuntimeError)),
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=2, max=60),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=True,
-)
+@retry_subgraph_read
 def _query_indexer_urls(network_subgraph_url: str) -> Dict[str, str]:
     """Map each indexer with a URL to that URL; raise when the subgraph lists none."""
     raw_indexers = paginate_subgraph_query(
@@ -234,7 +219,8 @@ def _query_indexer_urls(network_subgraph_url: str) -> Dict[str, str]:
         indexer["id"]: indexer["url"] for indexer in raw_indexers if indexer.get("url", "")
     }
     if not indexer_urls:
-        raise RuntimeError("network subgraph returned no indexers with a URL")
+        # Retried: the gateway may have served the query from an indexer that is behind.
+        raise SubgraphResponseError("network subgraph returned no indexers with a URL")
     return indexer_urls
 
 
