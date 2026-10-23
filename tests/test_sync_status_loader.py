@@ -134,6 +134,43 @@ class TestSyncStatusData:
             f"sync_status: invalid fetched_at for 0xAAAAAAAA: {fetched_at}"
         ]
 
+    @pytest.mark.parametrize("entry", [None, [], "QmA", 5])
+    def test_entry_that_is_not_an_object_excluded_with_warning(self, entry, caplog):
+        raw = {
+            "0xAAAAAAAAAAAA": entry,
+            "0xBBB": {"deployments": ["QmA"], "fetched_at": _now_iso()},
+        }
+
+        with caplog.at_level(logging.WARNING, logger="iisa.sync_status_loader"):
+            data = SyncStatusData(raw)
+
+        assert data.synced_indexers_for("QmA") == {"0xbbb"}
+        assert [r.getMessage() for r in caplog.records] == [
+            f"sync_status: ignoring entry for 0xAAAAAAAA that is not an object: {entry!r}"
+        ]
+
+    @pytest.mark.parametrize("deployments", ["QmA", 5, {"QmA": True}, ["QmA", 5], [["QmA"]]])
+    def test_unreadable_deployments_excluded_with_warning(self, deployments, caplog):
+        raw = {"0xAAAAAAAAAAAA": {"deployments": deployments, "fetched_at": _now_iso()}}
+
+        with caplog.at_level(logging.WARNING, logger="iisa.sync_status_loader"):
+            data = SyncStatusData(raw)
+
+        assert data.total_indexers == 0
+        assert data.total_deployments == 0
+        assert [r.getMessage() for r in caplog.records] == [
+            f"sync_status: ignoring unreadable deployments for 0xAAAAAAAA: {deployments!r}"
+        ]
+
+    def test_null_deployments_excluded_like_missing_ones(self, caplog):
+        raw = {"0xAAA": {"deployments": None, "fetched_at": _now_iso()}}
+
+        with caplog.at_level(logging.WARNING, logger="iisa.sync_status_loader"):
+            data = SyncStatusData(raw)
+
+        assert data.total_indexers == 0
+        assert caplog.records == []
+
     def test_summary_log_counts_filtered_entries(self, caplog):
         raw = {
             "0xFresh": {"deployments": ["QmA"], "fetched_at": _now_iso()},

@@ -19,15 +19,16 @@ import hmac
 import json
 import logging
 import math
+import numbers
 import os
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache, partial
-from typing import Any, Optional, cast
+from typing import Annotated, Any, NamedTuple, Optional, cast
 
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -101,7 +102,8 @@ class SelectionRequest(BaseModel):
     """
     Request body for indexer selection endpoint.
 
-    Matches the SelectionRequest struct in the Rust HTTP client.
+    Follows the SelectionRequest struct in dipper's Rust HTTP client, which types chain_id
+    as optional. Dipper's reassess job always sets it, and a request without one is a 422.
     """
 
     deployment_id: str
@@ -110,14 +112,22 @@ class SelectionRequest(BaseModel):
     num_candidates: int  # Target group size (required)
     blocklist: Optional[list[str]] = None
     declined_indexers: Optional[dict[str, list[str]]] = None
-    chain_id: Optional[str] = None  # e.g., "arbitrum-one"
+    # Required: the DIPs-info, chain-support and price filters all key on the chain, so a
+    # request without one would skip them all. They also skip any step whose DIPs column is
+    # missing from the loaded scores, and every step when dips_info_available is missing.
+    chain_id: str = Field(min_length=1)  # e.g., "arbitrum-one"
     max_grt_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
     )  # e.g., 4500.0
     max_grt_per_billion_entities_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
     )  # e.g., 2000.0
-    optimistic_dips_fees: Optional[dict[str, float]] = None  # indexer address -> GRT per 30 days
+    # indexer address -> GRT per 30 days, added to the indexer's query fees before its
+    # stake-to-fees is scored. A negative or infinite fee would skew that score and a NaN
+    # one would be silently treated as 0, so each is a 422.
+    optimistic_dips_fees: Optional[
+        dict[str, Annotated[float, Field(ge=0, allow_inf_nan=False)]]
+    ] = None
 
 
 class SelectedIndexer(BaseModel):
@@ -247,6 +257,24 @@ class SyncStatusAcceptedResponse(BaseModel):
 
     status: str
     indexers: int
+
+
+class ErrorResponse(BaseModel):
+    """Body of each error answer other than a 422: what went wrong, in words."""
+
+    detail: str
+
+
+_ERROR_RESPONSES: dict[int, dict[str, Any]] = {
+    400: {"model": ErrorResponse, "description": "The body could not be read as text"},
+    401: {"model": ErrorResponse, "description": "The bearer token is missing or wrong"},
+    503: {"model": ErrorResponse, "description": "The service has not started or has no scores"},
+}
+
+
+def _documented_errors(*codes: int) -> dict[int | str, dict[str, Any]]:
+    """OpenAPI entries for the error answers a route gives besides FastAPI's own 422."""
+    return {code: _ERROR_RESPONSES[code] for code in codes}
 
 
 # =============================================================================
@@ -457,7 +485,8 @@ def _parse_supported_networks(networks_json: Any) -> list[str]:
     """
     try:
         networks = json.loads(networks_json) if isinstance(networks_json, str) else []
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        logger.debug("Ignoring unreadable supported networks %.200r", networks_json)
         return []
     return networks if isinstance(networks, list) else []
 
@@ -475,9 +504,9 @@ def _supports_chain(networks_json: Any, chain_id: str) -> bool:
 def _require_push_token(authorization: Optional[str]) -> None:
     """Validate the bearer token against IISA_PUSH_TOKEN.
 
-    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). Uses
-    hmac.compare_digest to dodge timing oracles. "Bearer" prefix matched
-    case-insensitively per RFC 6750 §2.1; the token itself is case-sensitive.
+    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). "Bearer" is
+    matched in any letter case per RFC 6750 §2.1, the token exactly. hmac.compare_digest
+    dodges timing oracles; it compares bytes, since it refuses text with non-ASCII letters.
     """
     expected = get_settings().push_token
     if not expected:
@@ -485,7 +514,7 @@ def _require_push_token(authorization: Optional[str]) -> None:
     if not authorization or authorization[:7].lower() != "bearer ":
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
     provided = authorization[7:].strip()
-    if not hmac.compare_digest(provided, expected):
+    if not hmac.compare_digest(provided.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
@@ -625,9 +654,11 @@ async def health_check() -> HealthResponse:
     )
 
 
-@app.post("/scores", response_model=ScoresAcceptedResponse)
+@app.post(
+    "/scores", response_model=ScoresAcceptedResponse, responses=_documented_errors(400, 401, 503)
+)
 def push_scores(
-    payload: list[dict[str, Any]],
+    payload: Annotated[list[dict[str, Any]], Body(min_length=1)],
     authorization: Optional[str] = Header(None),
 ) -> ScoresAcceptedResponse:
     """Accept a pushed scores snapshot from the cronjob.
@@ -638,12 +669,6 @@ def push_scores(
     """
     _require_push_token(authorization)
 
-    if not payload:
-        raise HTTPException(
-            status_code=422,
-            detail="scores payload must be a non-empty list of records",
-        )
-
     if not _state._initialized:
         raise HTTPException(
             status_code=503,
@@ -653,9 +678,9 @@ def push_scores(
     try:
         rows = _state.load_scores_from_records(payload)
     except ScoresPayloadError as e:
-        # Wrong-shape body: the caller's problem, so 422 not 500.
+        # Wrong-shape body: the caller's problem, so a 422 in the error list every 422 carries.
         logger.warning("Rejected pushed scores: %s", e)
-        raise HTTPException(status_code=422, detail=str(e)) from e
+        raise RequestValidationError(e.errors) from e
     except Exception:
         logger.exception("Failed to accept pushed scores")
         raise HTTPException(status_code=500, detail="Failed to accept scores")
@@ -664,7 +689,7 @@ def push_scores(
     return ScoresAcceptedResponse(status="success", rows=rows)
 
 
-@app.get("/scores/status", response_model=ScoresStatusResponse)
+@app.get("/scores/status", response_model=ScoresStatusResponse, responses=_documented_errors(401))
 def scores_status(
     authorization: Optional[str] = Header(None),
 ) -> ScoresStatusResponse:
@@ -686,7 +711,7 @@ def scores_status(
     return ScoresStatusResponse(computed_at=computed_at, rows=rows)
 
 
-@app.get("/scores", response_model=ScoresSnapshotResponse)
+@app.get("/scores", response_model=ScoresSnapshotResponse, responses=_documented_errors(401))
 def scores_snapshot(
     authorization: Optional[str] = Header(None),
 ) -> ScoresSnapshotResponse:
@@ -722,7 +747,9 @@ def scores_snapshot(
     )
 
 
-@app.get("/scores/weighted", response_model=WeightedScoresResponse)
+@app.get(
+    "/scores/weighted", response_model=WeightedScoresResponse, responses=_documented_errors(401)
+)
 def scores_weighted(
     authorization: Optional[str] = Header(None),
 ) -> WeightedScoresResponse:
@@ -800,7 +827,7 @@ def scores_weighted(
     )
 
 
-@app.get("/dips-indexers", response_model=DipsIndexersResponse)
+@app.get("/dips-indexers", response_model=DipsIndexersResponse, responses=_documented_errors(401))
 def dips_indexers(
     chain: str,
     max_grt_per_30_days: Optional[float] = Query(default=None, ge=0, allow_inf_nan=False),
@@ -847,7 +874,11 @@ def dips_indexers(
     )
 
 
-@app.post("/sync-status", response_model=SyncStatusAcceptedResponse)
+@app.post(
+    "/sync-status",
+    response_model=SyncStatusAcceptedResponse,
+    responses=_documented_errors(400, 401, 503),
+)
 def push_sync_status(
     payload: dict[str, Any],
     authorization: Optional[str] = Header(None),
@@ -876,7 +907,7 @@ def push_sync_status(
     return SyncStatusAcceptedResponse(status="success", indexers=indexer_count)
 
 
-@app.post("/get-score", response_model=ScoreResponse)
+@app.post("/get-score", response_model=ScoreResponse, responses=_documented_errors(400, 401, 503))
 async def get_score(
     request: ScoreRequest,
     authorization: Optional[str] = Header(None),
@@ -940,7 +971,9 @@ async def get_score(
     )
 
 
-@app.post("/select-indexers", response_model=SelectionResponse)
+@app.post(
+    "/select-indexers", response_model=SelectionResponse, responses=_documented_errors(400, 503)
+)
 async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     """Select N indexers for a deployment via weighted scoring.
 
@@ -986,13 +1019,60 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
 
 
 def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[float]:
-    """Extract the price for a specific chain from the JSON price map."""
+    """Extract the price for a specific chain from the JSON price map.
+
+    A price that is not a finite number >= 0 counts as no price, so the indexer is excluded on
+    that chain. A NaN or negative price would otherwise be scored as the cheapest and win.
+    """
     try:
         prices = json.loads(dips_min_grt_json) if isinstance(dips_min_grt_json, str) else {}
+        if not isinstance(prices, dict):
+            raise TypeError(f"price map is a JSON {type(prices).__name__}, not an object")
         val = prices.get(chain_id)
-        return float(val) if val is not None else None
-    except (TypeError, ValueError):
+        if val is None:
+            return None
+        price = float(val)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        logger.debug(
+            "Ignoring unreadable price for chain '%s' in %.200r", chain_id, dips_min_grt_json
+        )
         return None
+    if isinstance(val, bool) or not math.isfinite(price) or price < 0:
+        logger.debug("Ignoring unusable price %r for chain '%s'", val, chain_id)
+        return None
+    return price
+
+
+_ENTITY_PRICE_COLUMN = "dips_min_grt_per_billion_entities_per_30_days"
+
+
+class _EntityPrice(NamedTuple):
+    """An indexer's per-entity price, read the same way by every step that uses it.
+
+    ``price`` is None when the indexer set none, meaning it accepts any per-entity price, and
+    when ``invalid``: a value is set but is not a finite number >= 0.
+    """
+
+    price: Optional[float]
+    invalid: bool = False
+
+
+_INVALID_ENTITY_PRICE = _EntityPrice(None, invalid=True)
+
+
+def _parse_entity_price(value: Any) -> _EntityPrice:
+    """Read one indexer's per-entity price. None or NaN is missing; anything else must be a
+    finite number >= 0, sent as a number or as text, or it is invalid.
+    """
+    if pd.api.types.is_scalar(value) and pd.isna(value):
+        return _EntityPrice(None)
+    if isinstance(value, bool) or not isinstance(value, (numbers.Real, str)):
+        return _INVALID_ENTITY_PRICE
+    try:
+        price = float(value)
+    except (ValueError, OverflowError):
+        return _INVALID_ENTITY_PRICE
+    return _EntityPrice(price) if math.isfinite(price) and price >= 0 else _INVALID_ENTITY_PRICE
 
 
 def _keep_with_dips_info(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
@@ -1063,22 +1143,48 @@ def _keep_within_budget(
     return df, ""
 
 
+def _keep_with_valid_entity_price(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """Price filter step: drop indexers whose per-entity price is set but invalid.
+
+    Runs whether or not the request sets a per-entity ceiling, since such a price sets no
+    usable floor to score the indexer on or to offer it. A missing price passes.
+    """
+    if _ENTITY_PRICE_COLUMN not in df.columns:
+        return df, ""
+    invalid = df[_ENTITY_PRICE_COLUMN].apply(lambda v: _parse_entity_price(v).invalid).astype(bool)
+    for indexer, value in zip(df.loc[invalid, "indexer"], df.loc[invalid, _ENTITY_PRICE_COLUMN]):
+        logger.warning(
+            "price filter: dropping indexer %s with invalid per-entity price %.200r",
+            indexer,
+            value,
+        )
+    pre_filter = len(df)
+    df = df[~invalid]
+    if df.empty:
+        return df, f"all {pre_filter} indexers have an invalid per-entity price"
+    return df, ""
+
+
 def _keep_within_entity_budget(
     df: pd.DataFrame, max_grt_per_billion_entities_per_30_days: Optional[float]
 ) -> tuple[pd.DataFrame, str]:
     """Price filter step: keep indexers whose per-entity price is at or below the ceiling.
 
-    An indexer with no per-entity price passes, since it is scored and offered as 0. A
-    price that is present but not a number fails, since it sets no usable floor.
+    An indexer with no per-entity price passes, since it is scored and offered as 0. An
+    invalid price fails, since it sets no usable floor.
     """
-    column = "dips_min_grt_per_billion_entities_per_30_days"
-    if max_grt_per_billion_entities_per_30_days is None or column not in df.columns:
+    if max_grt_per_billion_entities_per_30_days is None or _ENTITY_PRICE_COLUMN not in df.columns:
         return df, ""
     ceiling = max_grt_per_billion_entities_per_30_days
 
-    prices = pd.to_numeric(df[column], errors="coerce")
+    def within_budget(value: Any) -> bool:
+        entity_price = _parse_entity_price(value)
+        if entity_price.invalid:
+            return False
+        return entity_price.price is None or entity_price.price <= ceiling
+
     pre_filter = len(df)
-    df = df[df[column].isna() | (prices <= ceiling)]
+    df = df[df[_ENTITY_PRICE_COLUMN].apply(within_budget)]
     logger.debug(
         "price filter: %d/%d indexers within budget of %s GRT per billion entities/30d",
         len(df),
@@ -1096,19 +1202,16 @@ def _keep_within_entity_budget(
 
 def _filter_by_price(
     history: pd.DataFrame,
-    chain_id: Optional[str],
+    chain_id: str,
     max_grt_per_30_days: Optional[float],
     max_grt_per_billion_entities_per_30_days: Optional[float] = None,
 ) -> tuple[pd.DataFrame, str]:
-    """Drop indexers that lack DIP info, don't support the chain, lack a chain price,
-    exceed max_grt_per_30_days for the chain, or exceed the per-entity ceiling.
+    """Drop indexers that lack DIP info, don't support the chain, lack a chain price, exceed
+    max_grt_per_30_days for the chain, set an invalid per-entity price, or exceed the
+    per-entity ceiling.
 
-    Returns (filtered_df, reason). ``reason`` is empty unless filtering left
-    no candidates, in which case it explains why.
+    Returns (filtered_df, reason). ``reason`` says why if no candidates are left, else is empty.
     """
-    if chain_id is None:
-        return history, ""
-
     df = history.copy()
 
     # Only filter if we have the DIP info columns
@@ -1120,6 +1223,7 @@ def _filter_by_price(
         partial(_keep_supporting_chain, chain_id=chain_id),
         partial(_keep_with_chain_price, chain_id=chain_id),
         partial(_keep_within_budget, chain_id=chain_id, max_grt_per_30_days=max_grt_per_30_days),
+        _keep_with_valid_entity_price,
         partial(
             _keep_within_entity_budget,
             max_grt_per_billion_entities_per_30_days=max_grt_per_billion_entities_per_30_days,
@@ -1134,7 +1238,7 @@ def _filter_by_price(
 
 def _enrich_with_chain_prices(
     history: pd.DataFrame,
-    chain_id: Optional[str],
+    chain_id: str,
 ) -> pd.DataFrame:
     """
     Add base_price_per_epoch and price_per_entity columns for scoring.
@@ -1143,7 +1247,7 @@ def _enrich_with_chain_prices(
     """
     df = history.copy()
 
-    if chain_id is None or "dips_min_grt_per_30_days" not in df.columns:
+    if "dips_min_grt_per_30_days" not in df.columns:
         df["base_price_per_epoch"] = 0.0
         df["price_per_entity"] = 0.0
         return df
@@ -1157,10 +1261,17 @@ def _enrich_with_chain_prices(
 
     df["base_price_per_epoch"] = df["dips_min_grt_per_30_days"].apply(extract_price)
 
-    if "dips_min_grt_per_billion_entities_per_30_days" in df.columns:
-        df["price_per_entity"] = pd.to_numeric(
-            df["dips_min_grt_per_billion_entities_per_30_days"], errors="coerce"
-        ).fillna(0.0)
+    def entity_price_for_scoring(value: Any) -> float:
+        # A missing price scores as 0. An invalid one scores as NaN, which ranks worst.
+        entity_price = _parse_entity_price(value)
+        if entity_price.invalid:
+            return math.nan
+        return 0.0 if entity_price.price is None else entity_price.price
+
+    if _ENTITY_PRICE_COLUMN in df.columns:
+        df["price_per_entity"] = (
+            df[_ENTITY_PRICE_COLUMN].map(entity_price_for_scoring).astype(float)
+        )
     else:
         df["price_per_entity"] = 0.0
 
@@ -1168,15 +1279,16 @@ def _enrich_with_chain_prices(
 
 
 def _indexer_prices(
-    history: pd.DataFrame, idx_id: str, chain_id: Optional[str]
+    history: pd.DataFrame, idx_id: str, chain_id: str
 ) -> tuple[Optional[float], Optional[float]]:
     """Return (min_grt_per_30_days for the chain, min_grt_per_billion_entities_per_30_days)
     from the indexer's first row in ``history``.
 
-    Both are None without a chain_id or a row; either is None when its column is missing.
+    Both are None without a row; either is None when its column is missing. The
+    per-entity price is also None when the indexer set none or set an invalid one.
     """
     rows = history[history["indexer"] == idx_id]
-    if rows.empty or chain_id is None:
+    if rows.empty:
         return None, None
     row = rows.iloc[0]
 
@@ -1185,12 +1297,8 @@ def _indexer_prices(
         min_grt = _extract_chain_price(row["dips_min_grt_per_30_days"], chain_id)
 
     min_entity = None
-    if "dips_min_grt_per_billion_entities_per_30_days" in row.index:
-        val = row["dips_min_grt_per_billion_entities_per_30_days"]
-        try:
-            min_entity = float(val) if val is not None and pd.notna(val) else None
-        except (TypeError, ValueError):
-            min_entity = None
+    if _ENTITY_PRICE_COLUMN in row.index:
+        min_entity = _parse_entity_price(row[_ENTITY_PRICE_COLUMN]).price
 
     return min_grt, min_entity
 
@@ -1198,7 +1306,7 @@ def _indexer_prices(
 def _build_selected_indexers(
     indexer_ids: list[str],
     history: pd.DataFrame,
-    chain_id: Optional[str],
+    chain_id: str,
 ) -> list[SelectedIndexer]:
     """Build SelectedIndexer entries with pricing info."""
     results = []

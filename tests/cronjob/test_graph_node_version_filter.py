@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
-jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
+jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 from processing import (  # noqa: E402

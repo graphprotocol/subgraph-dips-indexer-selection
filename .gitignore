@@ -39,6 +39,7 @@ env/
 htmlcov/
 .tox/
 .nox/
+.hypothesis/
 
 # Type checking
 .mypy_cache/
