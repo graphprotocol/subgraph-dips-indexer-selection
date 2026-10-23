@@ -195,14 +195,17 @@ def _accepted_by_lenient_number_parsing(case: schemathesis.Case, status_code: in
     return False
 
 
-def _rejected_for_missing_score_columns(
-    case: schemathesis.Case, response: schemathesis.Response
-) -> bool:
-    """True when a scores push got the 422 that names the score columns it lacks."""
+def _rejected_by_push_checks(case: schemathesis.Case, response: schemathesis.Response) -> bool:
+    """True when a scores push got the 422 that names the score columns it lacks, or the
+    records whose indexer is not text.
+    """
     if (case.method, case.path, response.status_code) != ("POST", "/scores", 422):
         return False
-    errors = response.json()["detail"]
-    return len(errors) == 1 and errors[0]["type"] == "missing" and errors[0]["loc"] == ["body"]
+    return all(
+        (error["type"], error["loc"]) == ("missing", ["body"])
+        or (error["type"], error["loc"][::2]) == ("string_type", ["body", "indexer"])
+        for error in response.json()["detail"]
+    )
 
 
 def _known_gaps(case: schemathesis.Case, response: schemathesis.Response) -> list[CheckFunction]:
@@ -212,9 +215,10 @@ def _known_gaps(case: schemathesis.Case, response: schemathesis.Response) -> lis
     # routes on one path and it stops at the first. Only a custom 405 handler would fix that.
     if case.path == "/scores":
         excluded.append(allow_header_conformance)
-    # The push schema lists no required score columns, so a schema-valid record can lack one
-    # and get a 422. Listing them means settling which value types a push may carry.
-    if _rejected_for_missing_score_columns(case, response):
+    # The push schema lists no required score columns and no type for the indexer, so a
+    # schema-valid record can lack one or hold a number there and get a 422. Listing them
+    # means settling which value types a push may carry.
+    if _rejected_by_push_checks(case, response):
         excluded.append(positive_data_acceptance)
     # Accepting `"num_candidates": true` or `"max_grt_per_30_days": "4500"` follows pydantic's
     # lax mode. Making the request model strict would reject callers that send numbers as text.

@@ -8,10 +8,11 @@ filesystem). IISA reads that cache file on startup using DataManager.load_scores
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import pandas as pd
 
@@ -54,11 +55,15 @@ SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_score
 
 
 class ScoresPayloadError(ValueError):
-    """A pushed scores payload was missing required columns.
+    """A pushed scores payload was missing required columns or held an indexer that is not text.
 
     Separate type so the push endpoint can answer 422 (bad body) rather than
-    500 (service broke).
+    500 (service broke). ``errors`` lists each problem in the shape of FastAPI's 422 errors.
     """
+
+    def __init__(self, message: str, errors: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.errors = errors
 
 
 # Identity plus the quality/economic metrics the selector scores on. A push
@@ -77,6 +82,29 @@ REQUIRED_SCORE_COLUMNS: tuple[str, ...] = (
 def missing_required_columns(df: pd.DataFrame) -> list[str]:
     """Return the required columns absent from a pushed scores frame."""
     return [c for c in REQUIRED_SCORE_COLUMNS if c not in df.columns]
+
+
+def _check_indexers_are_text(df: pd.DataFrame) -> None:
+    """Raise ScoresPayloadError naming each record whose indexer is not text, since selection
+    can only match and return an indexer by its address. pandas reads a null or absent
+    indexer as NaN, so the error reports that input as null.
+    """
+    errors = [
+        {
+            "type": "string_type",
+            "loc": ("body", position, cols.INDEXER),
+            "msg": "Input should be a valid string",
+            "input": None if isinstance(indexer, float) and math.isnan(indexer) else indexer,
+        }
+        for position, indexer in enumerate(df[cols.INDEXER])
+        if not isinstance(indexer, str)
+    ]
+    if errors:
+        raise ScoresPayloadError(
+            f"pushed scores payload has {len(errors)} indexer(s) that are not text, "
+            f"first in record {errors[0]['loc'][1]}",
+            errors,
+        )
 
 
 class FileScoreLoader:
@@ -191,17 +219,19 @@ class DataManager:
     def transform_scores_df(self, scores_df: pd.DataFrame) -> pd.DataFrame:
         """Pure column-mapping transform, returned without touching state.
 
-        The push path dry-runs this first, so a payload with no rows (ValueError) or missing
+        The push path dry-runs this first, so a payload with no rows (ValueError), missing
         required columns (ScoresPayloadError, also for rows holding no fields, which pandas
-        calls empty) fails here with no side effects and can never poison the cache.
+        calls empty) or an indexer that is not text (ScoresPayloadError) fails here with no
+        side effects and can never poison the cache.
         """
         if len(scores_df.index) == 0:
             raise ValueError("transform_scores_df called with empty DataFrame")
         missing = missing_required_columns(scores_df)
         if missing:
-            raise ScoresPayloadError(
-                f"pushed scores payload missing required columns: {', '.join(missing)}"
-            )
+            message = f"pushed scores payload missing required columns: {', '.join(missing)}"
+            error = {"type": "missing", "loc": ("body",), "msg": message, "input": None}
+            raise ScoresPayloadError(message, [error])
+        _check_indexers_are_text(scores_df)
         return self._transform_scores_to_perf_history(scores_df)
 
     def commit_scores(

@@ -680,9 +680,7 @@ def push_scores(
     except ScoresPayloadError as e:
         # Wrong-shape body: the caller's problem, so a 422 in the error list every 422 carries.
         logger.warning("Rejected pushed scores: %s", e)
-        raise RequestValidationError(
-            [{"type": "missing", "loc": ("body",), "msg": str(e), "input": None}]
-        ) from e
+        raise RequestValidationError(e.errors) from e
     except Exception:
         logger.exception("Failed to accept pushed scores")
         raise HTTPException(status_code=500, detail="Failed to accept scores")

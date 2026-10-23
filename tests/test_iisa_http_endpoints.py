@@ -907,6 +907,31 @@ class TestPushScoresEndpoint:
         assert "indexer" in error["msg"]
         assert not scores_path.exists()
 
+    @pytest.mark.parametrize("indexer", [5, None, True, {"id": "0xDEF"}, ["0xDEF"]])
+    def test_push_scores_indexer_not_text_rejected(self, indexer, tmp_path, monkeypatch):
+        """An indexer that is not text is a 422 naming its record, since selection could
+        never return it, rather than an accepted push that breaks every later selection.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = self._sample_payload() + self._sample_payload()
+        payload[1]["indexer"] = indexer
+
+        response = client.post("/scores", json=payload)
+
+        assert response.status_code == 422
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body", 1, "indexer"]
+        assert error["type"] == "string_type"
+        assert error["input"] == indexer
+        assert not scores_path.exists()
+
     def test_push_scores_full_payload_accepted_end_to_end(self, tmp_path, monkeypatch):
         """A complete payload passes validation, writes disk, and returns the row count."""
         # Arrange — real DataManager, real transform, no mocks.
