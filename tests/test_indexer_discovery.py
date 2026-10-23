@@ -139,7 +139,7 @@ def _http_error(status):
     return response
 
 
-@pytest.mark.parametrize("status", [429, 500, 503])
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
 def test_retries_rate_limits_and_server_errors(no_retry_wait, status):
     page = _page([{"id": "0xaaa", "url": "https://indexer-a.example.com"}])
 
