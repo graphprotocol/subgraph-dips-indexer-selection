@@ -68,13 +68,13 @@ _TRANSIENT_ERRORS = (
 
 
 def is_retryable_subgraph_error(error: BaseException) -> bool:
-    """True for failures a retry can clear: _TRANSIENT_ERRORS, a 429 or 5xx reply, or a
+    """True for failures a retry can clear: _TRANSIENT_ERRORS, a 408, 429 or 5xx reply, or a
     SubgraphResponseError (the gateway reports a failing indexer as a GraphQL error).
     A rejected key, a wrong URL or a malformed one fails the same way every time.
     """
     if isinstance(error, requests.HTTPError):
         status = error.response.status_code if error.response is not None else None
-        return status is None or status == 429 or status >= 500
+        return status is None or status in (408, 429) or status >= 500
     if isinstance(error, SubgraphResponseError):
         return error.retryable
     return isinstance(error, _TRANSIENT_ERRORS)
@@ -85,7 +85,7 @@ def is_retryable_subgraph_error(error: BaseException) -> bool:
 retry_subgraph_read = retry(
     retry=retry_if_exception(is_retryable_subgraph_error),
     stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=2, max=60),
+    wait=wait_exponential(multiplier=2),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
