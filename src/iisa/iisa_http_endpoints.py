@@ -486,9 +486,9 @@ def _supports_chain(networks_json: Any, chain_id: str) -> bool:
 def _require_push_token(authorization: Optional[str]) -> None:
     """Validate the bearer token against IISA_PUSH_TOKEN.
 
-    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). Uses
-    hmac.compare_digest to dodge timing oracles. "Bearer" prefix matched
-    case-insensitively per RFC 6750 §2.1; the token itself is case-sensitive.
+    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). "Bearer" is
+    matched in any letter case per RFC 6750 §2.1, the token exactly. hmac.compare_digest
+    dodges timing oracles; it compares bytes, since it refuses text with non-ASCII letters.
     """
     expected = get_settings().push_token
     if not expected:
@@ -496,7 +496,7 @@ def _require_push_token(authorization: Optional[str]) -> None:
     if not authorization or authorization[:7].lower() != "bearer ":
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
     provided = authorization[7:].strip()
-    if not hmac.compare_digest(provided, expected):
+    if not hmac.compare_digest(provided.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 

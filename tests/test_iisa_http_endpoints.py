@@ -618,6 +618,24 @@ class TestPushScoresEndpoint:
         assert response.status_code == 401
         assert "Invalid" in response.json()["detail"]
 
+    @pytest.mark.parametrize("header", [b"Bearer \xe9", b"Bearer caf\xc3\xa9", b"bearer \xff\xfe"])
+    def test_push_scores_rejects_non_ascii_token(self, monkeypatch, header):
+        """A token with non-ASCII characters is a 401, not a 500 from the constant-time compare."""
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/scores", json=self._sample_payload(), headers={"Authorization": header}
+        )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid bearer token"
+
     @patch("iisa.iisa_http_endpoints.DataManager")
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
     def test_push_scores_transform_failure_does_not_touch_disk(
