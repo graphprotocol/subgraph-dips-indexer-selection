@@ -710,17 +710,21 @@ def _normalize_base_price_per_epoch(
     return 0.5
 
 
-def _normalize_price_per_entity(price_per_entity: pd.Series) -> Union[pd.Series, float]:
+def _normalize_price_per_entity(price_per_entity: pd.Series) -> pd.Series:
     """Normalize price per entity (lower is better).
 
-    price_ceiling applies to base epoch price; entity pricing uses
-    observed max since there is no separate budget field for it.
+    price_ceiling applies to base epoch price; entity pricing uses observed max since there is
+    no separate budget field for it. The service turns a missing price into 0 before this, so
+    a value that is not a finite number >= 0 is unreadable and gets 0, the worst score.
     """
-    prices = pd.to_numeric(price_per_entity, errors="coerce").fillna(0.0).clip(lower=0)
+    prices = pd.to_numeric(price_per_entity, errors="coerce").astype(float)
+    prices = prices.where(np.isfinite(prices) & (prices >= 0))
     ceiling = prices.max()
     if ceiling > 0 and ceiling > prices.min():
-        return cast(pd.Series, 1 - (prices / ceiling))
-    return 0.5
+        scores = 1 - (prices / ceiling)
+    else:
+        scores = pd.Series(0.5, index=prices.index)
+    return scores.where(prices.notna(), 0.0)
 
 
 def _normalize_generic(series: pd.Series) -> pd.Series:

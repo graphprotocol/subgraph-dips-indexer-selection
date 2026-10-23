@@ -2805,6 +2805,71 @@ class TestEnrichWithChainPrices:
         assert result.iloc[0]["base_price_per_epoch"] == 0.0
 
 
+class TestEntityPriceReadOneWay:
+    """The per-entity price ceiling, scoring and the price returned to dipper all read an
+    indexer's per-entity price the same way: missing, a finite number >= 0, or invalid.
+    """
+
+    COLUMN = "dips_min_grt_per_billion_entities_per_30_days"
+    INVALID = ["-5", -5.0, "inf", float("inf"), "1e400", "nan", "abc", "", True, [100]]
+    MISSING_OR_VALID = [
+        (None, None),
+        (float("nan"), None),
+        ("1500", 1500.0),
+        (1500, 1500.0),
+        ("1_000", 1000.0),
+        ("0", 0.0),
+    ]
+
+    def _history(self, entity_price):
+        return pd.DataFrame(
+            [
+                {
+                    "indexer": "0xa",
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 100.0}),
+                    self.COLUMN: entity_price,
+                }
+            ]
+        )
+
+    @pytest.mark.parametrize("entity_price", INVALID)
+    def test_invalid_price_fails_the_entity_ceiling(self, entity_price):
+        from iisa.iisa_http_endpoints import _keep_within_entity_budget
+
+        result, _ = _keep_within_entity_budget(self._history(entity_price), 2000.0)
+        assert result.empty
+
+    @pytest.mark.parametrize("entity_price", INVALID)
+    def test_invalid_price_is_not_scored_as_a_price(self, entity_price):
+        """Scored as NaN, which ranks worst, not as missing (0), which ranks cheapest."""
+        from iisa.iisa_http_endpoints import _enrich_with_chain_prices
+
+        result = _enrich_with_chain_prices(self._history(entity_price), "arb")
+        assert pd.isna(result.iloc[0]["price_per_entity"])
+
+    @pytest.mark.parametrize("entity_price", INVALID)
+    def test_invalid_price_is_not_returned_to_dipper(self, entity_price):
+        from iisa.iisa_http_endpoints import _indexer_prices
+
+        assert _indexer_prices(self._history(entity_price), "0xa", "arb") == (100.0, None)
+
+    @pytest.mark.parametrize("entity_price, price", MISSING_OR_VALID)
+    def test_missing_or_valid_price_reads_the_same_in_every_step(self, entity_price, price):
+        """A missing price passes any ceiling and scores as 0; it is returned to dipper as None."""
+        from iisa.iisa_http_endpoints import (
+            _enrich_with_chain_prices,
+            _indexer_prices,
+            _keep_within_entity_budget,
+        )
+
+        history = self._history(entity_price)
+        kept, _ = _keep_within_entity_budget(history, 2000.0)
+        assert list(kept["indexer"]) == ["0xa"]
+        scored = _enrich_with_chain_prices(history, "arb").iloc[0]["price_per_entity"]
+        assert scored == (0.0 if price is None else price)
+        assert _indexer_prices(history, "0xa", "arb") == (100.0, price)
+
+
 class TestSelectIndexersEndToEndPricing:
     """Integration test: /select-indexers must not return indexers with None pricing."""
 
