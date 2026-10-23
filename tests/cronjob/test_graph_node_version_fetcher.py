@@ -15,7 +15,7 @@ from pathlib import Path
 import aiohttp
 import pytest
 
-jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
+jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 from processing import _fetch_single_graph_node_version_async  # noqa: E402
