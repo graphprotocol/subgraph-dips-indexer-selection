@@ -8,8 +8,8 @@ updates:
       actions:
         patterns: ["*"]
 
-  # Service deps: pyproject.toml and uv.lock. "increase" raises each minimum to the new
-  # release, since the service image and CI install from pyproject, not the lock.
+  # Service deps: pyproject.toml and uv.lock. "increase" also raises each minimum, which
+  # changes pyproject.toml and so stops the service image reusing its cached install.
   - package-ecosystem: uv
     directory: /
     schedule:
