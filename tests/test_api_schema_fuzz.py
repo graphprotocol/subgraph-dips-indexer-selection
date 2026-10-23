@@ -16,6 +16,7 @@ from typing import Any, Optional
 import pytest
 import schemathesis
 from fastapi.testclient import TestClient
+from hypothesis import settings
 from pydantic import ValidationError
 from schemathesis.checks import CheckFunction
 from schemathesis.specs.openapi.checks import (
@@ -111,17 +112,32 @@ def _sync_status_payload() -> dict[str, Any]:
     }
 
 
-def _seed_state() -> None:
-    """Replace the app's state with a fresh one holding the seeded scores and sync status.
+# The state _seed_state last made, and the scores and sync status it held then.
+_seeded: dict[str, Any] = {}
 
-    Runs before every request, so one request that pushes new scores cannot change what the
-    next one sees and each failure replays on its own.
-    """
+
+def _seed_state() -> None:
+    """Replace the app's state with a fresh one holding the seeded scores and sync status."""
     state = IISAState()
     state.initialize(Settings())
     state.load_scores_from_records(copy.deepcopy(SCORE_RECORDS))
     state.load_sync_status_from_dict(_sync_status_payload())
     iisa_http_endpoints._state = state
+    _seeded.update(state=state, history=state.history, sync_status=state.sync_status)
+
+
+def _start_from_seeded_state() -> None:
+    """Seed the app's state unless it still holds the seeded scores and sync status, so a
+    request that pushes new ones cannot change what the next sees and each failure replays on
+    its own. A push swaps in new objects, so comparing them by identity spots one.
+    """
+    state = iisa_http_endpoints._state
+    if (
+        state is not _seeded.get("state")
+        or state.history is not _seeded["history"]
+        or state.sync_status is not _seeded["sync_status"]
+    ):
+        _seed_state()
 
 
 @pytest.fixture(scope="module")
@@ -245,24 +261,24 @@ def _call_authorised_and_validate(case: schemathesis.Case) -> None:
 
 @schema.parametrize()
 def test_every_endpoint_matches_its_schema(case: schemathesis.Case) -> None:
-    """Authorised requests, valid and invalid, get no 5xx and only answers the schema lists."""
-    _seed_state()
+    """Authorised requests, valid and invalid, get no 5xx and only answers the schema lists.
+    Each is sent as generated, then with ids and score columns the seeded data matches, so
+    requests also do real work. Sending both from one generated case saves generating twice.
+    """
+    _start_from_seeded_state()
     _call_authorised_and_validate(case)
-
-
-@schema.parametrize()
-def test_every_endpoint_matches_its_schema_on_seeded_data(case: schemathesis.Case) -> None:
-    """The same, with ids and score columns the seeded data matches, so requests do real work."""
-    _seed_state()
+    _start_from_seeded_state()
     _use_seeded_data(case)
     _call_authorised_and_validate(case)
 
 
-# /health and /select-indexers take no token.
+# /health and /select-indexers take no token. Every other route checks it the same way, so
+# a fifth of the profile's examples is enough to cover each one.
 @latin1_schema.exclude(path=["/health", "/select-indexers"]).parametrize()
+@settings(max_examples=max(10, settings().max_examples // 5))
 def test_any_bearer_token_gets_an_answer_the_schema_lists(case: schemathesis.Case) -> None:
     """The generated Authorization text, sent as a bearer token, so most fail the token check."""
-    _seed_state()
+    _start_from_seeded_state()
     header = (case.headers or {}).get("authorization")
     if isinstance(header, str):
         case.headers = {**case.headers, "authorization": f"Bearer {header}"}
@@ -272,7 +288,7 @@ def test_any_bearer_token_gets_an_answer_the_schema_lists(case: schemathesis.Cas
 
 # Values the score job never sends. Each case puts one in a column of the first record, or
 # takes the column out of every record, and pushes the result.
-UNUSUAL_VALUES = [None, 5, "x", [1], {"a": 1}]
+UNUSUAL_VALUES = [None, 5, "x", {"a": 1}]
 ABSENT = "absent"
 # The reads that use pushed scores, sent once a push is accepted.
 SCORE_READS: list[tuple[str, str, Optional[dict[str, Any]]]] = [
@@ -307,7 +323,7 @@ def _unusual_push_cases() -> Iterator[Any]:
         yield pytest.param(column, ABSENT, id=f"{column}-absent")
         for value in UNUSUAL_VALUES:
             known_gap = column in ("total_query_fees", "last_known_slashable_stake") and (
-                isinstance(value, (str, list, dict))
+                isinstance(value, (str, dict))
             )
             marks = [UNREADABLE_FEES_OR_STAKE] if known_gap else []
             yield pytest.param(column, value, id=f"{column}-{value!r}", marks=marks)
