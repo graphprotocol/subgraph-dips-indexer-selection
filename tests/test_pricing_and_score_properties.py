@@ -693,6 +693,44 @@ def test_selection_adds_only_eligible_indexers_to_any_existing_group(case):
     _assert_selection_scores(selector)
 
 
+# A member dipper already pays leaves the group only on its own data: blocklisted, or DIPs info
+# whose prices fail the rules. Without DIPs info it may stay, since a failed fetch looks the same.
+@given(case=selection_cases(existing_meets_rules=False))
+@example(
+    case=_example_case(
+        [_example_row(FIRST, "org-a"), _example_row(SECOND, "org-b")],
+        num_candidates=1,
+        existing_indexers=[FIRST],
+        blocklist=[FIRST],
+    )
+)
+def test_selection_never_returns_a_blocklisted_indexer_already_in_the_group(case):
+    selected, _ = _select(case)
+    assert not set(selected) & set(case.request.blocklist or [])
+
+
+@given(case=selection_cases(existing_meets_rules=False))
+@example(
+    case=_example_case(
+        [
+            _example_row(FIRST, "org-a", dips_min_grt_per_30_days=json.dumps({CHAIN: "abc"})),
+            _example_row(SECOND, "org-b"),
+        ],
+        unpriced=(FIRST,),
+        num_candidates=1,
+        existing_indexers=[FIRST],
+    )
+)
+def test_selection_never_returns_a_member_whose_own_prices_fail(case):
+    request = case.request
+    selected, _ = _select(case)
+    for indexer in selected:
+        truth = case.truths[indexer]
+        assert not truth.available or truth.passes(
+            request.max_grt_per_30_days, request.max_grt_per_billion_entities_per_30_days
+        ), f"selected {indexer} despite an invalid or over-ceiling price"
+
+
 # Properties that do not hold yet: each needs a decision, so each is a strict xfail with a
 # hand-written example that fails today. Remove the xfail once the behaviour is settled. Each
 # names the error it expects, so a new crash still fails the run.
@@ -714,54 +752,6 @@ def test_selection_adds_only_eligible_indexers_to_any_existing_group(case):
 def test_selection_never_returns_more_than_asked_when_the_group_is_too_big(case):
     selected, _ = _select(case)
     assert len(selected) <= case.request.num_candidates
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="An indexer already in the group stays selected when the request blocklists it. "
-    "Dropping it makes dipper cancel its live agreement, which needs a decision.",
-)
-@given(case=selection_cases(existing_meets_rules=False))
-@example(
-    case=_example_case(
-        [_example_row(FIRST, "org-a"), _example_row(SECOND, "org-b")],
-        num_candidates=1,
-        existing_indexers=[FIRST],
-        blocklist=[FIRST],
-    )
-)
-def test_selection_never_returns_a_blocklisted_indexer_already_in_the_group(case):
-    selected, _ = _select(case)
-    assert not set(selected) & set(case.request.blocklist or [])
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="An indexer already in the group stays selected when the price filter drops it, "
-    "even for an invalid price. Dropping it makes dipper cancel its live agreement, which "
-    "needs a decision.",
-)
-@given(case=selection_cases(existing_meets_rules=False))
-@example(
-    case=_example_case(
-        [
-            _example_row(FIRST, "org-a", dips_min_grt_per_30_days=json.dumps({CHAIN: "abc"})),
-            _example_row(SECOND, "org-b"),
-        ],
-        unpriced=(FIRST,),
-        num_candidates=1,
-        existing_indexers=[FIRST],
-    )
-)
-def test_selection_never_returns_an_invalid_price_already_in_the_group(case):
-    request = case.request
-    selected, _ = _select(case)
-    for indexer in selected:
-        assert case.truths[indexer].passes(
-            request.max_grt_per_30_days, request.max_grt_per_billion_entities_per_30_days
-        ), f"selected {indexer} despite an invalid or over-ceiling price"
 
 
 @pytest.mark.xfail(
