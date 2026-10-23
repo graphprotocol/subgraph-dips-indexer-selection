@@ -18,6 +18,7 @@ Endpoints:
 import hmac
 import json
 import logging
+import math
 import os
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
@@ -26,7 +27,10 @@ from functools import lru_cache, partial
 from typing import Any, Optional, cast
 
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -107,7 +111,9 @@ class SelectionRequest(BaseModel):
     blocklist: Optional[list[str]] = None
     declined_indexers: Optional[dict[str, list[str]]] = None
     chain_id: Optional[str] = None  # e.g., "arbitrum-one"
-    max_grt_per_30_days: Optional[float] = None  # e.g., 4500.0
+    max_grt_per_30_days: Optional[float] = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )  # e.g., 4500.0
     max_grt_per_billion_entities_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
     )  # e.g., 2000.0
@@ -562,6 +568,26 @@ app = FastAPI(
 )
 
 
+def _json_safe(value: Any) -> Any:
+    """Replace NaN and infinite floats, at any depth, with their text form."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's own 422 echoes the rejected input, and a NaN or infinite float there
+    can't be written as JSON, which turns the 422 into a 500.
+    """
+    errors = _json_safe(jsonable_encoder(exc.errors()))
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
 # =============================================================================
 # Endpoints
 # =============================================================================
@@ -777,7 +803,7 @@ def scores_weighted(
 @app.get("/dips-indexers", response_model=DipsIndexersResponse)
 def dips_indexers(
     chain: str,
-    max_grt_per_30_days: Optional[float] = None,
+    max_grt_per_30_days: Optional[float] = Query(default=None, ge=0, allow_inf_nan=False),
     max_grt_per_billion_entities_per_30_days: Optional[float] = Query(
         default=None, ge=0, allow_inf_nan=False
     ),
