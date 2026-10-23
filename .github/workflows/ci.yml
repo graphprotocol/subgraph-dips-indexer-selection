@@ -1,6 +1,5 @@
-# confluent-kafka, base58, and protobuf are installed alongside the dev extras
-# because the cronjob tests import them but they aren't declared as dev deps in
-# pyproject.toml (they live in the cronjob Dockerfile).
+# The cronjob's requirements.txt is installed alongside the dev extras so its tests
+# run against the same version ranges the cronjob image installs.
 name: CI
 
 on:
@@ -26,7 +25,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -e ".[dev]" confluent-kafka base58 protobuf
+        run: pip install -e ".[dev]" -r cronjobs/compute_scores/requirements.txt
 
       - name: Lint
         run: ruff check src/ tests/ cronjobs/compute_scores/
