@@ -55,6 +55,8 @@ INDEXER_IDS = [f"0x{number:040x}" for number in range(1, 9)]
 NORM_COLUMNS = [f"norm_{metric}" for metric in DEFAULT_WEIGHTS]
 # Deep enough to exhaust the JSON decoder's recursion limit.
 DEEPLY_NESTED = "[" * 2_000 + "]" * 2_000
+# An integer longer than Python reads from text by default (4,300 digits).
+TOO_MANY_DIGITS = "[" + "1" * 5_000 + "]"
 
 
 def _reads_as_float(text: str) -> bool:
@@ -91,7 +93,8 @@ malformed_price_cells = st.sampled_from(
     + [None, math.nan, 5.0, {CHAIN: 5.0}]
 )
 malformed_network_cells = st.sampled_from(
-    ["not json", "", "[", "null", "5", f'"{CHAIN}"', json.dumps({CHAIN: True}), DEEPLY_NESTED]
+    ["not json", "", "[", "null", "5", f'"{CHAIN}"', json.dumps({CHAIN: True})]
+    + [DEEPLY_NESTED, TOO_MANY_DIGITS]
     + [None, math.nan, [CHAIN]]
 )
 
@@ -256,6 +259,8 @@ def _assert_unit_interval(values: Any, *, allow_nan: bool = False) -> None:
 # Valid JSON that is not an object raised AttributeError, failing selection with a 500.
 @example(cell_and_price=("null", None))
 @example(cell_and_price=("[1, 2]", None))
+# JSON nested deeper than the decoder can follow raised RecursionError, failing selection.
+@example(cell_and_price=(DEEPLY_NESTED, None))
 def test_chain_price_reads_as_a_usable_number_or_none(cell_and_price):
     cell, expected = cell_and_price
     price = _extract_chain_price(cell, CHAIN)
@@ -270,6 +275,9 @@ def test_entity_price_reads_as_missing_usable_or_invalid(cell_and_truth):
 
 
 @given(cell_and_supports=network_cells())
+# The decoder's RecursionError and its ValueError for a very long integer failed selection.
+@example(cell_and_supports=(DEEPLY_NESTED, False))
+@example(cell_and_supports=(TOO_MANY_DIGITS, False))
 def test_supported_networks_never_fail_to_read(cell_and_supports):
     cell, supports = cell_and_supports
     assert _supports_chain(cell, CHAIN) is supports
