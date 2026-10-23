@@ -91,13 +91,53 @@ def test_raises_when_every_attempt_fails(no_retry_wait):
     assert post.call_count == 5
 
 
-def test_raises_on_graphql_errors(no_retry_wait):
+def test_retries_graphql_errors(no_retry_wait):
+    """The gateway reports an indexer that failed to serve the query as a GraphQL error."""
     response = MagicMock()
     response.json.return_value = {"errors": [{"message": "indexer unavailable"}]}
 
-    with patch("subgraph.requests.post", return_value=response):
+    with patch("subgraph.requests.post", return_value=response) as post:
         with pytest.raises(RuntimeError, match="GraphQL errors"):
             discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 5
+
+
+def _http_error(status):
+    response = MagicMock()
+    response.status_code = status
+    response.raise_for_status.side_effect = requests.HTTPError(f"{status} Error", response=response)
+    return response
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_retries_rate_limits_and_server_errors(no_retry_wait, status):
+    page = _page([{"id": "0xaaa", "url": "https://indexer-a.example.com"}])
+
+    with patch("subgraph.requests.post", side_effect=[_http_error(status), page]) as post:
+        result = discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 2
+    assert result == {"0xaaa": "https://indexer-a.example.com"}
+
+
+@pytest.mark.parametrize(
+    "post_kwargs",
+    [
+        {"return_value": _http_error(401)},
+        {"return_value": _http_error(403)},
+        {"return_value": _http_error(404)},
+        {"side_effect": requests.exceptions.MissingSchema("No scheme supplied")},
+        {"side_effect": requests.exceptions.InvalidURL("Invalid URL")},
+    ],
+    ids=["401_rejected_key", "403_forbidden", "404_wrong_url", "missing_scheme", "invalid_url"],
+)
+def test_does_not_retry_errors_that_cannot_clear(no_retry_wait, post_kwargs):
+    with patch("subgraph.requests.post", **post_kwargs) as post:
+        with pytest.raises(requests.RequestException):
+            discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 1
 
 
 def test_raises_when_no_indexer_has_a_url(no_retry_wait):

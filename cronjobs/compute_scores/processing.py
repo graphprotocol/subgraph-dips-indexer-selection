@@ -22,7 +22,6 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
-import requests
 from numpy.linalg import pinv
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
@@ -30,11 +29,15 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from subgraph import paginate_subgraph_query
+from subgraph import (
+    SubgraphResponseError,
+    is_retryable_subgraph_error,
+    paginate_subgraph_query,
+)
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -218,8 +221,7 @@ query($first: Int!, $lastId: String!) {
 
 
 @retry(
-    # RuntimeError covers GraphQL errors and an answer that lists no indexers.
-    retry=retry_if_exception_type((requests.RequestException, RuntimeError)),
+    retry=retry_if_exception(is_retryable_subgraph_error),
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=2, max=60),
     before_sleep=before_sleep_log(logger, logging.WARNING),
@@ -234,7 +236,8 @@ def _query_indexer_urls(network_subgraph_url: str) -> Dict[str, str]:
         indexer["id"]: indexer["url"] for indexer in raw_indexers if indexer.get("url", "")
     }
     if not indexer_urls:
-        raise RuntimeError("network subgraph returned no indexers with a URL")
+        # Retried: the gateway may have served the query from an indexer that is behind.
+        raise SubgraphResponseError("network subgraph returned no indexers with a URL")
     return indexer_urls
 
 

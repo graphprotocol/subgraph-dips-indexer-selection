@@ -26,33 +26,32 @@ def redact_url(text: str) -> str:
     return _GATEWAY_API_KEY.sub(r"\1<redacted>", text)
 
 
+class SubgraphResponseError(RuntimeError):
+    """The subgraph answered, but with GraphQL errors or without the data asked for."""
+
+
+def is_retryable_subgraph_error(error: BaseException) -> bool:
+    """True for failures a retry can clear: no connection, a timeout, a 429 or 5xx reply, or
+    a SubgraphResponseError (the gateway reports a failing indexer as a GraphQL error).
+    A rejected key, a wrong URL or a malformed one fails the same way every time.
+    """
+    if isinstance(error, requests.HTTPError):
+        status = error.response.status_code if error.response is not None else None
+        return status is None or status == 429 or status >= 500
+    return isinstance(error, (requests.ConnectionError, requests.Timeout, SubgraphResponseError))
+
+
 def paginate_subgraph_query(
     url: str,
     query: str,
     entity: str = "indexers",
     page_size: int = 1000,
 ) -> List[dict]:
-    """Paginate a Graph Network subgraph query using id_gt cursor advancement.
+    """Return every ``entity`` across pages, paging on an ``id_gt`` cursor until a short page.
 
-    The query string must use ``$first`` (Int!) and ``$lastId`` (String!)
-    variables, and order results by ``id``.  The function fetches pages until
-    either an empty page is returned or a page smaller than ``page_size``
-    indicates there are no more results.
-
-    Raises ``RuntimeError`` on GraphQL-level errors (``"errors"`` key in
-    response).  HTTP and connection errors from ``requests`` propagate with
-    their original type, and any API key masked in the message, so the caller
-    can decide on retry/fallback policy.
-
-    Args:
-        url: Subgraph endpoint URL.
-        query: GraphQL query string with $first and $lastId variables.
-        entity: Top-level field name inside ``data`` to extract results from.
-        page_size: Number of entities per page (default 1000, the subgraph
-            maximum).
-
-    Returns:
-        Flat list of entity dicts across all pages.
+    ``query`` must take ``$first`` (Int!) and ``$lastId`` (String!) and order by ``id``.
+    Raises SubgraphResponseError on GraphQL errors; ``requests`` errors keep their type,
+    with any API key masked, so callers can choose what to retry.
     """
     last_id = ""
     all_entities: List[dict] = []
@@ -83,7 +82,7 @@ def paginate_subgraph_query(
         data = response.json()
 
         if "errors" in data:
-            raise RuntimeError(f"GraphQL errors: {data['errors']}")
+            raise SubgraphResponseError(f"GraphQL errors: {data['errors']}")
 
         page = data.get("data", {}).get(entity, [])
         elapsed = time.monotonic() - t0
