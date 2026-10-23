@@ -1529,17 +1529,19 @@ class TestRunScoringPushFailure:
 class TestValidateConfigurationIISAURL:
     """validate_configuration() must fail fast when IISA_API_URL is unset."""
 
-    def test_missing_iisa_api_url_raises_configuration_error(self, monkeypatch):
-        # Arrange — satisfy the Redpanda settings so only IISA_API_URL trips.
+    def test_missing_iisa_api_url_raises_configuration_error(self, monkeypatch, caplog):
+        # Arrange — satisfy the other settings so only IISA_API_URL trips.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
         monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x")
         monkeypatch.setattr(main, "IISA_API_URL", "")
 
         # Act / Assert
-        with pytest.raises(main.ConfigurationError) as exc_info:
-            main.validate_configuration()
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError, match="Found 1 configuration error"):
+                main.validate_configuration()
 
-        assert "configuration error" in str(exc_info.value).lower()
+        assert "IISA_API_URL is required" in caplog.text
 
     def test_present_iisa_api_url_passes(self, monkeypatch):
         # Arrange — all required config set.
@@ -1625,6 +1627,7 @@ class TestValidateConfigurationRedpandaTopic:
         # Arrange — everything else valid, so only the topic trips.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
         monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x")
         if topic is None:
             monkeypatch.delenv("REDPANDA_TOPIC", raising=False)
         else:
@@ -1632,7 +1635,7 @@ class TestValidateConfigurationRedpandaTopic:
 
         # Act / Assert
         with caplog.at_level("ERROR", logger=main.logger.name):
-            with pytest.raises(main.ConfigurationError):
+            with pytest.raises(main.ConfigurationError, match="Found 1 configuration error"):
                 main.validate_configuration()
 
         assert "REDPANDA_TOPIC is required" in caplog.text
