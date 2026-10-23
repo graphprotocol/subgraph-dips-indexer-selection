@@ -17,6 +17,7 @@ from typing import Any, Optional, Tuple
 import pandas as pd
 
 from . import score_columns as cols
+from .indexer_selection import read_metric
 
 __all__ = [
     "FileScoreLoader",
@@ -297,7 +298,8 @@ class DataManager:
         df = df.rename(columns=cols.CRONJOB_TO_SELECTOR_RENAME)
 
         if cols.UPTIME_SCORE in df.columns:
-            df[cols.SEL_UPTIME_PERCENT] = df[cols.UPTIME_SCORE] * 100
+            uptime, _ = read_metric(df, cols.UPTIME_SCORE)
+            df[cols.SEL_UPTIME_PERCENT] = uptime * 100
 
         missing_location = [c for c in (cols.DST_LAT, cols.DST_LON) if c not in df.columns]
         if missing_location:

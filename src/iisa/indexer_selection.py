@@ -16,6 +16,7 @@ from .score_columns import SEL_LATENCY_CI
 
 __all__ = [
     "IndexerSelector",
+    "read_metric",
     "DeploymentId",
     "IndexerId",
     "IpfsHashStr",
@@ -692,7 +693,7 @@ def _normalize_column(
     """Normalise one metric column after reading it as numbers. An unreadable value scores 0
     and is left out of the normalisation, so it cannot move any other indexer's score.
     """
-    numbers, unreadable = _read_metric(merged, column)
+    numbers, unreadable = read_metric(merged, column)
     readable = ~unreadable.to_numpy()
     scores = np.zeros(len(merged))
     scores[readable] = normalize(numbers[readable])
@@ -703,14 +704,14 @@ def _carried_scores(merged: pd.DataFrame, column: str) -> pd.Series:
     """Read a norm_ column the input already carries. A value that is not a finite number in
     [0, 1] scores 0, so a corrupt pushed score cannot outrank every other indexer.
     """
-    numbers, unreadable = _read_metric(merged, column)
+    numbers, unreadable = read_metric(merged, column)
     outside = numbers.notna() & ~numbers.between(0, 1)
     if outside.any():
         _warn_scored_as_zero(merged, column, outside, "fall outside [0, 1]")
     return numbers.mask(unreadable | outside, 0.0)
 
 
-def _read_metric(merged: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
+def read_metric(merged: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
     """Return (numbers, unreadable) for a metric column read as floats.
 
     None and NaN stay NaN, as missing. Any other value that does not read as a

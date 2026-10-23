@@ -932,6 +932,27 @@ class TestPushScoresEndpoint:
         assert error["input"] == indexer
         assert not scores_path.exists()
 
+    @pytest.mark.parametrize("uptime", [{}, {"a": 1}, [1], "x"])
+    def test_push_with_unreadable_uptime_accepted(self, uptime, tmp_path, monkeypatch):
+        """An uptime that is not a number scores 0, like any unreadable metric, rather than
+        failing the push with a 500 that the score job would retry for minutes.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = self._sample_payload()
+        payload[0]["uptime_score"] = uptime
+
+        response = client.post("/scores", json=payload)
+
+        assert response.status_code == 200
+        weighted = client.get("/scores/weighted").json()["scores"]
+        assert weighted[0]["components"]["uptime"] == 0.0
+
     @pytest.mark.parametrize("dropped", [["org"], ["dst_lat"], ["dst_lon", "org"]])
     def test_push_without_org_or_location_can_be_served(self, dropped, tmp_path, monkeypatch):
         """A push lacking the org or location columns still serves a selection of 2, with

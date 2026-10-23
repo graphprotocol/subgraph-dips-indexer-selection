@@ -95,6 +95,20 @@ class TestDataManager:
         assert data["% up_x"].iloc[1] == pytest.approx(95.0)
         assert data["% up_x"].iloc[2] == pytest.approx(99.0)
 
+    def test_transform_reads_uptime_as_a_number_before_scaling(self, mock_scores_df, caplog):
+        """An uptime that does not read as a number becomes missing, so it scores 0, and is
+        logged, rather than failing the push (an object) or repeating as text (a string).
+        """
+        data_manager = DataManager(MagicMock())
+        mock_scores_df["uptime_score"] = pd.Series([{"a": 1}, "x", "0.5"], dtype=object)
+
+        with caplog.at_level(logging.WARNING, logger="iisa.indexer_selection"):
+            data = data_manager.transform_scores_df(mock_scores_df)
+
+        assert data["% up_x"].tolist()[2] == pytest.approx(50.0)
+        assert data["% up_x"].iloc[:2].isna().all()
+        assert any("'uptime_score'" in r.getMessage() for r in caplog.records)
+
     def test_load_scores_destination_loc_creation(self, mock_provider_with_scores):
         """Test that destination_loc is created from lat/lon."""
         data_manager = DataManager(mock_provider_with_scores)
