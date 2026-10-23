@@ -444,6 +444,43 @@ def test_normalised_metrics_are_finite_and_within_unit_range(table):
         _assert_unit_interval(normalized[column])
 
 
+# Each raw metric column and the score _normalize_metrics derives from it.
+RAW_TO_NORM = {
+    SEL_LATENCY_CI: "norm_lat_lin_reg_coefficient",
+    "% up_x": "norm_uptime_score",
+    "stake_to_fees": "norm_stake_to_fees",
+    "average_status": "norm_success_rate",
+    "base_price_per_epoch": "norm_base_price_per_epoch",
+    "price_per_entity": "norm_price_per_entity",
+}
+raw_values = st.one_of(st.floats(min_value=0, max_value=100), any_floats, st.none())
+
+
+def _scores(column: str, values: list[Any]) -> np.ndarray:
+    """The norm_ scores _normalize_metrics gives a table holding only this metric column."""
+    table = pd.DataFrame({"indexer": INDEXER_IDS[: len(values)], column: values})
+    return _normalize_metrics(table)[RAW_TO_NORM[column]].to_numpy(dtype=float)
+
+
+@pytest.mark.parametrize("column", list(RAW_TO_NORM))
+@given(
+    values=st.lists(raw_values, min_size=1, max_size=len(INDEXER_IDS) - 1),
+    position=st.integers(min_value=0, max_value=len(INDEXER_IDS) - 1),
+    bad=unreadable_values,
+)
+# The unreadable value was normalised as missing first: stake_to_fees filled it in as a best
+# value above the max, and base price as a free price, which moved every other score.
+@example(values=[0.5, 2.0], position=2, bad="abc")
+@example(values=[100.0, 100.0], position=2, bad="abc")
+def test_an_unreadable_value_scores_0_and_leaves_other_scores_unchanged(
+    column, values, position, bad
+):
+    position = min(position, len(values))
+    scores = list(_scores(column, [*values[:position], bad, *values[position:]]))
+    assert scores.pop(position) == 0
+    np.testing.assert_array_equal(scores, _scores(column, values))
+
+
 norm_values = st.one_of(st.floats(min_value=0, max_value=1), st.just(math.nan))
 weights = st.one_of(
     st.just(dict(DEFAULT_WEIGHTS)),

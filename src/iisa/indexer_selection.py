@@ -682,12 +682,14 @@ def _normalize_column(
     column: str,
     normalize: Callable[[pd.Series], Union[pd.Series, float]],
 ) -> pd.Series:
-    """Normalise one metric column after reading it as numbers; unreadable values score 0."""
+    """Normalise one metric column after reading it as numbers. An unreadable value scores 0
+    and is left out of the normalisation, so it cannot move any other indexer's score.
+    """
     numbers, unreadable = _read_metric(merged, column)
-    scores = normalize(numbers)
-    if not isinstance(scores, pd.Series):
-        scores = pd.Series(scores, index=merged.index)
-    return scores.mask(unreadable, 0.0)
+    readable = ~unreadable.to_numpy()
+    scores = np.zeros(len(merged))
+    scores[readable] = normalize(numbers[readable])
+    return pd.Series(scores, index=merged.index)
 
 
 def _carried_scores(merged: pd.DataFrame, column: str) -> pd.Series:
