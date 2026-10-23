@@ -9,9 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy package configuration and install dependencies
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
+COPY --from=ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a /uv /bin/uv
+
+# Install exactly the versions in uv.lock, the ones CI tests and the OSV scan checks, into
+# /app/.venv with the image's own Python. Dev tools are an extra, so they stay out.
+ENV UV_PYTHON_DOWNLOADS=never UV_COMPILE_BYTECODE=1 PATH="/app/.venv/bin:$PATH"
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-install-project --no-cache
 
 # Copy source code
 COPY src/ ./src/
