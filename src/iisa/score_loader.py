@@ -110,6 +110,19 @@ def _check_indexers_are_text(df: pd.DataFrame) -> None:
     )
 
 
+def _warn_column_missing(columns: list[str], what: str) -> None:
+    """Log that the scores lack ``columns``, so selection counts every indexer as sharing one
+    unknown ``what`` and cannot spread a group across them.
+    """
+    logger.warning(
+        "Scores have no %s column(s): every indexer counts as 1 unknown %s, so selection "
+        "cannot spread a group across %ss",
+        ", ".join(repr(c) for c in columns),
+        what,
+        what,
+    )
+
+
 class FileScoreLoader:
     """
     Reads pre-computed indexer scores from the IISA service's own cache file.
@@ -220,12 +233,10 @@ class DataManager:
         return True
 
     def transform_scores_df(self, scores_df: pd.DataFrame) -> pd.DataFrame:
-        """Pure column-mapping transform, returned without touching state.
-
-        The push path dry-runs this first, so a payload with no rows (ValueError), missing
-        required columns (ScoresPayloadError, also for rows holding no fields, which pandas
-        calls empty) or an indexer that is not text (ScoresPayloadError) fails here with no
-        side effects and can never poison the cache.
+        """Pure column-mapping transform, returned without touching state. The push path
+        dry-runs this first, so a payload with no rows (ValueError), missing required columns
+        (ScoresPayloadError, also for rows holding no fields, which pandas calls empty) or an
+        indexer that is not text (ScoresPayloadError) fails here and can never poison the cache.
         """
         if len(scores_df.index) == 0:
             raise ValueError("transform_scores_df called with empty DataFrame")
@@ -276,9 +287,10 @@ class DataManager:
     def _transform_scores_to_perf_history(self, scores_df: pd.DataFrame) -> pd.DataFrame:
         """Rename CronJob score columns to the names IndexerSelector expects.
 
-        Maps lat_coefficient_upper_bound -> latency-CI column, success_rate ->
-        average_status, lat_normalized_score -> norm_lat_lin_reg_coefficient,
-        uptime_score (x100) -> "% up_x", and dst_lat/dst_lon -> destination_loc.
+        Maps lat_coefficient_upper_bound -> latency-CI column, success_rate -> average_status,
+        lat_normalized_score -> norm_lat_lin_reg_coefficient, uptime_score (x100) -> "% up_x",
+        and dst_lat/dst_lon -> destination_loc. A missing location or org goes in empty, since
+        selection reads both.
         """
         df = scores_df.copy()
 
@@ -287,12 +299,19 @@ class DataManager:
         if cols.UPTIME_SCORE in df.columns:
             df[cols.SEL_UPTIME_PERCENT] = df[cols.UPTIME_SCORE] * 100
 
-        if cols.DST_LAT in df.columns and cols.DST_LON in df.columns:
+        missing_location = [c for c in (cols.DST_LAT, cols.DST_LON) if c not in df.columns]
+        if missing_location:
+            _warn_column_missing(missing_location, "location")
+            df[cols.SEL_DESTINATION_LOC] = None
+        else:
             df[cols.SEL_DESTINATION_LOC] = (
                 df[cols.DST_LAT].fillna(0).astype(str)
                 + ","
                 + df[cols.DST_LON].fillna(0).astype(str)
             )
+        if cols.ORG not in df.columns:
+            _warn_column_missing([cols.ORG], "org")
+            df[cols.ORG] = None
 
         return df
 

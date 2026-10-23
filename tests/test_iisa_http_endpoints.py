@@ -932,6 +932,43 @@ class TestPushScoresEndpoint:
         assert error["input"] == indexer
         assert not scores_path.exists()
 
+    @pytest.mark.parametrize("dropped", [["org"], ["dst_lat"], ["dst_lon", "org"]])
+    def test_push_without_org_or_location_can_be_served(self, dropped, tmp_path, monkeypatch):
+        """A push lacking the org or location columns still serves a selection of 2, with
+        every indexer counted as 1 unknown org or location, rather than answering 500.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = []
+        for indexer in ("0xabc", "0xdef"):
+            record = {
+                **self._sample_payload()[0],
+                "indexer": indexer,
+                "org": f"org of {indexer}",
+                "dst_lat": 52.4,
+                "dst_lon": 4.9,
+                "dips_info_available": True,
+                "dips_min_grt_per_30_days": '{"arbitrum-one": "1"}',
+                "dips_supported_networks": '["arbitrum-one"]',
+            }
+            for column in dropped:
+                del record[column]
+            payload.append(record)
+        assert client.post("/scores", json=payload).status_code == 200
+
+        response = client.post(
+            "/select-indexers",
+            json={"deployment_id": "Qm", "num_candidates": 2, "chain_id": "arbitrum-one"},
+        )
+
+        assert response.status_code == 200
+        assert sorted(i["id"] for i in response.json()["indexers"]) == ["0xabc", "0xdef"]
+
     def test_push_scores_full_payload_accepted_end_to_end(self, tmp_path, monkeypatch):
         """A complete payload passes validation, writes disk, and returns the row count."""
         # Arrange — real DataManager, real transform, no mocks.
