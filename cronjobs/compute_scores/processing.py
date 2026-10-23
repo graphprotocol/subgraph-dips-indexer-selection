@@ -300,6 +300,17 @@ def _unavailable_dips_info(indexer: str) -> dict:
 def _dips_info_record(indexer: str, data: dict) -> dict:
     """Turn one indexer's /dips/info response into the row stored for it."""
     min_prices, min_entity_price = _extract_dips_prices(data)
+    if min_entity_price is not None and not _is_valid_price(min_entity_price):
+        # A missing per-entity price means the indexer accepts any price: it passes every ceiling
+        # and is offered 0. Dropping only the bad value would reward it, so the whole response is
+        # treated as unusable instead.
+        logger.warning(
+            "Ignoring DIPs info from indexer %s: invalid per-entity price %r",
+            indexer,
+            min_entity_price,
+        )
+        return _unavailable_dips_info(indexer)
+
     chain_prices = _valid_chain_prices(indexer, min_prices) if isinstance(min_prices, dict) else {}
     supported_networks = data.get("supported_networks", [])
     # If supported_networks not explicitly provided, infer from the valid price keys

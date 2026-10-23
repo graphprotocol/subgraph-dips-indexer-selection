@@ -213,3 +213,42 @@ def test_finite_non_negative_base_price_is_kept(good_price, caplog):
     assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": good_price}
     assert json.loads(record["dips_supported_networks"]) == ["arbitrum-one"]
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize("bad_price", INVALID_PRICES)
+def test_invalid_per_entity_price_makes_dips_info_unusable(bad_price, caplog):
+    # A missing per-entity price means "accepts any price", so a bad value must not become one.
+    body = {
+        "min_grt_per_30_days": {"arbitrum-one": "450"},
+        "min_grt_per_billion_entities_per_30_days": bad_price,
+        "supported_networks": ["arbitrum-one"],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="processing"):
+        record = _fetch_record(body)
+
+    assert record == {
+        "indexer": "0xindexer",
+        "dips_info_available": False,
+        "dips_min_grt_per_30_days": "{}",
+        "dips_min_grt_per_billion_entities_per_30_days": None,
+        "dips_supported_networks": "[]",
+    }
+    warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "0xindexer" in warning and repr(bad_price) in warning
+
+
+@pytest.mark.parametrize(
+    ("entity_price", "stored"), [(None, None), ("0", "0"), (200, "200"), ("2.5", "2.5")]
+)
+def test_missing_or_valid_per_entity_price_keeps_dips_info(entity_price, stored):
+    body = {
+        "min_grt_per_30_days": {"arbitrum-one": "450"},
+        "min_grt_per_billion_entities_per_30_days": entity_price,
+    }
+
+    record = _fetch_record(body)
+
+    assert record["dips_info_available"] is True
+    assert record["dips_min_grt_per_billion_entities_per_30_days"] == stored
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": "450"}
