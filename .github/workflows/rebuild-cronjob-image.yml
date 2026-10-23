@@ -14,6 +14,13 @@ on:
   workflow_dispatch:
     # Allow manual trigger
 
+# Two runs at once on the same main commit would race to push the same manifest update branch,
+# so a new run waits for the one in progress. GitHub keeps only the newest waiting run, which is
+# safe because pushes and the weekly schedule both build the latest main.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/subgraph-dips-indexer-selection-cronjob
