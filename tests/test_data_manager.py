@@ -1,6 +1,7 @@
 """Tests for the DataManager class."""
 
 import dataclasses
+import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
@@ -94,6 +95,20 @@ class TestDataManager:
         assert data["% up_x"].iloc[1] == pytest.approx(95.0)
         assert data["% up_x"].iloc[2] == pytest.approx(99.0)
 
+    def test_transform_reads_uptime_as_a_number_before_scaling(self, mock_scores_df, caplog):
+        """An uptime that does not read as a number becomes missing, so it scores 0, and is
+        logged, rather than failing the push (an object) or repeating as text (a string).
+        """
+        data_manager = DataManager(MagicMock())
+        mock_scores_df["uptime_score"] = pd.Series([{"a": 1}, "x", "0.5"], dtype=object)
+
+        with caplog.at_level(logging.WARNING, logger="iisa.indexer_selection"):
+            data = data_manager.transform_scores_df(mock_scores_df)
+
+        assert data["% up_x"].tolist()[2] == pytest.approx(50.0)
+        assert data["% up_x"].iloc[:2].isna().all()
+        assert any("'uptime_score'" in r.getMessage() for r in caplog.records)
+
     def test_load_scores_destination_loc_creation(self, mock_provider_with_scores):
         """Test that destination_loc is created from lat/lon."""
         data_manager = DataManager(mock_provider_with_scores)
@@ -104,6 +119,21 @@ class TestDataManager:
         assert data["destination_loc"].iloc[0] == "50.0,10.0"
         assert data["destination_loc"].iloc[1] == "40.0,-74.0"
         assert data["destination_loc"].iloc[2] == "35.0,139.0"
+
+    def test_transform_without_org_or_location_adds_them_empty(self, mock_scores_df, caplog):
+        """Scores without the org or location columns, which selection reads, get them empty,
+        and a warning names each one, so a selection can still run on them.
+        """
+        data_manager = DataManager(MagicMock())
+
+        with caplog.at_level(logging.WARNING, logger="iisa.score_loader"):
+            data = data_manager.transform_scores_df(mock_scores_df.drop(columns=["org", "dst_lon"]))
+
+        assert data["org"].isna().all()
+        assert data["destination_loc"].isna().all()
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("'org'" in message for message in warnings)
+        assert any("'dst_lon'" in message for message in warnings)
 
     def test_load_scores_empty_table(self, mock_provider_empty_scores):
         """Test that load_scores() returns False when table is empty."""
@@ -190,6 +220,17 @@ class TestDataManager:
 
         with pytest.raises(ValueError, match="empty DataFrame"):
             data_manager.transform_scores_df(pd.DataFrame())
+
+    def test_transform_scores_df_rows_without_fields_raise_payload_error(self):
+        """Records that hold no fields make a frame with rows but no columns. That is a payload
+        missing every required column, not an empty one, so the push can answer 422.
+        """
+        from iisa.score_loader import ScoresPayloadError
+
+        data_manager = DataManager(MagicMock())
+
+        with pytest.raises(ScoresPayloadError, match="indexer"):
+            data_manager.transform_scores_df(pd.DataFrame([{}, {}]))
 
     def test_transform_scores_df_missing_required_column_raises(self, mock_scores_df):
         """A frame missing a required column raises ScoresPayloadError, naming it."""

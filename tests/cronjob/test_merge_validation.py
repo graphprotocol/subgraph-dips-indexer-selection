@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
+jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 import main  # noqa: E402

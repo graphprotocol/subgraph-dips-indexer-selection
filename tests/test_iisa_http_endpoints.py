@@ -70,11 +70,11 @@ class TestPydanticModels:
     """Tests for request/response model validation."""
 
     def test_selection_request_requires_num_candidates(self):
-        """num_candidates is required along with deployment_id."""
+        """num_candidates is required along with deployment_id and chain_id."""
         # Arrange & Act
         from iisa.iisa_http_endpoints import SelectionRequest
 
-        request = SelectionRequest(deployment_id="Qm123", num_candidates=3)
+        request = SelectionRequest(deployment_id="Qm123", chain_id="arbitrum-one", num_candidates=3)
 
         # Assert
         assert request.deployment_id == "Qm123"
@@ -91,6 +91,7 @@ class TestPydanticModels:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             existing_indexers=["0x111"],
             num_candidates=2,
             blocklist=["0xBAD"],
@@ -113,9 +114,21 @@ class TestPydanticModels:
         from iisa.iisa_http_endpoints import SelectionRequest
 
         with pytest.raises(PydanticValidationError) as exc_info:
-            SelectionRequest(deployment_id="Qm123")
+            SelectionRequest(deployment_id="Qm123", chain_id="arbitrum-one")
 
         assert "num_candidates" in str(exc_info.value)
+
+    @pytest.mark.parametrize("chain_fields", [{}, {"chain_id": None}, {"chain_id": ""}])
+    def test_selection_request_without_chain_raises(self, chain_fields):
+        """A missing, null or empty chain is rejected: every price filter needs one."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from iisa.iisa_http_endpoints import SelectionRequest
+
+        with pytest.raises(PydanticValidationError) as exc_info:
+            SelectionRequest(deployment_id="Qm123", num_candidates=3, **chain_fields)
+
+        assert "chain_id" in str(exc_info.value)
 
     def test_selection_response(self):
         """deployment_id and indexers fields."""
@@ -377,6 +390,52 @@ def mock_history_df():
     )
 
 
+class TestOpenApiErrorResponses:
+    """The OpenAPI schema lists each error answer a route can give, besides FastAPI's 422."""
+
+    @pytest.mark.parametrize(
+        "method, path, codes",
+        [
+            ("get", "/health", set()),
+            ("post", "/scores", {"400", "401", "503"}),
+            ("get", "/scores", {"401"}),
+            ("get", "/scores/status", {"401"}),
+            ("get", "/scores/weighted", {"401"}),
+            ("get", "/dips-indexers", {"401"}),
+            ("post", "/sync-status", {"400", "401", "503"}),
+            ("post", "/get-score", {"400", "401", "503"}),
+            ("post", "/select-indexers", {"400", "503"}),
+        ],
+    )
+    def test_lists_each_error_answer(self, method, path, codes):
+        from iisa.iisa_http_endpoints import app
+
+        responses = app.openapi()["paths"][path][method]["responses"]
+
+        assert set(responses) - {"200", "422"} == codes
+        for code in codes:
+            assert responses[code]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/ErrorResponse"
+            }
+
+    @pytest.mark.parametrize("body", [b"\xff\xfe\xfd", b"caf\xe9"], ids=["not-utf8", "latin1-text"])
+    def test_unreadable_body_answer_matches_the_listed_error_shape(self, body):
+        """FastAPI answers a body it cannot decode with its own 400, which the schema lists."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/sync-status", content=body, headers={"Content-Type": "application/json"}
+        )
+
+        assert response.status_code == 400
+        assert set(response.json()) == {"detail"}
+        assert isinstance(response.json()["detail"], str)
+
+
 class TestHealthEndpoint:
     """Tests for GET /health endpoint."""
 
@@ -570,6 +629,10 @@ class TestPushScoresEndpoint:
 
         response = client.post("/scores", json=[])
         assert response.status_code == 422
+        # The same error list FastAPI gives any invalid body, as the OpenAPI schema documents.
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert error["type"] == "too_short"
 
     def test_push_scores_rejects_missing_token_when_required(self, monkeypatch):
         """IISA_PUSH_TOKEN set + no header → 401."""
@@ -604,6 +667,24 @@ class TestPushScoresEndpoint:
         )
         assert response.status_code == 401
         assert "Invalid" in response.json()["detail"]
+
+    @pytest.mark.parametrize("header", [b"Bearer \xe9", b"Bearer caf\xc3\xa9", b"bearer \xff\xfe"])
+    def test_push_scores_rejects_non_ascii_token(self, monkeypatch, header):
+        """A token with non-ASCII characters is a 401, not a 500 from the constant-time compare."""
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/scores", json=self._sample_payload(), headers={"Authorization": header}
+        )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid bearer token"
 
     @patch("iisa.iisa_http_endpoints.DataManager")
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
@@ -777,7 +858,9 @@ class TestPushScoresEndpoint:
 
         # Assert
         assert response.status_code == 422
-        assert "uptime_score" in response.json()["detail"]
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert "uptime_score" in error["msg"]
         assert not scores_path.exists()
 
     def test_push_scores_missing_indexer_rejected(self, tmp_path, monkeypatch):
@@ -800,8 +883,131 @@ class TestPushScoresEndpoint:
 
         # Assert
         assert response.status_code == 422
-        assert "indexer" in response.json()["detail"]
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert "indexer" in error["msg"]
         assert not scores_path.exists()
+
+    def test_push_scores_records_without_fields_rejected(self, tmp_path, monkeypatch):
+        """Records holding no fields at all are a 422 for the missing columns, not a 500."""
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post("/scores", json=[{}])
+
+        assert response.status_code == 422
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert "indexer" in error["msg"]
+        assert not scores_path.exists()
+
+    @pytest.mark.parametrize("indexer", [5, None, True, {"id": "0xDEF"}, ["0xDEF"]])
+    def test_push_scores_indexer_not_text_rejected(self, indexer, tmp_path, monkeypatch):
+        """An indexer that is not text is a 422 naming its record, since selection could
+        never return it, rather than an accepted push that breaks every later selection.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = self._sample_payload() + self._sample_payload()
+        payload[1]["indexer"] = indexer
+
+        response = client.post("/scores", json=payload)
+
+        assert response.status_code == 422
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body", 1, "indexer"]
+        assert error["type"] == "string_type"
+        assert error["input"] == indexer
+        assert not scores_path.exists()
+
+    @pytest.mark.parametrize("indexer", [5, 2.5, True])
+    def test_push_scores_every_indexer_a_number_rejected(self, indexer, tmp_path, monkeypatch):
+        """When every indexer is a number, pandas holds them as its own number type, which
+        the 422 must still echo as plain JSON rather than fail to write as a 500.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = [{**record, "indexer": indexer} for record in self._sample_payload() * 2]
+
+        response = client.post("/scores", json=payload)
+
+        assert response.status_code == 422
+        assert [error["input"] for error in response.json()["detail"]] == [indexer, indexer]
+
+    @pytest.mark.parametrize("uptime", [{}, {"a": 1}, [1], "x"])
+    def test_push_with_unreadable_uptime_accepted(self, uptime, tmp_path, monkeypatch):
+        """An uptime that is not a number scores 0, like any unreadable metric, rather than
+        failing the push with a 500 that the score job would retry for minutes.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = self._sample_payload()
+        payload[0]["uptime_score"] = uptime
+
+        response = client.post("/scores", json=payload)
+
+        assert response.status_code == 200
+        weighted = client.get("/scores/weighted").json()["scores"]
+        assert weighted[0]["components"]["uptime"] == 0.0
+
+    @pytest.mark.parametrize("dropped", [["org"], ["dst_lat"], ["dst_lon", "org"]])
+    def test_push_without_org_or_location_can_be_served(self, dropped, tmp_path, monkeypatch):
+        """A push lacking the org or location columns still serves a selection of 2, with
+        every indexer counted as 1 unknown org or location, rather than answering 500.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = []
+        for indexer in ("0xabc", "0xdef"):
+            record = {
+                **self._sample_payload()[0],
+                "indexer": indexer,
+                "org": f"org of {indexer}",
+                "dst_lat": 52.4,
+                "dst_lon": 4.9,
+                "dips_info_available": True,
+                "dips_min_grt_per_30_days": '{"arbitrum-one": "1"}',
+                "dips_supported_networks": '["arbitrum-one"]',
+            }
+            for column in dropped:
+                del record[column]
+            payload.append(record)
+        assert client.post("/scores", json=payload).status_code == 200
+
+        response = client.post(
+            "/select-indexers",
+            json={"deployment_id": "Qm", "num_candidates": 2, "chain_id": "arbitrum-one"},
+        )
+
+        assert response.status_code == 200
+        assert sorted(i["id"] for i in response.json()["indexers"]) == ["0xabc", "0xdef"]
 
     def test_push_scores_full_payload_accepted_end_to_end(self, tmp_path, monkeypatch):
         """A complete payload passes validation, writes disk, and returns the row count."""
@@ -1500,6 +1706,29 @@ class TestGetScoreEndpoint:
 class TestSelectIndexersEndpoint:
     """Tests for POST /select-indexers endpoint."""
 
+    @pytest.mark.parametrize("chain_fields", [{}, {"chain_id": None}, {"chain_id": ""}])
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
+    def test_select_indexers_without_chain_returns_422(
+        self, mock_processor_class, mock_history_df, chain_fields
+    ):
+        """Without a chain no price filter can run, so the request is rejected unscored."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints._state._history = mock_history_df
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={"deployment_id": "Qm123", "num_candidates": 3, **chain_fields},
+        )
+
+        assert response.status_code == 422
+        assert "chain_id" in response.text
+        mock_processor_class.assert_not_called()
+
     @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_indexers_returns_deployment_id_and_indexers(
         self, mock_processor_class, mock_history_df
@@ -1523,6 +1752,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 3,
             },
         )
@@ -1551,6 +1781,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 3,
             },
         )
@@ -1580,6 +1811,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 3,
             },
         )
@@ -1605,6 +1837,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 0,
             },
         )
@@ -1637,6 +1870,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 3,
             },
         )
@@ -1668,6 +1902,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 5,
             },
         )
@@ -1701,6 +1936,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             existing_indexers=["0xEXIST"],
             num_candidates=3,
         )
@@ -1723,7 +1959,7 @@ class TestSelectWithProcessor:
 
         iisa_http_endpoints._state._history = None
 
-        request = SelectionRequest(deployment_id="Qm123", num_candidates=3)
+        request = SelectionRequest(deployment_id="Qm123", chain_id="arbitrum-one", num_candidates=3)
 
         # Act
         result = _select_with_processor(request)
@@ -1747,6 +1983,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             blocklist=["0xBAD1", "0xBAD2"],
             num_candidates=3,
         )
@@ -1775,6 +2012,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             existing_indexers=["0xEXIST1", "0xEXIST2"],
             num_candidates=3,
         )
@@ -1804,6 +2042,7 @@ class TestSelectWithProcessor:
         pending = {"Qm123": ["0xPEND1"], "Qm456": ["0xPEND2"]}
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             pending_agreements=pending,
             num_candidates=3,
         )
@@ -1833,6 +2072,7 @@ class TestSelectWithProcessor:
         declined = {"Qm123": ["0xDEC1", "0xDEC2"]}
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             declined_indexers=declined,
             num_candidates=3,
         )
@@ -1859,6 +2099,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             num_candidates=5,
         )
 
@@ -1890,6 +2131,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             num_candidates=3,
         )
 
@@ -1918,6 +2160,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             num_candidates=3,
         )
 
@@ -1974,6 +2217,23 @@ class TestPushSyncStatusEndpoint:
         response = client.post("/sync-status", json={})
         assert response.status_code == 200
         assert response.json()["indexers"] == 0
+
+    def test_push_sync_status_skips_entries_that_are_not_objects(self, tmp_path):
+        """An entry that is a list or null is skipped rather than failing the push with a 500."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        settings = Settings()
+        settings.sync_status_file_path = str(tmp_path / "sync_status.json")
+        iisa_http_endpoints._state.initialize(settings)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        payload = {**self._sample_payload(), "0xBBB": [], "0xCCC": None}
+        response = client.post("/sync-status", json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "success", "indexers": 1}
 
     def test_push_sync_status_rejects_wrong_token(self, monkeypatch):
         monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
@@ -2098,19 +2358,39 @@ class TestExtractChainPrice:
         prices_json = json.dumps({"arbitrum-one": "450.5"})
         assert _extract_chain_price(prices_json, "arbitrum-one") == 450.5
 
+    @pytest.mark.parametrize(
+        "bad_price",
+        [
+            "NaN",
+            float("nan"),
+            "Infinity",
+            float("inf"),
+            float("-inf"),
+            -500.0,
+            "-500",
+            True,
+            10**400,
+        ],
+    )
+    def test_returns_none_for_unusable_price(self, bad_price):
+        """A NaN or negative base price was scored as the cheapest and won selection."""
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        prices_json = json.dumps({"arbitrum-one": bad_price, "mainnet": 200.0})
+        assert _extract_chain_price(prices_json, "arbitrum-one") is None
+        assert _extract_chain_price(prices_json, "mainnet") == 200.0
+
+    def test_accepts_zero_price(self):
+        from iisa.iisa_http_endpoints import _extract_chain_price
+
+        assert _extract_chain_price(json.dumps({"arbitrum-one": "0"}), "arbitrum-one") == 0.0
+
 
 class TestFilterByPrice:
     """Tests for _filter_by_price -- excludes indexers by DIP info, chain, and budget."""
 
     def _make_history(self, rows):
         return pd.DataFrame(rows)
-
-    def test_no_filtering_when_chain_id_is_none(self):
-        from iisa.iisa_http_endpoints import _filter_by_price
-
-        df = self._make_history([{"indexer": "0xA", "dips_info_available": False}])
-        result, reason = _filter_by_price(df, None, None)
-        assert len(result) == 1
 
     def test_excludes_indexers_without_dips_info(self):
         from iisa.iisa_http_endpoints import _filter_by_price
@@ -2377,6 +2657,39 @@ class TestFilterByPrice:
             "all 1 indexers exceed payment ceiling of 2000.0 GRT per billion entities/30d"
         )
 
+    @pytest.mark.parametrize("bad_price", ["-5", "abc", float("inf")])
+    def test_invalid_entity_price_is_dropped_without_an_entity_ceiling(self, bad_price, caplog):
+        """A per-entity price that is set but invalid sets no usable floor, so the indexer is
+        dropped even when the request sends no per-entity ceiling. A missing price still passes.
+        """
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                self._entity_priced("0xA", bad_price),
+                self._entity_priced("0xB", "100"),
+                self._entity_priced("0xC", None),
+            ]
+        )
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            result, reason = _filter_by_price(df, "arb", None, None)
+
+        assert list(result["indexer"]) == ["0xB", "0xC"]
+        assert reason == ""
+        assert [r.getMessage() for r in caplog.records if r.name == "iisa-service"] == [
+            f"price filter: dropping indexer 0xA with invalid per-entity price {bad_price!r}"
+        ]
+
+    def test_reason_text_when_every_entity_price_is_invalid(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [self._entity_priced("0xA", "-5"), self._entity_priced("0xB", "abc")]
+        )
+        result, reason = _filter_by_price(df, "arb", None, None)
+        assert result.empty
+        assert reason == "all 2 indexers have an invalid per-entity price"
+
     def test_logs_each_step_at_debug(self, caplog):
         from iisa.iisa_http_endpoints import _filter_by_price
 
@@ -2409,6 +2722,7 @@ class TestPriceFilterSteps:
             ("_keep_supporting_chain", ("arb",)),
             ("_keep_with_chain_price", ("arb",)),
             ("_keep_within_budget", ("arb", 1.0)),
+            ("_keep_with_valid_entity_price", ()),
             ("_keep_within_entity_budget", (1.0,)),
         ],
     )
@@ -2491,20 +2805,6 @@ class TestBuildSelectedIndexers:
         result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
         assert result[0].min_grt_per_30_days is None
 
-    def test_returns_none_when_no_chain_id(self):
-        from iisa.iisa_http_endpoints import _build_selected_indexers
-
-        history = pd.DataFrame(
-            [
-                {
-                    "indexer": "0xa",
-                    "dips_min_grt_per_30_days": json.dumps({"arbitrum-one": 450.0}),
-                }
-            ]
-        )
-        result = _build_selected_indexers(["0xa"], history, None)
-        assert result[0].min_grt_per_30_days is None
-
     def test_indexer_not_in_history_returns_none_pricing(self):
         from iisa.iisa_http_endpoints import _build_selected_indexers
 
@@ -2539,15 +2839,6 @@ class TestBuildSelectedIndexers:
         result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
         assert result[0].min_grt_per_billion_entities_per_30_days == expected
 
-    def test_entity_price_is_none_when_no_chain_id(self):
-        from iisa.iisa_http_endpoints import _build_selected_indexers
-
-        history = pd.DataFrame(
-            [{"indexer": "0xa", "dips_min_grt_per_billion_entities_per_30_days": 2000.0}]
-        )
-        result = _build_selected_indexers(["0xa"], history, None)
-        assert result[0].min_grt_per_billion_entities_per_30_days is None
-
     def test_uses_first_row_and_keeps_requested_order(self):
         from iisa.iisa_http_endpoints import _build_selected_indexers
 
@@ -2580,7 +2871,6 @@ class TestIndexerPrices:
         [
             (HISTORY, "0xa", "arb", (450.0, 2000.0)),
             (HISTORY, "0xa", "mainnet", (None, 2000.0)),
-            (HISTORY, "0xa", None, (None, None)),
             (HISTORY, "0xother", "arb", (None, None)),
             (HISTORY[["indexer"]], "0xa", "arb", (None, None)),
             (HISTORY.drop(columns=["dips_min_grt_per_30_days"]), "0xa", "arb", (None, 2000.0)),
@@ -2763,19 +3053,80 @@ class TestEnrichWithChainPrices:
         result = _enrich_with_chain_prices(df, "arb")
         assert result.iloc[0]["base_price_per_epoch"] == 0.0
 
-    def test_zero_price_when_no_chain_id(self):
+    def test_zero_prices_when_chain_price_column_missing(self):
         from iisa.iisa_http_endpoints import _enrich_with_chain_prices
 
         df = pd.DataFrame(
+            [{"indexer": "0xa", "dips_min_grt_per_billion_entities_per_30_days": 2000.0}]
+        )
+        result = _enrich_with_chain_prices(df, "arb")
+        assert result.iloc[0]["base_price_per_epoch"] == 0.0
+        assert result.iloc[0]["price_per_entity"] == 0.0
+
+
+class TestEntityPriceReadOneWay:
+    """The per-entity price ceiling, scoring and the price returned to dipper all read an
+    indexer's per-entity price the same way: missing, a finite number >= 0, or invalid.
+    """
+
+    COLUMN = "dips_min_grt_per_billion_entities_per_30_days"
+    INVALID = ["-5", -5.0, "inf", float("inf"), "1e400", "nan", "abc", "", True, [100]]
+    MISSING_OR_VALID = [
+        (None, None),
+        (float("nan"), None),
+        ("1500", 1500.0),
+        (1500, 1500.0),
+        ("1_000", 1000.0),
+        ("0", 0.0),
+    ]
+
+    def _history(self, entity_price):
+        return pd.DataFrame(
             [
                 {
                     "indexer": "0xa",
-                    "dips_min_grt_per_30_days": json.dumps({"arb": 450.0}),
+                    "dips_min_grt_per_30_days": json.dumps({"arb": 100.0}),
+                    self.COLUMN: entity_price,
                 }
             ]
         )
-        result = _enrich_with_chain_prices(df, None)
-        assert result.iloc[0]["base_price_per_epoch"] == 0.0
+
+    @pytest.mark.parametrize("entity_price", INVALID)
+    def test_invalid_price_fails_the_entity_ceiling(self, entity_price):
+        from iisa.iisa_http_endpoints import _keep_within_entity_budget
+
+        result, _ = _keep_within_entity_budget(self._history(entity_price), 2000.0)
+        assert result.empty
+
+    @pytest.mark.parametrize("entity_price", INVALID)
+    def test_invalid_price_is_not_scored_as_a_price(self, entity_price):
+        """Scored as NaN, which ranks worst, not as missing (0), which ranks cheapest."""
+        from iisa.iisa_http_endpoints import _enrich_with_chain_prices
+
+        result = _enrich_with_chain_prices(self._history(entity_price), "arb")
+        assert pd.isna(result.iloc[0]["price_per_entity"])
+
+    @pytest.mark.parametrize("entity_price", INVALID)
+    def test_invalid_price_is_not_returned_to_dipper(self, entity_price):
+        from iisa.iisa_http_endpoints import _indexer_prices
+
+        assert _indexer_prices(self._history(entity_price), "0xa", "arb") == (100.0, None)
+
+    @pytest.mark.parametrize("entity_price, price", MISSING_OR_VALID)
+    def test_missing_or_valid_price_reads_the_same_in_every_step(self, entity_price, price):
+        """A missing price passes any ceiling and scores as 0; it is returned to dipper as None."""
+        from iisa.iisa_http_endpoints import (
+            _enrich_with_chain_prices,
+            _indexer_prices,
+            _keep_within_entity_budget,
+        )
+
+        history = self._history(entity_price)
+        kept, _ = _keep_within_entity_budget(history, 2000.0)
+        assert list(kept["indexer"]) == ["0xa"]
+        scored = _enrich_with_chain_prices(history, "arb").iloc[0]["price_per_entity"]
+        assert scored == (0.0 if price is None else price)
+        assert _indexer_prices(history, "0xa", "arb") == (100.0, price)
 
 
 class TestSelectIndexersEndToEndPricing:
@@ -2899,6 +3250,32 @@ class TestSelectIndexersEndToEndPricing:
             "indexer priced at 5000 GRT/30d should be excluded with budget of 400"
         )
 
+    @pytest.mark.parametrize("bad_price", ["-5", "abc", "NaN"])
+    def test_invalid_entity_price_is_never_selected_without_an_entity_ceiling(self, bad_price):
+        """With no per-entity ceiling in the request, nothing used to drop an indexer whose
+        per-entity price is invalid, and scoring read that price as 0, the cheapest.
+        """
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row("0xhonest", "arb", 100.0, loc="US", org="org1", entity_price=2000.0),
+                self._row("0xcheat", "arb", 100.0, loc="EU", org="org2", entity_price=bad_price),
+            ]
+        )
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            json={"deployment_id": "QmBadEntityPriceTest", "chain_id": "arb", "num_candidates": 2},
+        )
+
+        assert response.status_code == 200
+        assert [i["id"] for i in response.json()["indexers"]] == ["0xhonest"]
+
     def test_entity_budget_enforcement_excludes_expensive_indexers(self):
         """Indexers whose per-entity price exceeds the per-entity ceiling must be excluded."""
         from iisa import iisa_http_endpoints
@@ -2950,6 +3327,57 @@ class TestSelectIndexersEndToEndPricing:
             headers={"content-type": "application/json"},
         )
         assert response.status_code == 422
+
+    @pytest.mark.parametrize("fees", ["-1", "NaN", "Infinity"])
+    def test_unusable_optimistic_dips_fees_are_rejected(self, fees):
+        """A negative or infinite fee would skew an indexer's stake-to-fees score and a NaN one
+        was silently treated as 0. Sent as raw JSON, since the test client can't encode NaN.
+        """
+        from iisa.iisa_http_endpoints import app
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            content=(
+                '{"deployment_id": "QmFeesTest", "chain_id": "arb", "num_candidates": 1, '
+                f'"optimistic_dips_fees": {{"0xindexer": {fees}}}}}'
+            ),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"] == ["body", "optimistic_dips_fees", "0xindexer"]
+
+    @pytest.mark.parametrize("ceiling", [None, 1000.0])
+    @pytest.mark.parametrize("bad_price", ["NaN", float("nan"), -500.0, "-500"])
+    def test_unusable_advertised_base_price_never_wins(self, bad_price, ceiling):
+        """An indexer advertising a NaN or negative base price used to be scored as the
+        cheapest, so it won on chains without a ceiling (NaN) or under any ceiling (negative).
+        """
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row("0xhonest", "arb", 100.0, loc="US", org="org1"),
+                self._row("0xcheat", "arb", bad_price, loc="EU", org="org2"),
+            ]
+        )
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmBadPriceTest",
+                "chain_id": "arb",
+                "num_candidates": 2,
+                "max_grt_per_30_days": ceiling,
+            },
+        )
+
+        assert response.status_code == 200
+        assert [i["id"] for i in response.json()["indexers"]] == ["0xhonest"]
 
     def test_blocklist_excludes_indexers(self):
         """Blocklisted indexers must not appear in the response."""

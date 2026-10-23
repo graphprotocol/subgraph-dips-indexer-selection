@@ -1,10 +1,16 @@
 """Tests for subgraph pagination helper and indexer discovery."""
 
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from processing import discover_indexers_from_network_subgraph
-from subgraph import paginate_subgraph_query
+
+jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
+sys.path.insert(0, str(jobs_path))
+
+from processing import discover_indexers_from_network_subgraph  # noqa: E402
+from subgraph import paginate_subgraph_query  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # paginate_subgraph_query

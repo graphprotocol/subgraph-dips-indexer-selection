@@ -8,14 +8,16 @@ filesystem). IISA reads that cache file on startup using DataManager.load_scores
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import pandas as pd
 
 from . import score_columns as cols
+from .indexer_selection import read_metric
 
 __all__ = [
     "FileScoreLoader",
@@ -54,11 +56,15 @@ SCORES_FILE_PATH = os.environ.get("SCORES_FILE_PATH", "/app/scores/indexer_score
 
 
 class ScoresPayloadError(ValueError):
-    """A pushed scores payload was missing required columns.
+    """A pushed scores payload was missing required columns or held an indexer that is not text.
 
     Separate type so the push endpoint can answer 422 (bad body) rather than
-    500 (service broke).
+    500 (service broke). ``errors`` lists each problem in the shape of FastAPI's 422 errors.
     """
+
+    def __init__(self, message: str, errors: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.errors = errors
 
 
 # Identity plus the quality/economic metrics the selector scores on. A push
@@ -77,6 +83,46 @@ REQUIRED_SCORE_COLUMNS: tuple[str, ...] = (
 def missing_required_columns(df: pd.DataFrame) -> list[str]:
     """Return the required columns absent from a pushed scores frame."""
     return [c for c in REQUIRED_SCORE_COLUMNS if c not in df.columns]
+
+
+def _check_indexers_are_text(df: pd.DataFrame) -> None:
+    """Raise ScoresPayloadError naming each record whose indexer is not text, since selection
+    can only match and return an indexer by its address. Read as plain Python values, as
+    pandas holds a column of numbers in its own types; a null or absent indexer reads as NaN.
+    """
+    indexers = df[cols.INDEXER].tolist()
+    positions = [i for i, indexer in enumerate(indexers) if not isinstance(indexer, str)]
+    if not positions:
+        return
+    errors = []
+    for position in positions:
+        indexer = indexers[position]
+        errors.append(
+            {
+                "type": "string_type",
+                "loc": ("body", position, cols.INDEXER),
+                "msg": "Input should be a valid string",
+                "input": None if isinstance(indexer, float) and math.isnan(indexer) else indexer,
+            }
+        )
+    raise ScoresPayloadError(
+        f"pushed scores payload has {len(positions)} indexer(s) that are not text, "
+        f"first in record {positions[0]}",
+        errors,
+    )
+
+
+def _warn_column_missing(columns: list[str], what: str) -> None:
+    """Log that the scores lack ``columns``, so selection counts every indexer as sharing one
+    unknown ``what`` and cannot spread a group across them.
+    """
+    logger.warning(
+        "Scores have no %s column(s): every indexer counts as 1 unknown %s, so selection "
+        "cannot spread a group across %ss",
+        ", ".join(repr(c) for c in columns),
+        what,
+        what,
+    )
 
 
 class FileScoreLoader:
@@ -189,19 +235,19 @@ class DataManager:
         return True
 
     def transform_scores_df(self, scores_df: pd.DataFrame) -> pd.DataFrame:
-        """Pure column-mapping transform, returned without touching state.
-
-        The push path dry-runs this before writing, so an empty payload (raises
-        ValueError) or one missing required columns (raises ScoresPayloadError)
-        fails here with no side effects and can never poison the cache.
+        """Pure column-mapping transform, returned without touching state. The push path
+        dry-runs this first, so a payload with no rows (ValueError), missing required columns
+        (ScoresPayloadError, also for rows holding no fields, which pandas calls empty) or an
+        indexer that is not text (ScoresPayloadError) fails here and can never poison the cache.
         """
-        if scores_df.empty:
+        if len(scores_df.index) == 0:
             raise ValueError("transform_scores_df called with empty DataFrame")
         missing = missing_required_columns(scores_df)
         if missing:
-            raise ScoresPayloadError(
-                f"pushed scores payload missing required columns: {', '.join(missing)}"
-            )
+            message = f"pushed scores payload missing required columns: {', '.join(missing)}"
+            error = {"type": "missing", "loc": ("body",), "msg": message, "input": None}
+            raise ScoresPayloadError(message, [error])
+        _check_indexers_are_text(scores_df)
         return self._transform_scores_to_perf_history(scores_df)
 
     def commit_scores(
@@ -243,23 +289,32 @@ class DataManager:
     def _transform_scores_to_perf_history(self, scores_df: pd.DataFrame) -> pd.DataFrame:
         """Rename CronJob score columns to the names IndexerSelector expects.
 
-        Maps lat_coefficient_upper_bound -> latency-CI column, success_rate ->
-        average_status, lat_normalized_score -> norm_lat_lin_reg_coefficient,
-        uptime_score (x100) -> "% up_x", and dst_lat/dst_lon -> destination_loc.
+        Maps lat_coefficient_upper_bound -> latency-CI column, success_rate -> average_status,
+        lat_normalized_score -> norm_lat_lin_reg_coefficient, uptime_score (x100) -> "% up_x",
+        and dst_lat/dst_lon -> destination_loc. A missing location or org goes in empty, since
+        selection reads both.
         """
         df = scores_df.copy()
 
         df = df.rename(columns=cols.CRONJOB_TO_SELECTOR_RENAME)
 
         if cols.UPTIME_SCORE in df.columns:
-            df[cols.SEL_UPTIME_PERCENT] = df[cols.UPTIME_SCORE] * 100
+            uptime, _ = read_metric(df, cols.UPTIME_SCORE)
+            df[cols.SEL_UPTIME_PERCENT] = uptime * 100
 
-        if cols.DST_LAT in df.columns and cols.DST_LON in df.columns:
+        missing_location = [c for c in (cols.DST_LAT, cols.DST_LON) if c not in df.columns]
+        if missing_location:
+            _warn_column_missing(missing_location, "location")
+            df[cols.SEL_DESTINATION_LOC] = None
+        else:
             df[cols.SEL_DESTINATION_LOC] = (
                 df[cols.DST_LAT].fillna(0).astype(str)
                 + ","
                 + df[cols.DST_LON].fillna(0).astype(str)
             )
+        if cols.ORG not in df.columns:
+            _warn_column_missing([cols.ORG], "org")
+            df[cols.ORG] = None
 
         return df
 
