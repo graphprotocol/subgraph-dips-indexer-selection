@@ -87,15 +87,16 @@ def missing_required_columns(df: pd.DataFrame) -> list[str]:
 
 def _check_indexers_are_text(df: pd.DataFrame) -> None:
     """Raise ScoresPayloadError naming each record whose indexer is not text, since selection
-    can only match and return an indexer by its address. pandas reads a null or absent
-    indexer as NaN, so the error reports that input as null.
+    can only match and return an indexer by its address. Read as plain Python values, as
+    pandas holds a column of numbers in its own types; a null or absent indexer reads as NaN.
     """
-    positions = [i for i, indexer in enumerate(df[cols.INDEXER]) if not isinstance(indexer, str)]
+    indexers = df[cols.INDEXER].tolist()
+    positions = [i for i, indexer in enumerate(indexers) if not isinstance(indexer, str)]
     if not positions:
         return
     errors = []
     for position in positions:
-        indexer = df[cols.INDEXER].iloc[position]
+        indexer = indexers[position]
         errors.append(
             {
                 "type": "string_type",

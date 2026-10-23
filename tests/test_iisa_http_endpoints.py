@@ -932,6 +932,25 @@ class TestPushScoresEndpoint:
         assert error["input"] == indexer
         assert not scores_path.exists()
 
+    @pytest.mark.parametrize("indexer", [5, 2.5, True])
+    def test_push_scores_every_indexer_a_number_rejected(self, indexer, tmp_path, monkeypatch):
+        """When every indexer is a number, pandas holds them as its own number type, which
+        the 422 must still echo as plain JSON rather than fail to write as a 500.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = [{**record, "indexer": indexer} for record in self._sample_payload() * 2]
+
+        response = client.post("/scores", json=payload)
+
+        assert response.status_code == 422
+        assert [error["input"] for error in response.json()["detail"]] == [indexer, indexer]
+
     @pytest.mark.parametrize("uptime", [{}, {"a": 1}, [1], "x"])
     def test_push_with_unreadable_uptime_accepted(self, uptime, tmp_path, monkeypatch):
         """An uptime that is not a number scores 0, like any unreadable metric, rather than
