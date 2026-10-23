@@ -9,7 +9,7 @@ import pytest
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-from subgraph import paginate_subgraph_query  # noqa: E402
+from subgraph import SubgraphResponseError, paginate_subgraph_query  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # paginate_subgraph_query
@@ -52,15 +52,11 @@ def test_pagination_two_pages(mock_post):
     assert result[1000:] == page2
 
     # First call uses empty lastId, second uses the last id from page1
-    first_call_vars = mock_post.call_args_list[0].kwargs.get(
-        "json", mock_post.call_args_list[0][1].get("json", {})
-    )["variables"]
+    first_call_vars = mock_post.call_args_list[0].kwargs["json"]["variables"]
     assert first_call_vars["lastId"] == ""
     assert first_call_vars["first"] == 1000
 
-    second_call_vars = mock_post.call_args_list[1].kwargs.get(
-        "json", mock_post.call_args_list[1][1].get("json", {})
-    )["variables"]
+    second_call_vars = mock_post.call_args_list[1].kwargs["json"]["variables"]
     assert second_call_vars["lastId"] == page1[-1]["id"]
 
 
@@ -92,17 +88,31 @@ def test_pagination_empty_response(mock_post):
     assert mock_post.call_count == 1
 
 
+@pytest.mark.parametrize(
+    "message, retryable",
+    [("bad indexers: {0x1234: Timeout}", True), ("auth error: API key not found", False)],
+    ids=["temporary", "permanent"],
+)
 @patch("subgraph.requests.post")
-def test_pagination_graphql_errors(mock_post):
-    """GraphQL errors in the response raise RuntimeError."""
-    mock_post.return_value = _mock_response(
-        {
-            "errors": [{"message": "something went wrong"}],
-        }
-    )
+def test_pagination_graphql_errors(mock_post, message, retryable):
+    """GraphQL errors raise SubgraphResponseError, flagged by whether a retry can clear them."""
+    mock_post.return_value = _mock_response({"errors": [{"message": message}]})
 
-    with pytest.raises(RuntimeError, match="GraphQL errors"):
+    with pytest.raises(SubgraphResponseError, match="GraphQL errors") as excinfo:
         paginate_subgraph_query(DUMMY_URL, DUMMY_QUERY)
+
+    assert excinfo.value.retryable is retryable
+
+
+@patch("subgraph.requests.post")
+def test_pagination_reply_without_data(mock_post):
+    """A reply with no data raises rather than reading as an empty page."""
+    mock_post.return_value = _mock_response({"data": None})
+
+    with pytest.raises(SubgraphResponseError, match="no data") as excinfo:
+        paginate_subgraph_query(DUMMY_URL, DUMMY_QUERY)
+
+    assert excinfo.value.retryable is True
 
 
 @patch("subgraph.requests.post")
@@ -114,10 +124,7 @@ def test_pagination_custom_entity_and_page_size(mock_post):
     result = paginate_subgraph_query(DUMMY_URL, DUMMY_QUERY, entity="allocations", page_size=50)
 
     assert result == page
-    call_vars = mock_post.call_args.kwargs.get("json", mock_post.call_args[1].get("json", {}))[
-        "variables"
-    ]
-    assert call_vars["first"] == 50
+    assert mock_post.call_args.kwargs["json"]["variables"]["first"] == 50
 
 
 @patch("subgraph.requests.post")
