@@ -36,7 +36,6 @@ from typing import Callable, Dict, List, Optional, Tuple, cast
 import base58
 import numpy as np
 import pandas as pd
-import requests
 from gateway_queries_pb2 import ClientQueryProtobuf  # type: ignore[attr-defined]
 from iisa_client import (
     IISAPushError,
@@ -44,13 +43,7 @@ from iisa_client import (
     get_scores_status,
     post_scores,
 )
-from subgraph import paginate_subgraph_query, redact_url
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from subgraph import paginate_subgraph_query, redact_url, retry_subgraph_read
 
 logger = logging.getLogger(__name__)
 
@@ -960,19 +953,7 @@ class RedpandaProvider:
     # Internal: GraphQL pagination
     # -----------------------------------------------------------------------
 
-    @retry(
-        retry=retry_if_exception_type(
-            (
-                ConnectionError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.HTTPError,
-            )
-        ),
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, max=60),
-        reraise=True,
-    )
+    @retry_subgraph_read
     def _paginate_graphql_indexers(self) -> List[dict]:
         """Paginate through all indexers from the Graph Network subgraph.
 

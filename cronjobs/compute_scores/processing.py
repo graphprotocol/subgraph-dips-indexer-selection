@@ -29,18 +29,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from subgraph import (
-    SubgraphResponseError,
-    is_retryable_subgraph_error,
-    paginate_subgraph_query,
-)
-from tenacity import (
-    before_sleep_log,
-    retry,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_exponential,
-)
+from subgraph import SubgraphResponseError, paginate_subgraph_query, retry_subgraph_read
 
 if TYPE_CHECKING:
     import aiohttp
@@ -220,13 +209,7 @@ query($first: Int!, $lastId: String!) {
 """
 
 
-@retry(
-    retry=retry_if_exception(is_retryable_subgraph_error),
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=2, max=60),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=True,
-)
+@retry_subgraph_read
 def _query_indexer_urls(network_subgraph_url: str) -> Dict[str, str]:
     """Map each indexer with a URL to that URL; raise when the subgraph lists none."""
     raw_indexers = paginate_subgraph_query(

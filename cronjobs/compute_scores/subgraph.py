@@ -12,6 +12,13 @@ import time
 from typing import List
 
 import requests
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +78,17 @@ def is_retryable_subgraph_error(error: BaseException) -> bool:
     if isinstance(error, SubgraphResponseError):
         return error.retryable
     return isinstance(error, _TRANSIENT_ERRORS)
+
+
+# Every network subgraph read retries the same way: up to 5 attempts, 2, 4, 8 then 16 seconds
+# apart, and only for the failures is_retryable_subgraph_error says can clear.
+retry_subgraph_read = retry(
+    retry=retry_if_exception(is_retryable_subgraph_error),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, max=60),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
 
 
 def paginate_subgraph_query(
