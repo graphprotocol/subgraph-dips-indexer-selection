@@ -1,5 +1,6 @@
-# The cronjob's requirements.txt is installed alongside the dev extras so its tests
-# run against the same version ranges the cronjob image installs.
+# The service is tested against the exact versions in uv.lock, the ones the OSV scan checks.
+# The cronjob image is not locked: it installs whatever its requirements.txt resolves to on
+# the day it is built, so the cronjob's tests (tests/cronjob) run against that resolve instead.
 name: CI
 
 on:
@@ -20,12 +21,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v7
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          version: "0.12.24"
           python-version: "3.11"
+          activate-environment: true
+
+      # Fails when pyproject.toml has changed but uv.lock was not regenerated to match.
+      - name: Check uv.lock is up to date
+        run: uv lock --check
 
       - name: Install dependencies
-        run: pip install -e ".[dev]" -r cronjobs/compute_scores/requirements.txt
+        run: uv sync --locked --extra dev
 
       - name: Lint
         run: ruff check src/ tests/ cronjobs/compute_scores/
@@ -34,10 +41,29 @@ jobs:
       - name: Complexity
         run: complexipy src/ cronjobs/compute_scores/ --max-complexity-allowed 15 --failed --plain
 
+      # tests/cronjob needs the cronjob's own dependencies, so the cronjob-tests job runs it.
       - name: Test
-        run: pytest --tb=short -q --cov=src --cov-fail-under=75
+        run: pytest --tb=short -q --cov=src --cov-fail-under=75 --ignore=tests/cronjob
 
   type-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.24"
+          python-version: "3.11"
+          activate-environment: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: mypy
+        run: mypy
+
+  cronjob-tests:
     runs-on: ubuntu-latest
 
     steps:
@@ -47,8 +73,23 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      # The same install the cronjob image's Dockerfile runs. The list of what it installed
+      # lets the next step prove the test tools left every one of those versions alone.
+      - name: Install cronjob dependencies
+        run: |
+          pip install -r cronjobs/compute_scores/requirements.txt
+          pip freeze > "$RUNNER_TEMP/cronjob-packages.txt"
 
-      - name: mypy
-        run: mypy
+      # The dev extra brings pytest, and the iisa package that the shared conftest imports.
+      - name: Install test tools
+        run: |
+          pip install -e ".[dev]"
+          changed=$(pip freeze | grep -vxFf - "$RUNNER_TEMP/cronjob-packages.txt" || true)
+          if [ -n "$changed" ]; then
+            echo "::error::Installing the test tools changed packages the cronjob image ships:"
+            echo "$changed"
+            exit 1
+          fi
+
+      - name: Test
+        run: pytest tests/cronjob --tb=short -q
