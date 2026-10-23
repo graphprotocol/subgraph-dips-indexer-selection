@@ -70,11 +70,11 @@ class TestPydanticModels:
     """Tests for request/response model validation."""
 
     def test_selection_request_requires_num_candidates(self):
-        """num_candidates is required along with deployment_id."""
+        """num_candidates is required along with deployment_id and chain_id."""
         # Arrange & Act
         from iisa.iisa_http_endpoints import SelectionRequest
 
-        request = SelectionRequest(deployment_id="Qm123", num_candidates=3)
+        request = SelectionRequest(deployment_id="Qm123", chain_id="arbitrum-one", num_candidates=3)
 
         # Assert
         assert request.deployment_id == "Qm123"
@@ -91,6 +91,7 @@ class TestPydanticModels:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             existing_indexers=["0x111"],
             num_candidates=2,
             blocklist=["0xBAD"],
@@ -113,9 +114,21 @@ class TestPydanticModels:
         from iisa.iisa_http_endpoints import SelectionRequest
 
         with pytest.raises(PydanticValidationError) as exc_info:
-            SelectionRequest(deployment_id="Qm123")
+            SelectionRequest(deployment_id="Qm123", chain_id="arbitrum-one")
 
         assert "num_candidates" in str(exc_info.value)
+
+    @pytest.mark.parametrize("chain_fields", [{}, {"chain_id": None}, {"chain_id": ""}])
+    def test_selection_request_without_chain_raises(self, chain_fields):
+        """A missing, null or empty chain is rejected: every price filter needs one."""
+        from pydantic import ValidationError as PydanticValidationError
+
+        from iisa.iisa_http_endpoints import SelectionRequest
+
+        with pytest.raises(PydanticValidationError) as exc_info:
+            SelectionRequest(deployment_id="Qm123", num_candidates=3, **chain_fields)
+
+        assert "chain_id" in str(exc_info.value)
 
     def test_selection_response(self):
         """deployment_id and indexers fields."""
@@ -1500,6 +1513,29 @@ class TestGetScoreEndpoint:
 class TestSelectIndexersEndpoint:
     """Tests for POST /select-indexers endpoint."""
 
+    @pytest.mark.parametrize("chain_fields", [{}, {"chain_id": None}, {"chain_id": ""}])
+    @patch("iisa.iisa_http_endpoints.IndexerSelector")
+    def test_select_indexers_without_chain_returns_422(
+        self, mock_processor_class, mock_history_df, chain_fields
+    ):
+        """Without a chain no price filter can run, so the request is rejected unscored."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints._state._history = mock_history_df
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={"deployment_id": "Qm123", "num_candidates": 3, **chain_fields},
+        )
+
+        assert response.status_code == 422
+        assert "chain_id" in response.text
+        mock_processor_class.assert_not_called()
+
     @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_indexers_returns_deployment_id_and_indexers(
         self, mock_processor_class, mock_history_df
@@ -1523,6 +1559,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 3,
             },
         )
@@ -1551,6 +1588,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 3,
             },
         )
@@ -1580,6 +1618,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 3,
             },
         )
@@ -1605,6 +1644,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 0,
             },
         )
@@ -1637,6 +1677,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 3,
             },
         )
@@ -1668,6 +1709,7 @@ class TestSelectIndexersEndpoint:
             "/select-indexers",
             json={
                 "deployment_id": "Qm123",
+                "chain_id": "arbitrum-one",
                 "num_candidates": 5,
             },
         )
@@ -1701,6 +1743,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             existing_indexers=["0xEXIST"],
             num_candidates=3,
         )
@@ -1723,7 +1766,7 @@ class TestSelectWithProcessor:
 
         iisa_http_endpoints._state._history = None
 
-        request = SelectionRequest(deployment_id="Qm123", num_candidates=3)
+        request = SelectionRequest(deployment_id="Qm123", chain_id="arbitrum-one", num_candidates=3)
 
         # Act
         result = _select_with_processor(request)
@@ -1747,6 +1790,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             blocklist=["0xBAD1", "0xBAD2"],
             num_candidates=3,
         )
@@ -1775,6 +1819,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             existing_indexers=["0xEXIST1", "0xEXIST2"],
             num_candidates=3,
         )
@@ -1804,6 +1849,7 @@ class TestSelectWithProcessor:
         pending = {"Qm123": ["0xPEND1"], "Qm456": ["0xPEND2"]}
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             pending_agreements=pending,
             num_candidates=3,
         )
@@ -1833,6 +1879,7 @@ class TestSelectWithProcessor:
         declined = {"Qm123": ["0xDEC1", "0xDEC2"]}
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             declined_indexers=declined,
             num_candidates=3,
         )
@@ -1859,6 +1906,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             num_candidates=5,
         )
 
@@ -1890,6 +1938,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             num_candidates=3,
         )
 
@@ -1918,6 +1967,7 @@ class TestSelectWithProcessor:
 
         request = SelectionRequest(
             deployment_id="Qm123",
+            chain_id="arbitrum-one",
             num_candidates=3,
         )
 
@@ -2131,13 +2181,6 @@ class TestFilterByPrice:
 
     def _make_history(self, rows):
         return pd.DataFrame(rows)
-
-    def test_no_filtering_when_chain_id_is_none(self):
-        from iisa.iisa_http_endpoints import _filter_by_price
-
-        df = self._make_history([{"indexer": "0xA", "dips_info_available": False}])
-        result, reason = _filter_by_price(df, None, None)
-        assert len(result) == 1
 
     def test_excludes_indexers_without_dips_info(self):
         from iisa.iisa_http_endpoints import _filter_by_price
@@ -2552,20 +2595,6 @@ class TestBuildSelectedIndexers:
         result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
         assert result[0].min_grt_per_30_days is None
 
-    def test_returns_none_when_no_chain_id(self):
-        from iisa.iisa_http_endpoints import _build_selected_indexers
-
-        history = pd.DataFrame(
-            [
-                {
-                    "indexer": "0xa",
-                    "dips_min_grt_per_30_days": json.dumps({"arbitrum-one": 450.0}),
-                }
-            ]
-        )
-        result = _build_selected_indexers(["0xa"], history, None)
-        assert result[0].min_grt_per_30_days is None
-
     def test_indexer_not_in_history_returns_none_pricing(self):
         from iisa.iisa_http_endpoints import _build_selected_indexers
 
@@ -2600,15 +2629,6 @@ class TestBuildSelectedIndexers:
         result = _build_selected_indexers(["0xa"], history, "arbitrum-one")
         assert result[0].min_grt_per_billion_entities_per_30_days == expected
 
-    def test_entity_price_is_none_when_no_chain_id(self):
-        from iisa.iisa_http_endpoints import _build_selected_indexers
-
-        history = pd.DataFrame(
-            [{"indexer": "0xa", "dips_min_grt_per_billion_entities_per_30_days": 2000.0}]
-        )
-        result = _build_selected_indexers(["0xa"], history, None)
-        assert result[0].min_grt_per_billion_entities_per_30_days is None
-
     def test_uses_first_row_and_keeps_requested_order(self):
         from iisa.iisa_http_endpoints import _build_selected_indexers
 
@@ -2641,7 +2661,6 @@ class TestIndexerPrices:
         [
             (HISTORY, "0xa", "arb", (450.0, 2000.0)),
             (HISTORY, "0xa", "mainnet", (None, 2000.0)),
-            (HISTORY, "0xa", None, (None, None)),
             (HISTORY, "0xother", "arb", (None, None)),
             (HISTORY[["indexer"]], "0xa", "arb", (None, None)),
             (HISTORY.drop(columns=["dips_min_grt_per_30_days"]), "0xa", "arb", (None, 2000.0)),
@@ -2824,19 +2843,15 @@ class TestEnrichWithChainPrices:
         result = _enrich_with_chain_prices(df, "arb")
         assert result.iloc[0]["base_price_per_epoch"] == 0.0
 
-    def test_zero_price_when_no_chain_id(self):
+    def test_zero_prices_when_chain_price_column_missing(self):
         from iisa.iisa_http_endpoints import _enrich_with_chain_prices
 
         df = pd.DataFrame(
-            [
-                {
-                    "indexer": "0xa",
-                    "dips_min_grt_per_30_days": json.dumps({"arb": 450.0}),
-                }
-            ]
+            [{"indexer": "0xa", "dips_min_grt_per_billion_entities_per_30_days": 2000.0}]
         )
-        result = _enrich_with_chain_prices(df, None)
+        result = _enrich_with_chain_prices(df, "arb")
         assert result.iloc[0]["base_price_per_epoch"] == 0.0
+        assert result.iloc[0]["price_per_entity"] == 0.0
 
 
 class TestEntityPriceReadOneWay:

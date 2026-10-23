@@ -102,7 +102,8 @@ class SelectionRequest(BaseModel):
     """
     Request body for indexer selection endpoint.
 
-    Matches the SelectionRequest struct in the Rust HTTP client.
+    Follows the SelectionRequest struct in dipper's Rust HTTP client, which types chain_id
+    as optional. Dipper's reassess job always sets it, and a request without one is a 422.
     """
 
     deployment_id: str
@@ -111,7 +112,10 @@ class SelectionRequest(BaseModel):
     num_candidates: int  # Target group size (required)
     blocklist: Optional[list[str]] = None
     declined_indexers: Optional[dict[str, list[str]]] = None
-    chain_id: Optional[str] = None  # e.g., "arbitrum-one"
+    # Required: the DIPs-info, chain-support and price filters all key on the chain, so a
+    # request without one would skip them all. They also skip any step whose DIPs column is
+    # missing from the loaded scores, and every step when dips_info_available is missing.
+    chain_id: str = Field(min_length=1)  # e.g., "arbitrum-one"
     max_grt_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
     )  # e.g., 4500.0
@@ -1166,7 +1170,7 @@ def _keep_within_entity_budget(
 
 def _filter_by_price(
     history: pd.DataFrame,
-    chain_id: Optional[str],
+    chain_id: str,
     max_grt_per_30_days: Optional[float],
     max_grt_per_billion_entities_per_30_days: Optional[float] = None,
 ) -> tuple[pd.DataFrame, str]:
@@ -1176,9 +1180,6 @@ def _filter_by_price(
 
     Returns (filtered_df, reason). ``reason`` says why if no candidates are left, else is empty.
     """
-    if chain_id is None:
-        return history, ""
-
     df = history.copy()
 
     # Only filter if we have the DIP info columns
@@ -1205,7 +1206,7 @@ def _filter_by_price(
 
 def _enrich_with_chain_prices(
     history: pd.DataFrame,
-    chain_id: Optional[str],
+    chain_id: str,
 ) -> pd.DataFrame:
     """
     Add base_price_per_epoch and price_per_entity columns for scoring.
@@ -1214,7 +1215,7 @@ def _enrich_with_chain_prices(
     """
     df = history.copy()
 
-    if chain_id is None or "dips_min_grt_per_30_days" not in df.columns:
+    if "dips_min_grt_per_30_days" not in df.columns:
         df["base_price_per_epoch"] = 0.0
         df["price_per_entity"] = 0.0
         return df
@@ -1246,16 +1247,16 @@ def _enrich_with_chain_prices(
 
 
 def _indexer_prices(
-    history: pd.DataFrame, idx_id: str, chain_id: Optional[str]
+    history: pd.DataFrame, idx_id: str, chain_id: str
 ) -> tuple[Optional[float], Optional[float]]:
     """Return (min_grt_per_30_days for the chain, min_grt_per_billion_entities_per_30_days)
     from the indexer's first row in ``history``.
 
-    Both are None without a chain_id or a row; either is None when its column is missing. The
+    Both are None without a row; either is None when its column is missing. The
     per-entity price is also None when the indexer set none or set an invalid one.
     """
     rows = history[history["indexer"] == idx_id]
-    if rows.empty or chain_id is None:
+    if rows.empty:
         return None, None
     row = rows.iloc[0]
 
@@ -1273,7 +1274,7 @@ def _indexer_prices(
 def _build_selected_indexers(
     indexer_ids: list[str],
     history: pd.DataFrame,
-    chain_id: Optional[str],
+    chain_id: str,
 ) -> list[SelectedIndexer]:
     """Build SelectedIndexer entries with pricing info."""
     results = []
