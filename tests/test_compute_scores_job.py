@@ -1575,8 +1575,23 @@ class TestValidateConfigurationSubgraphURL:
             ("graph-node:8000/subgraphs/name/graph-network", "must be an http(s) URL"),
             ("ftp://graph-node/subgraphs/name/graph-network", "must be an http(s) URL"),
             ("https://", "must be an http(s) URL"),
+            ("https://:8000/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("http://user:pw@/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("http://[graph-node:8000/subgraphs/name/graph-network", "is not a valid URL"),
+            ("https://gateway.thegraph.com/api/k/subgraphs/id/Qm\n", "contains whitespace"),
+            (" https://gateway.thegraph.com/api/k/subgraphs/id/Qm", "contains whitespace"),
         ],
-        ids=["empty", "no_scheme", "wrong_scheme", "no_host"],
+        ids=[
+            "empty",
+            "no_scheme",
+            "wrong_scheme",
+            "no_host",
+            "port_but_no_host",
+            "credentials_but_no_host",
+            "unclosed_bracket",
+            "trailing_newline",
+            "leading_space",
+        ],
     )
     def test_unusable_url_raises_configuration_error(self, monkeypatch, caplog, url, expected):
         self._satisfy_the_rest(monkeypatch)
