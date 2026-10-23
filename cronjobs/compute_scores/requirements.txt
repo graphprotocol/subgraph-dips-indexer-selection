@@ -23,7 +23,7 @@ confluent-kafka>=2.3,<3.0
 requests>=2.33.0,<3.0
 
 # Protobuf runtime for gateway_queries message parsing
-protobuf>=5.0,<7.0
+protobuf>=7.36.2,<8.0
 
 # CIDv0 base58 encoding for deployment hashes
 base58>=2.1,<3.0
