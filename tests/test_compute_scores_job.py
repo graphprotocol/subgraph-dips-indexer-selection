@@ -1529,25 +1529,113 @@ class TestRunScoringPushFailure:
 class TestValidateConfigurationIISAURL:
     """validate_configuration() must fail fast when IISA_API_URL is unset."""
 
-    def test_missing_iisa_api_url_raises_configuration_error(self, monkeypatch):
-        # Arrange — satisfy the Redpanda settings so only IISA_API_URL trips.
+    def test_missing_iisa_api_url_raises_configuration_error(self, monkeypatch, caplog):
+        # Arrange — satisfy the other settings so only IISA_API_URL trips.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
         monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x")
         monkeypatch.setattr(main, "IISA_API_URL", "")
 
         # Act / Assert
-        with pytest.raises(main.ConfigurationError) as exc_info:
-            main.validate_configuration()
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError, match="Found 1 configuration error"):
+                main.validate_configuration()
 
-        assert "configuration error" in str(exc_info.value).lower()
+        assert "IISA_API_URL is required" in caplog.text
 
     def test_present_iisa_api_url_passes(self, monkeypatch):
         # Arrange — all required config set.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
         monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
         monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x")
 
         # Act / Assert — should not raise
+        main.validate_configuration()
+
+
+class TestValidateConfigurationSubgraphURL:
+    """validate_configuration() must refuse to run without a usable network subgraph URL.
+
+    Without one every indexer fails its DIPs probe, so selection would pick no one and
+    dipper would cancel every agreement.
+    """
+
+    FAKE_KEY = "0123456789abcdef0123456789abcdef"
+
+    def _satisfy_the_rest(self, monkeypatch):
+        monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
+        monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            ("", "GRAPH_NETWORK_SUBGRAPH_URL is required"),
+            ("graph-node:8000/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("ftp://graph-node/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("https://", "must be an http(s) URL"),
+            ("https://:8000/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("http://user:pw@/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("http://[graph-node:8000/subgraphs/name/graph-network", "is not a valid URL"),
+            ("https://gateway.thegraph.com/api/k/subgraphs/id/Qm\n", "contains whitespace"),
+            (" https://gateway.thegraph.com/api/k/subgraphs/id/Qm", "contains whitespace"),
+        ],
+        ids=[
+            "empty",
+            "no_scheme",
+            "wrong_scheme",
+            "no_host",
+            "port_but_no_host",
+            "credentials_but_no_host",
+            "unclosed_bracket",
+            "trailing_newline",
+            "leading_space",
+        ],
+    )
+    def test_unusable_url_raises_configuration_error(self, monkeypatch, caplog, url, expected):
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
+
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError):
+                main.validate_configuration()
+
+        assert expected in caplog.text
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"htps://gateway.thegraph.com/api/{FAKE_KEY}/subgraphs/id/QmNetwork",
+            f"htps://indexer:{FAKE_KEY}@graph-node.internal/subgraphs/name/graph-network",
+            f"https//graph-node.internal/subgraphs/id/QmNetwork?api_key={FAKE_KEY}",
+        ],
+        ids=["gateway_key_in_path", "password_in_url", "key_in_query"],
+    )
+    def test_error_never_repeats_the_url(self, monkeypatch, caplog, url):
+        """The URL may carry an API key or credentials, wherever in it they sit."""
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
+
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError):
+                main.validate_configuration()
+
+        assert "GRAPH_NETWORK_SUBGRAPH_URL" in caplog.text
+        assert self.FAKE_KEY not in caplog.text
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://gateway.thegraph.com/api/key/subgraphs/id/QmNetwork",
+            "http://graph-node:8000/subgraphs/name/graph-network",
+        ],
+        ids=["gateway", "local_graph_node"],
+    )
+    def test_usable_url_passes(self, monkeypatch, url):
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
+
         main.validate_configuration()
 
 
@@ -1563,6 +1651,7 @@ class TestValidateConfigurationRedpandaTopic:
         # Arrange — everything else valid, so only the topic trips.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
         monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x")
         if topic is None:
             monkeypatch.delenv("REDPANDA_TOPIC", raising=False)
         else:
@@ -1570,7 +1659,7 @@ class TestValidateConfigurationRedpandaTopic:
 
         # Act / Assert
         with caplog.at_level("ERROR", logger=main.logger.name):
-            with pytest.raises(main.ConfigurationError):
+            with pytest.raises(main.ConfigurationError, match="Found 1 configuration error"):
                 main.validate_configuration()
 
         assert "REDPANDA_TOPIC is required" in caplog.text

@@ -65,10 +65,23 @@ def test_skips_indexers_without_a_url(mock_paginate):
     assert result == {"0xaaa": "https://indexer-a.example.com"}
 
 
-def test_unset_url_returns_empty_without_querying():
+def test_unset_url_raises_without_querying():
+    """An empty answer would score every indexer as failing its DIPs probe."""
     with patch("processing.paginate_subgraph_query") as mock_paginate:
-        assert discover_indexers_from_network_subgraph("") == {}
+        with pytest.raises(ValueError, match="GRAPH_NETWORK_SUBGRAPH_URL is not set"):
+            discover_indexers_from_network_subgraph("")
     mock_paginate.assert_not_called()
+
+
+def test_job_with_no_subgraph_url_pushes_nothing(monkeypatch):
+    provider = MagicMock()
+    monkeypatch.setattr(main, "RedpandaProvider", lambda: provider)
+    monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
+    monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "")
+
+    assert main.run_scoring() is False
+    provider.fetch_initial_query_results.assert_not_called()
+    provider.write_scores.assert_not_called()
 
 
 def test_retries_a_failed_request(no_retry_wait):
