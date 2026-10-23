@@ -664,8 +664,8 @@ def _normalize_metrics(
     # Keep a norm_ column the input already carries (the CronJob ships latency normalised).
     for norm_col, source_col, normalize in metrics:
         if norm_col in merged.columns:
-            continue
-        if source_col in merged.columns:
+            merged[norm_col] = _carried_scores(merged, norm_col)
+        elif source_col in merged.columns:
             merged[norm_col] = _normalize_column(merged, source_col, normalize)
         else:
             merged[norm_col] = np.nan
@@ -688,6 +688,17 @@ def _normalize_column(
     if not isinstance(scores, pd.Series):
         scores = pd.Series(scores, index=merged.index)
     return scores.mask(unreadable, 0.0)
+
+
+def _carried_scores(merged: pd.DataFrame, column: str) -> pd.Series:
+    """Read a norm_ column the input already carries. A value that is not a finite number in
+    [0, 1] scores 0, so a corrupt pushed score cannot outrank every other indexer.
+    """
+    numbers, unreadable = _read_metric(merged, column)
+    outside = numbers.notna() & ~numbers.between(0, 1)
+    if outside.any():
+        _warn_scored_as_zero(merged, column, outside, "fall outside [0, 1]")
+    return numbers.mask(unreadable | outside, 0.0)
 
 
 def _read_metric(merged: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
