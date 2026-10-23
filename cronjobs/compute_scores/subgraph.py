@@ -26,8 +26,25 @@ def redact_url(text: str) -> str:
     return _GATEWAY_API_KEY.sub(r"\1<redacted>", text)
 
 
+# The gateway answers a rejected key, an unknown subgraph and an invalid query with HTTP 200 and a
+# GraphQL error starting with these (its error type in edgeandnode/gateway); none clears on retry.
+_PERMANENT_GATEWAY_ERRORS = ("auth error", "subgraph not found", "bad query")
+
+
 class SubgraphResponseError(RuntimeError):
     """The subgraph answered, but with GraphQL errors or without the data asked for."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _graphql_errors_are_permanent(errors: object) -> bool:
+    """True when any error in a GraphQL ``errors`` list is one of _PERMANENT_GATEWAY_ERRORS."""
+    if not isinstance(errors, list):
+        return False
+    messages = [str(e.get("message", "")) for e in errors if isinstance(e, dict)]
+    return any(message.startswith(_PERMANENT_GATEWAY_ERRORS) for message in messages)
 
 
 # Failures of the connection or the reply rather than of the request: no connection, a timeout,
@@ -51,6 +68,8 @@ def is_retryable_subgraph_error(error: BaseException) -> bool:
     if isinstance(error, requests.HTTPError):
         status = error.response.status_code if error.response is not None else None
         return status is None or status == 429 or status >= 500
+    if isinstance(error, SubgraphResponseError):
+        return error.retryable
     return isinstance(error, _TRANSIENT_ERRORS)
 
 
@@ -95,7 +114,10 @@ def paginate_subgraph_query(
         data = response.json()
 
         if "errors" in data:
-            raise SubgraphResponseError(f"GraphQL errors: {data['errors']}")
+            raise SubgraphResponseError(
+                f"GraphQL errors: {data['errors']}",
+                retryable=not _graphql_errors_are_permanent(data["errors"]),
+            )
 
         page = data.get("data", {}).get(entity, [])
         elapsed = time.monotonic() - t0

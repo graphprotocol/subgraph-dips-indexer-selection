@@ -91,16 +91,45 @@ def test_raises_when_every_attempt_fails(no_retry_wait):
     assert post.call_count == 5
 
 
-def test_retries_graphql_errors(no_retry_wait):
-    """The gateway reports an indexer that failed to serve the query as a GraphQL error."""
+def _graphql_error(message):
     response = MagicMock()
-    response.json.return_value = {"errors": [{"message": "indexer unavailable"}]}
+    response.json.return_value = {"errors": [{"message": message}]}
+    return response
 
-    with patch("subgraph.requests.post", return_value=response) as post:
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "bad indexers: {0x1234: Unavailable(no status: indexer not available)}",
+        "no indexers found",
+        "internal error: database timeout",
+    ],
+)
+def test_retries_gateway_errors_that_can_clear(no_retry_wait, message):
+    """The gateway reports an indexer that failed to serve the query as a GraphQL error."""
+    with patch("subgraph.requests.post", return_value=_graphql_error(message)) as post:
         with pytest.raises(RuntimeError, match="GraphQL errors"):
             discover_indexers_from_network_subgraph(SUBGRAPH_URL)
 
     assert post.call_count == 5
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "auth error: API key not found",
+        "auth error: missing authorization header",
+        "subgraph not found: no allocations",
+        "bad query: failed to parse",
+    ],
+)
+def test_does_not_retry_gateway_errors_that_cannot_clear(no_retry_wait, message):
+    """The gateway sends these with HTTP 200, so they arrive as GraphQL errors, not a 401."""
+    with patch("subgraph.requests.post", return_value=_graphql_error(message)) as post:
+        with pytest.raises(RuntimeError, match="GraphQL errors"):
+            discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 1
 
 
 def _http_error(status):
