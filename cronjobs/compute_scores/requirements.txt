@@ -1,7 +1,7 @@
 # Data processing
 pandas>=2.0,<4.0
 numpy>=1.24,<3.0
-pyarrow>=23.0.1,<25.0
+pyarrow>=26.0.0,<27.0
 
 # Machine learning (for linear regression)
 scipy>=1.11,<2.0
