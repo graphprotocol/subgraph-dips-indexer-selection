@@ -26,7 +26,7 @@ requests>=2.34.2,<3.0
 protobuf>=7.36.2,<8.0
 
 # CIDv0 base58 encoding for deployment hashes
-base58>=2.1,<3.0
+base58>=2.1.1,<3.0
 
 # Async HTTP for /dips/info endpoint fetching
 aiohttp>=3.14.5,<4.0
