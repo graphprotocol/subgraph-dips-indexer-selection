@@ -1477,6 +1477,15 @@ import main  # noqa: E402
 from iisa_client import IISAPushError  # noqa: E402
 
 
+@pytest.fixture
+def indexer_urls_read(monkeypatch):
+    """Stand in for the network subgraph read run_scoring makes before any scoring."""
+    monkeypatch.setattr(
+        main, "discover_indexers_from_network_subgraph", lambda _url: {"0xAAA": "https://a.example"}
+    )
+
+
+@pytest.mark.usefixtures("indexer_urls_read")
 class TestRunScoringPushFailure:
     """run_scoring() must return False when IISAPushError escapes write_scores."""
 
@@ -1624,7 +1633,6 @@ class TestComputeAllScoresGeoipDemotion:
                 "last_known_slashable_stake": [100.0, 200.0, 300.0],
             }
         )
-        mock_provider.graph_network_url = "http://graph-network:8000"
 
         def fake_resolve_geoip(_combined_queries):
             # Simulate the local-network case: every URL resolves to a
@@ -1643,7 +1651,6 @@ class TestComputeAllScoresGeoipDemotion:
             )
 
         monkeypatch.setattr(processing, "resolve_indexer_geoip", fake_resolve_geoip)
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
         monkeypatch.setattr(
             processing,
             "fetch_and_filter_graph_node_versions",
@@ -1653,6 +1660,7 @@ class TestComputeAllScoresGeoipDemotion:
         with caplog.at_level("WARNING", logger="processing"):
             result = compute_all_scores(
                 provider=mock_provider,
+                indexer_urls={},
                 start_date=date(2026, 5, 1),
                 num_days=28,
                 target_rows=20_000_000,
@@ -1692,7 +1700,6 @@ class TestComputeAllScoresGeoipDemotion:
                 "last_known_slashable_stake": [100.0, 200.0, 300.0],
             }
         )
-        mock_provider.graph_network_url = "http://graph-network:8000"
 
         def fake_resolve_geoip(_combined_queries):
             # One public resolution → full mode must stay engaged.
@@ -1710,7 +1717,6 @@ class TestComputeAllScoresGeoipDemotion:
             )
 
         monkeypatch.setattr(processing, "resolve_indexer_geoip", fake_resolve_geoip)
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
         monkeypatch.setattr(
             processing,
             "fetch_and_filter_graph_node_versions",
@@ -1721,6 +1727,7 @@ class TestComputeAllScoresGeoipDemotion:
             try:
                 compute_all_scores(
                     provider=mock_provider,
+                    indexer_urls={},
                     start_date=date(2026, 5, 1),
                     num_days=28,
                     target_rows=20_000_000,
@@ -1760,13 +1767,11 @@ class TestComputeAllScoresGeoipDemotion:
                 "last_known_slashable_stake": [100.0, 200.0, 300.0],
             }
         )
-        mock_provider.graph_network_url = "http://graph-network:8000"
 
         def fail_if_called(*_args, **_kwargs):
             raise AssertionError("GeoIP resolution must not run in partial mode")
 
         monkeypatch.setattr(processing, "resolve_indexer_geoip", fail_if_called)
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
         monkeypatch.setattr(
             processing,
             "fetch_and_filter_graph_node_versions",
@@ -1775,6 +1780,7 @@ class TestComputeAllScoresGeoipDemotion:
 
         result = compute_all_scores(
             provider=mock_provider,
+            indexer_urls={},
             start_date=date(2026, 5, 1),
             num_days=28,
             target_rows=20_000_000,
@@ -1788,6 +1794,7 @@ class TestComputeAllScoresGeoipDemotion:
         assert (result["dips_info_available"] == False).all()  # noqa: E712
 
 
+@pytest.mark.usefixtures("indexer_urls_read")
 class TestRunScoringModeReporting:
     """The summary log must reflect the published scoring_mode, not the input flag.
 
@@ -1855,7 +1862,7 @@ class TestRunScoringModeReporting:
         monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
         monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
         monkeypatch.setattr(main, "compute_all_scores", raise_pipeline_error)
-        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: degraded_df)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda urls: degraded_df)
 
         with caplog.at_level("INFO", logger=main.logger.name):
             result = main.run_scoring()
@@ -1874,7 +1881,7 @@ class TestRunScoringModeReporting:
         monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
         monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
         monkeypatch.setattr(main, "compute_all_scores", lambda **kwargs: pd.DataFrame())
-        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: None)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda urls: None)
 
         with caplog.at_level("INFO", logger=main.logger.name):
             result = main.run_scoring()
@@ -1893,7 +1900,7 @@ class TestRunScoringModeReporting:
         monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
         monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
         monkeypatch.setattr(main, "compute_all_scores", lambda **kwargs: None)
-        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: degraded_df)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda urls: degraded_df)
 
         with caplog.at_level("INFO", logger=main.logger.name):
             result = main.run_scoring()

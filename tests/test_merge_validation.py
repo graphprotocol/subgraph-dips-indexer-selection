@@ -55,7 +55,9 @@ def test_failed_full_pipeline_logs_the_traceback(monkeypatch, caplog):
     monkeypatch.setattr(main, "compute_all_scores", raise_merge_error)
 
     with caplog.at_level(logging.WARNING, logger=main.logger.name):
-        scores, mode = main._run_full_pipeline(provider=None, geoip_available=True, seed=1)
+        scores, mode = main._run_full_pipeline(
+            provider=None, geoip_available=True, seed=1, indexer_urls={}
+        )
 
     assert scores is None and mode == main.MODE_FAILED
     failure = next(r for r in caplog.records if r.getMessage().startswith("Pipeline failed"))
