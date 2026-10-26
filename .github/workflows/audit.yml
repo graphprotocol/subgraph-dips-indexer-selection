@@ -1,4 +1,4 @@
-# Audits both python dependency trees (pyproject.toml and the cronjob's
+# Audits both python dependency trees (the service's uv.lock and the cronjob's
 # requirements.txt) for known CVEs on every PR and push to main.
 name: audit
 
@@ -20,17 +20,19 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install project dependencies
-        # pip-audit checks the whole environment, including the runner's preinstalled
-        # setuptools, so upgrade it or an old bundled copy fails the audit.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.24"
+
+      # Audits the exact versions in uv.lock, which the service image installs, rather than
+      # what pip would pick today. The dev extra rides along, as it is part of the same lock.
+      - name: List the locked dependencies
         run: |
-          pip install --upgrade setuptools
-          pip install -e ".[dev]" pip-audit==2.10.1
+          uv export --locked --extra dev --no-emit-project --no-hashes -o "$RUNNER_TEMP/locked.txt"
+          pip install pip-audit==2.10.1
 
       - name: pip-audit
-        # The project itself is installed as editable and is not published on PyPI, so skip it
-        # instead of asking PyPI about it; PyPI sometimes answers that lookup with a 503.
-        run: .github/scripts/pip-audit-with-retry.sh --skip-editable
+        run: .github/scripts/pip-audit-with-retry.sh -r "$RUNNER_TEMP/locked.txt" --disable-pip --no-deps
 
   pip-audit-cronjob:
     runs-on: ubuntu-latest
