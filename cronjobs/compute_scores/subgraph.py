@@ -63,13 +63,13 @@ _TRANSIENT_ERRORS = (
     requests.exceptions.ContentDecodingError,
     requests.exceptions.JSONDecodeError,
     ConnectionError,
-    SubgraphResponseError,
 )
 
 
 def is_retryable_subgraph_error(error: BaseException) -> bool:
     """True for failures a retry can clear: _TRANSIENT_ERRORS, a 408, 429 or 5xx reply, or a
-    SubgraphResponseError (the gateway reports a failing indexer as a GraphQL error).
+    SubgraphResponseError marked retryable (the gateway reports a failing indexer as a GraphQL
+    error).
     A rejected key, a wrong URL or a malformed one fails the same way every time.
     """
     if isinstance(error, requests.HTTPError):
