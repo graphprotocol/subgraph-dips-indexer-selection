@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sync-status-fetcher
+  namespace: subgraph-dips-indexer-selection-iisa-daily-cronjob-samuel
+  labels:
+    app: iisa-sync-status-fetcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: iisa-sync-status-fetcher
+  template:
+    metadata:
+      labels:
+        app: iisa-sync-status-fetcher
+    spec:
+      # The fetcher never calls the Kubernetes API, so it has no use for a service account token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      imagePullSecrets:
+        - name: github-registry-secret
+      containers:
+        - name: sync-status-fetcher
+          # The score-computation CronJob's image, which ships the fetcher; the rebuild workflow bumps both tags.
+          image: ghcr.io/graphprotocol/subgraph-dips-indexer-selection-cronjob:sha-dd249f7
+          imagePullPolicy: Always
+          command: ["python", "sync_status_fetcher.py"]
+          ports:
+            - name: health
+              containerPort: 9091
+              protocol: TCP
+          env:
+            - name: SYNC_STATUS_FETCH_INTERVAL
+              value: "3600"
+            - name: SYNC_STATUS_HTTP_PORT
+              value: "9091"
+            - name: GRAPH_NETWORK_SUBGRAPH_URL
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-redpanda-credentials
+                  key: GRAPH_NETWORK_SUBGRAPH_URL
+            - name: IISA_API_URL
+              value: "http://iisa:8080"
+            - name: IISA_PUSH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-push-token
+                  key: IISA_PUSH_TOKEN
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          # /health is 503 until the first push and again once 2 pushes in a row fail, so a stuck
+          # fetcher is restarted (which also picks up a rotated token). The first cycle probes every
+          # indexer, so it gets 15 minutes. No readiness probe: nothing sends this pod traffic.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The root filesystem is read-only, so anything that needs scratch space gets /tmp.
+        - name: tmp
+          emptyDir: {}

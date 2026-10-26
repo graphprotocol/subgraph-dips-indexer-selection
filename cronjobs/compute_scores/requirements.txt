@@ -1,17 +1,17 @@
 # Data processing
-pandas>=2.0,<4.0
+pandas>=3.1.0,<4.0
 numpy>=1.24,<3.0
 pyarrow>=23.0.1,<25.0
 
 # Machine learning (for linear regression)
 scipy>=1.11,<2.0
-scikit-learn>=1.3,<2.0
+scikit-learn>=1.9.1,<2.0
 
 # GeoIP resolution (offline, using MaxMind GeoLite2 databases)
-geoip2>=5.0,<6.0
+geoip2>=5.3.0,<6.0
 
 # Retry logic
-tenacity>=8.2,<10.0
+tenacity>=9.2.1,<10.0
 
 # Airport data (for IATA geolocation)
 airportsdata>=20260905
@@ -26,13 +26,13 @@ requests>=2.34.2,<3.0
 protobuf>=7.36.2,<8.0
 
 # CIDv0 base58 encoding for deployment hashes
-base58>=2.1,<3.0
+base58>=2.1.1,<3.0
 
 # Async HTTP for /dips/info endpoint fetching
 aiohttp>=3.14.5,<4.0
 
 # PEP 440 version comparison for the graph-node minimum-version filter
-packaging>=21.0,<26.0
+packaging>=26.3,<27.0
 
 # Transitive pins to keep the vulnerability scanner happy.
 idna>=3.20

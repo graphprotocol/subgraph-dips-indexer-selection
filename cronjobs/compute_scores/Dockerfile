@@ -1,5 +1,5 @@
 # Build stage - install dependencies with gcc and generate protobuf code
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
@@ -18,7 +18,7 @@ COPY proto/ proto/
 RUN protoc -I proto --python_out=. proto/gateway_queries.proto
 
 # Runtime stage - clean image without gcc
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 

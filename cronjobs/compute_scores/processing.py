@@ -10,7 +10,9 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
+import reprlib
 import socket
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -29,7 +31,6 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from subgraph import paginate_subgraph_query
 
 if TYPE_CHECKING:
     import aiohttp
@@ -199,41 +200,6 @@ def _get_min_graph_node_version_strict() -> bool:
     return raw not in _MIN_GRAPH_NODE_VERSION_STRICT_FALSE_VALUES
 
 
-def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
-    """Query the Graph Network subgraph for indexer addresses and service URLs.
-
-    The subgraph is the source of truth — Redpanda only sees indexers the gateway
-    has routed to, so newly registered ones are invisible without this lookup.
-    Returns {address: url} for indexers with a URL, or {} on any failure.
-    """
-    if not network_subgraph_url:
-        logger.warning("GRAPH_NETWORK_SUBGRAPH_URL not set, cannot discover indexers from subgraph")
-        return {}
-
-    query = """
-    query($first: Int!, $lastId: String!) {
-      indexers(first: $first, where: { id_gt: $lastId, url_not: "" }, orderBy: id) {
-        id
-        url
-      }
-    }
-    """
-    try:
-        raw_indexers = paginate_subgraph_query(network_subgraph_url, query, entity="indexers")
-    except Exception as e:
-        logger.warning(f"Failed to query network subgraph: {e}")
-        return {}
-
-    all_indexers: Dict[str, str] = {}
-    for indexer in raw_indexers:
-        url = indexer.get("url", "")
-        if url:
-            all_indexers[indexer["id"]] = url
-
-    logger.info(f"Discovered {len(all_indexers)} indexers from network subgraph")
-    return all_indexers
-
-
 def _extract_dips_prices(data: dict) -> tuple:
     """Pull the two min-price fields out of a /dips/info response.
 
@@ -251,6 +217,105 @@ def _extract_dips_prices(data: dict) -> tuple:
     return min_prices, min_entity_price
 
 
+_LOG_REPR = reprlib.Repr()
+_LOG_REPR.maxlevel = 2
+_LOG_REPR.maxstring = _LOG_REPR.maxlong = _LOG_REPR.maxother = 60
+_MAX_LOGGED_CHARS = 200
+
+
+def _for_log(value: object) -> str:
+    """Quote a value an indexer sent for a log line: escaped, so a line break in it cannot start a
+    fake log line, and cut short, so a huge value cannot flood the log on every run.
+    """
+    text = _LOG_REPR.repr(value)
+    return text if len(text) <= _MAX_LOGGED_CHARS else text[:_MAX_LOGGED_CHARS] + "..."
+
+
+def _parse_price(value: object) -> Optional[float]:
+    """An advertised price (JSON number or text) as a float if finite and >= 0, else None.
+
+    Any indexer can serve arbitrary JSON from /dips/info: NaN was scored as the cheapest price
+    and a negative one passed every ceiling. Store the float, not the raw value: float() reads
+    text like "1_000" that the selection service's per-entity parser reads as no price.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        price = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return price if math.isfinite(price) and price >= 0 else None
+
+
+def _valid_chain_prices(indexer: str, min_prices: dict) -> dict:
+    """Keep each per-chain base price as a float, dropping and logging any that is not valid.
+
+    The selection service treats a chain with no price as unpriced and excludes the indexer there.
+    """
+    valid = {}
+    for chain, price in min_prices.items():
+        parsed = _parse_price(price)
+        if parsed is not None:
+            valid[chain] = parsed
+        else:
+            logger.warning(
+                "Ignoring invalid DIPs base price from indexer %s for chain %s: %s",
+                indexer,
+                _for_log(chain),
+                _for_log(price),
+            )
+    return valid
+
+
+def _unavailable_dips_info(indexer: str) -> dict:
+    """The stored row for an indexer whose DIPs info is missing or unusable."""
+    return {
+        "indexer": indexer,
+        "dips_info_available": False,
+        "dips_min_grt_per_30_days": "{}",
+        "dips_min_grt_per_billion_entities_per_30_days": None,
+        "dips_supported_networks": "[]",
+    }
+
+
+def _dips_info_record(indexer: str, data: object) -> dict:
+    """Turn one indexer's /dips/info response into the row stored for it."""
+    if not isinstance(data, dict):
+        logger.warning(
+            "Ignoring DIPs info from indexer %s: /dips/info body is %s, not a JSON object",
+            indexer,
+            "empty or null" if data is None else type(data).__name__,
+        )
+        return _unavailable_dips_info(indexer)
+    min_prices, min_entity_price = _extract_dips_prices(data)
+    entity_price = None if min_entity_price is None else _parse_price(min_entity_price)
+    if min_entity_price is not None and entity_price is None:
+        # A missing per-entity price means the indexer accepts any price: it passes every ceiling
+        # and is offered 0. Dropping only the bad value would reward it, so the whole response is
+        # treated as unusable instead.
+        logger.warning(
+            "Ignoring DIPs info from indexer %s: invalid per-entity price %s",
+            indexer,
+            _for_log(min_entity_price),
+        )
+        return _unavailable_dips_info(indexer)
+
+    chain_prices = _valid_chain_prices(indexer, min_prices) if isinstance(min_prices, dict) else {}
+    supported_networks = data.get("supported_networks", [])
+    # If supported_networks not explicitly provided, infer from the valid price keys
+    if not supported_networks:
+        supported_networks = list(chain_prices.keys())
+    return {
+        "indexer": indexer,
+        "dips_info_available": True,
+        "dips_min_grt_per_30_days": json.dumps(chain_prices),
+        "dips_min_grt_per_billion_entities_per_30_days": None
+        if entity_price is None
+        else str(entity_price),
+        "dips_supported_networks": json.dumps(supported_networks),
+    }
+
+
 async def _fetch_single_dips_info_async(
     session: "aiohttp.ClientSession",
     indexer: str,
@@ -262,7 +327,7 @@ async def _fetch_single_dips_info_async(
 
     dips_url = url.rstrip("/") + "/dips/info"
 
-    async def do_fetch() -> dict:
+    async def do_fetch() -> object:
         async with semaphore:
             async with session.get(
                 dips_url,
@@ -276,29 +341,12 @@ async def _fetch_single_dips_info_async(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                body: dict = await resp.json()
-                return body
+                return await resp.json()
 
     last_error: Optional[Exception] = None
     for attempt in range(DIPS_INFO_MAX_RETRIES):
         try:
             data = await do_fetch()
-            min_prices, min_entity_price = _extract_dips_prices(data)
-            supported_networks = data.get("supported_networks", [])
-            # If supported_networks not explicitly provided, infer from price keys
-            if not supported_networks and isinstance(min_prices, dict):
-                supported_networks = list(min_prices.keys())
-            return {
-                "indexer": indexer,
-                "dips_info_available": True,
-                "dips_min_grt_per_30_days": json.dumps(min_prices)
-                if isinstance(min_prices, dict)
-                else "{}",
-                "dips_min_grt_per_billion_entities_per_30_days": str(min_entity_price)
-                if min_entity_price is not None
-                else None,
-                "dips_supported_networks": json.dumps(supported_networks),
-            }
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = e
             if attempt < DIPS_INFO_MAX_RETRIES - 1:
@@ -307,15 +355,22 @@ async def _fetch_single_dips_info_async(
                     DIPS_INFO_RETRY_BACKOFF_MULTIPLIER * (2**attempt),
                 )
                 await asyncio.sleep(delay)
+            continue
+        except (ValueError, LookupError, RecursionError) as e:
+            # Not JSON, not in its declared charset, or nested too deep. That is the indexer's
+            # answer, not a network fault, so it is not retried. Uncaught, it would fail the
+            # fetch for every indexer.
+            logger.warning(
+                "Ignoring DIPs info from indexer %s: unreadable /dips/info body (%s: %s)",
+                indexer,
+                type(e).__name__,
+                e,
+            )
+            return _unavailable_dips_info(indexer)
+        return _dips_info_record(indexer, data)
 
     logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {last_error}")
-    return {
-        "indexer": indexer,
-        "dips_info_available": False,
-        "dips_min_grt_per_30_days": "{}",
-        "dips_min_grt_per_billion_entities_per_30_days": None,
-        "dips_supported_networks": "[]",
-    }
+    return _unavailable_dips_info(indexer)
 
 
 async def _fetch_all_dips_info_async(indexer_urls: Dict[str, str]) -> List[dict]:
@@ -879,6 +934,7 @@ def _attach_dips_info(merged: pd.DataFrame, indexer_urls: Dict[str, str]) -> pd.
 
 def compute_all_scores(
     provider,
+    indexer_urls: Dict[str, str],
     start_date: date,
     num_days: int,
     target_rows: int,
@@ -889,6 +945,7 @@ def compute_all_scores(
 
     Full (geoip_available=True): GeoIP + latency regression + uptime + success + stake.
     Partial: latency neutral (0.5), other metrics from real Redpanda data.
+    indexer_urls is the network subgraph's {address: url}, probed for DIP pricing.
     """
     # Fetch initial query results to determine sampling
     initial_query_results = provider.fetch_initial_query_results(start_date, num_days)
@@ -938,17 +995,14 @@ def compute_all_scores(
         drop_missing_latency=geoip_available,
     )
 
-    # DIP pricing fetched directly from indexers; the indexer list comes from
-    # the network subgraph (Redpanda only has indexers the gateway has queried,
-    # so newly registered ones would be invisible without this lookup).
-    indexer_urls = discover_indexers_from_network_subgraph(provider.graph_network_url)
+    # DIP pricing fetched directly from indexers
     merged = _attach_dips_info(merged, indexer_urls)
 
     # Attach graph-node versions and drop indexers below the configured
     # minimum (no-op when MIN_GRAPH_NODE_VERSION is unset).
     merged = fetch_and_filter_graph_node_versions(merged, indexer_urls)
 
-    # Transform to indexer_scores schema with pre-normalized values
+    # Transform to indexer_scores schema
     scores_df = transform_to_scores_schema(merged)
     scores_df["scoring_mode"] = "full" if geoip_available else "partial_no_geoip"
 
@@ -964,7 +1018,7 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     """
     Transform the merged DataFrame to the indexer_scores output schema.
 
-    Includes pre-normalizing static metrics.
+    Pre-normalizes latency only; the IISA service scales the other metrics itself.
     """
     # Build the output DataFrame
     scores = pd.DataFrame()
@@ -997,10 +1051,6 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     scores["stake_to_fees"] = merged.get("stake_to_fees")
     scores["total_query_fees"] = merged.get("total_query_fees", 0.0)
     scores["last_known_slashable_stake"] = merged.get("last_known_slashable_stake", 0.0)
-
-    # Pre-normalized scores
-    scores["norm_uptime_score"] = normalize_to_0_1(scores["uptime_score"])
-    scores["norm_success_rate"] = normalize_to_0_1(scores["success_rate"])
 
     # Organization/location
     scores["org"] = merged.get("org")
@@ -1665,16 +1715,12 @@ def merge_and_prepare_dataframes(
     return merged
 
 
-def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
+def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     """Equal quality metrics for every indexer, real per-indexer pricing from /dips/info.
 
-    Last-resort fallback when the full pipeline can't run. Indexer list comes
-    from the network subgraph; per-indexer pricing from /dips/info.
+    Last-resort fallback when the full pipeline can't run. indexer_urls is the network
+    subgraph's {address: url}; per-indexer pricing comes from /dips/info.
     """
-    indexer_urls = discover_indexers_from_network_subgraph(graph_network_subgraph_url)
-    if not indexer_urls:
-        return pd.DataFrame()
-
     dips_info_df = fetch_dips_info(indexer_urls)
     now = datetime.now(timezone.utc)
 
@@ -1695,8 +1741,6 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
     scores["uptime_duration_seconds"] = None
     scores["success_rate"] = 0.5
     scores["stake_to_fees"] = None
-    scores["norm_uptime_score"] = 0.5
-    scores["norm_success_rate"] = 0.5
     scores["norm_stake_to_fees"] = 0.5
     scores["org"] = None
     scores["dst_lat"] = None
