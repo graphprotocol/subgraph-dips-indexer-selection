@@ -406,8 +406,14 @@ RAW_METRICS = {
     "base_price_per_epoch": st.floats(min_value=0, max_value=1e6),
     "price_per_entity": st.floats(min_value=0, max_value=1e6),
 }
-# Scores the CronJob ships already normalised; the service keeps them as they are.
-CARRIED_NORMS = ["norm_lat_lin_reg_coefficient", "norm_uptime_score", "norm_success_rate"]
+# Scores the CronJob ships already normalised. The service keeps latency and stake_to_fees as
+# they are and recomputes uptime and success rate, so their copies here must be ignored.
+CARRIED_NORMS = [
+    "norm_lat_lin_reg_coefficient",
+    "norm_stake_to_fees",
+    "norm_uptime_score",
+    "norm_success_rate",
+]
 
 
 @st.composite
@@ -435,8 +441,12 @@ def metric_tables(draw: st.DrawFn) -> pd.DataFrame:
 @example(table=pd.DataFrame({"indexer": INDEXER_IDS[:2], "stake_to_fees": [0.0, "abc"]}))
 @example(table=pd.DataFrame({"indexer": INDEXER_IDS[:1], "average_status": [None]}))
 # A carried-over norm_ score was kept as pushed, so a value of 2 or inf outranked everyone.
-@example(table=pd.DataFrame({"indexer": INDEXER_IDS[:1], "norm_success_rate": [2.0]}))
-@example(table=pd.DataFrame({"indexer": INDEXER_IDS[:2], "norm_uptime_score": [math.inf, "x"]}))
+@example(table=pd.DataFrame({"indexer": INDEXER_IDS[:1], "norm_stake_to_fees": [2.0]}))
+@example(
+    table=pd.DataFrame(
+        {"indexer": INDEXER_IDS[:2], "norm_lat_lin_reg_coefficient": [math.inf, "x"]}
+    )
+)
 def test_normalised_metrics_are_finite_and_within_unit_range(table):
     normalized = _normalize_metrics(table.copy())
     assert len(normalized) == len(table)
@@ -652,7 +662,9 @@ def _assert_selection_scores(selector: Optional[IndexerSelector]) -> None:
 @example(case=_example_case([_example_row(FIRST, "org-a", stake_to_fees=None)], num_candidates=1))
 # Text in a carried-over norm_ score failed the score breakdown log, so selection gave a 500.
 @example(
-    case=_example_case([_example_row(FIRST, "org-a", norm_uptime_score="x")], num_candidates=1)
+    case=_example_case(
+        [_example_row(FIRST, "org-a", norm_lat_lin_reg_coefficient="x")], num_candidates=1
+    )
 )
 def test_selection_respects_size_blocklist_and_price_rules(case):
     request = case.request
