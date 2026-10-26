@@ -6,7 +6,8 @@ Pushes the resulting snapshot directly to the iisa HTTP service via
 iisa_client.post_sync_status; no shared filesystem is involved.
 
 HTTP endpoints:
-  GET /health  -- healthcheck (503 until first write)
+  GET /health  -- healthcheck (503 until the first push, and again once the
+                  last push is older than SYNC_STATUS_MAX_PUSH_AGE seconds)
 """
 
 import asyncio
@@ -39,6 +40,9 @@ MAX_RETRIES = int(os.environ.get("SYNC_STATUS_MAX_RETRIES", "5"))
 RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MULTIPLIER", "1"))
 RETRY_BACKOFF_MAX = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MAX", "5"))
 HTTP_PORT = int(os.environ.get("SYNC_STATUS_HTTP_PORT", "9091"))
+# Unhealthy once 2 cycles in a row fail to push. The extra half interval leaves room for the
+# cycles' own run time, so 1 failed cycle followed by a slow good one stays healthy.
+MAX_PUSH_AGE = int(os.environ.get("SYNC_STATUS_MAX_PUSH_AGE", str(FETCH_INTERVAL * 5 // 2)))
 GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
 IISA_API_URL = os.environ.get("IISA_API_URL", "")
 # Read the bearer token once at module load so rotation requires a restart —
@@ -50,7 +54,7 @@ STATUS_QUERY = "{ indexingStatuses { subgraph synced health } }"
 JSON_CONTENT_TYPE = "application/json"
 
 # Service state
-_last_write_time: Optional[str] = None
+_last_write_time: Optional[datetime] = None
 _stop_event = threading.Event()
 
 
@@ -174,7 +178,7 @@ def run_fetch_cycle() -> bool:
         logger.error("Failed to push sync status to iisa: %s", e)
         return False
 
-    _last_write_time = datetime.now(timezone.utc).isoformat()
+    _last_write_time = datetime.now(timezone.utc)
     logger.info("Pushed sync status for %d indexers to iisa", len(data))
     return True
 
@@ -184,26 +188,29 @@ def run_fetch_cycle() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _health(now: datetime) -> tuple[int, dict]:
+    """Return the /health status code and body: healthy only while the last push is recent."""
+    if _last_write_time is None:
+        return 503, {"status": "not_ready"}
+
+    age_seconds = (now - _last_write_time).total_seconds()
+    body = {
+        "last_write": _last_write_time.isoformat(),
+        "last_write_age_seconds": int(age_seconds),
+    }
+    if age_seconds > MAX_PUSH_AGE:
+        return 503, {"status": "stale", **body}
+    return 200, {"status": "healthy", **body}
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
-            if _last_write_time is not None:
-                self.send_response(200)
-                self.send_header("Content-Type", JSON_CONTENT_TYPE)
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps(
-                        {
-                            "status": "healthy",
-                            "last_write": _last_write_time,
-                        }
-                    ).encode()
-                )
-            else:
-                self.send_response(503)
-                self.send_header("Content-Type", JSON_CONTENT_TYPE)
-                self.end_headers()
-                self.wfile.write(b'{"status": "not_ready"}')
+            code, body = _health(datetime.now(timezone.utc))
+            self.send_response(code)
+            self.send_header("Content-Type", JSON_CONTENT_TYPE)
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
         else:
             self.send_response(404)
             self.end_headers()
