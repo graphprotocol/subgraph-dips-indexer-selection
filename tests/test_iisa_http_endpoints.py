@@ -963,11 +963,14 @@ class TestScoresWeightedEndpoint:
                     "indexer": ["0xabc", "0xxyz"],
                     "url": ["https://a.example/", "https://b.example/"],
                     "norm_lat_lin_reg_coefficient": [0.8, 0.6],
+                    "norm_stake_to_fees": [0.5, 0.65],
+                    # Pre-scaled copies the selector must ignore in favour of the raw values.
                     "norm_uptime_score": [0.9, 0.95],
                     "norm_success_rate": [0.85, 0.9],
-                    "norm_stake_to_fees": [0.5, 0.65],
-                    "norm_base_price_per_epoch": [0.7, 0.9],
-                    "norm_price_per_entity": [0.6, 0.8],
+                    "% up_x": [98.5, 100.0],
+                    "average_status": [0.985, 1.0],
+                    "base_price_per_epoch": [100.0, 50.0],
+                    "price_per_entity": [0.4, 0.2],
                 }
             ),
             computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
@@ -989,20 +992,22 @@ class TestScoresWeightedEndpoint:
         abc = entries_by_id["0xabc"]
         assert isinstance(abc["weighted_score"], float)
         assert 0.0 <= abc["weighted_score"] <= 1.0
+        # Latency and stake_to_fees arrive pre-scaled and are kept; the rest are scaled here.
+        # 98.5% of the best sits halfway between the 97% cutoff and the best.
         assert abc["components"]["latency"] == 0.8
-        assert abc["components"]["uptime"] == 0.9
-        assert abc["components"]["success_rate"] == 0.85
+        assert abc["components"]["uptime"] == pytest.approx(0.5)
+        assert abc["components"]["success_rate"] == pytest.approx(0.5)
         assert abc["components"]["stake_to_fees"] == 0.5
-        assert abc["components"]["base_price"] == 0.7
-        assert abc["components"]["price_per_entity"] == 0.6
+        assert abc["components"]["base_price"] == pytest.approx(0.0)
+        assert abc["components"]["price_per_entity"] == pytest.approx(0.0)
 
         xyz = entries_by_id["0xxyz"]
         assert xyz["components"]["latency"] == 0.6
-        assert xyz["components"]["uptime"] == 0.95
-        assert xyz["components"]["success_rate"] == 0.9
+        assert xyz["components"]["uptime"] == pytest.approx(1.0)
+        assert xyz["components"]["success_rate"] == pytest.approx(1.0)
         assert xyz["components"]["stake_to_fees"] == 0.65
-        assert xyz["components"]["base_price"] == 0.9
-        assert xyz["components"]["price_per_entity"] == 0.8
+        assert xyz["components"]["base_price"] == pytest.approx(0.5)
+        assert xyz["components"]["price_per_entity"] == pytest.approx(0.5)
 
     def test_nan_component_normalised_to_zero(self):
         from iisa import iisa_http_endpoints
@@ -1019,11 +1024,9 @@ class TestScoresWeightedEndpoint:
                     "indexer": ["0xabc"],
                     "url": ["https://a.example/"],
                     "norm_lat_lin_reg_coefficient": [float("nan")],
-                    "norm_uptime_score": [0.9],
-                    "norm_success_rate": [0.85],
                     "norm_stake_to_fees": [0.5],
-                    "norm_base_price_per_epoch": [0.7],
-                    "norm_price_per_entity": [0.6],
+                    "% up_x": [99.7],
+                    "average_status": [0.99],
                 }
             ),
             computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
@@ -1038,7 +1041,7 @@ class TestScoresWeightedEndpoint:
         # _normalize_metrics fills NaN with 0 across every norm_* column, so a
         # NaN latency input lands as a 0.0 latency in the response — not skipped.
         assert components["latency"] == 0.0
-        assert components["uptime"] == 0.9
+        assert components["uptime"] == 1.0
 
     def test_weighted_score_none_when_calculation_raises(self, monkeypatch):
         from iisa import iisa_http_endpoints
@@ -1054,7 +1057,7 @@ class TestScoresWeightedEndpoint:
                 {
                     "indexer": ["0xabc"],
                     "url": ["https://a.example/"],
-                    "norm_uptime_score": [0.9],
+                    "% up_x": [99.7],
                 }
             ),
             computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
@@ -1074,7 +1077,7 @@ class TestScoresWeightedEndpoint:
         body = response.json()
         assert body["scores"][0]["indexer"] == "0xabc"
         assert body["scores"][0]["weighted_score"] is None
-        assert body["scores"][0]["components"]["uptime"] == 0.9
+        assert body["scores"][0]["components"]["uptime"] == 1.0
 
     def test_returns_empty_snapshot_when_no_scores_loaded(self):
         from iisa import iisa_http_endpoints

@@ -630,6 +630,12 @@ class IndexerSelector:
         return [("synced", synced), ("unsynced", unsynced)]
 
 
+# Norm columns the CronJob ships already normalised and the selector keeps: latency, and
+# stake_to_fees in degraded mode (a neutral 0.5). Every other norm_ column is recomputed from
+# its raw value, so a pre-scaled copy can't replace the selector's own scaling.
+_PRECOMPUTED_NORM_COLUMNS = frozenset({"norm_lat_lin_reg_coefficient", "norm_stake_to_fees"})
+
+
 def _normalize_metrics(
     merged: pd.DataFrame,
     price_ceiling: Optional[float] = None,
@@ -638,7 +644,7 @@ def _normalize_metrics(
 
     price_ceiling, when given, caps pricing normalisation instead of using the
     observed max, so one outlier price can't compress the rest. Missing metrics
-    normalise to NaN, then to 0.
+    score 0. Input norm_ columns outside _PRECOMPUTED_NORM_COLUMNS are recomputed.
     """
     # (norm column, source column, normaliser), in the order the columns are added.
     metrics: list[tuple[str, str, Callable[[pd.Series], Union[pd.Series, float]]]] = [
@@ -661,9 +667,8 @@ def _normalize_metrics(
             merged[norm_col] = pd.Series(dtype=float)
         return merged
 
-    # Keep a norm_ column the input already carries (the CronJob ships latency normalised).
     for norm_col, source_col, normalize in metrics:
-        if norm_col in merged.columns:
+        if norm_col in _PRECOMPUTED_NORM_COLUMNS and norm_col in merged.columns:
             continue
         if source_col in merged.columns:
             merged[norm_col] = normalize(merged[source_col])
