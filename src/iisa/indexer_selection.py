@@ -269,12 +269,15 @@ class IndexerSelector:
     def _scale_rows(self) -> Optional[pd.Series]:
         """Rows that set each metric's scale: the group plus every indexer this request can pick.
 
-        Blocked, declined and pending indexers are left out, so one with the best uptime can't
-        push every real candidate below the 97%-of-best cutoff.
+        Blocked and declined indexers are left out even when in the group, so one with the best
+        uptime can't push every real candidate below the 97%-of-best cutoff.
         """
         if "indexer" not in self.data.columns:
             return None
-        excluded = self._unpickable_indexers() - set(self.current_group)
+        blocked = set(self.indexer_denylist) | set(
+            self.declined_indexers.get(self.deployment_id, [])
+        )
+        excluded = (self._unpickable_indexers() - set(self.current_group)) | blocked
         return ~self.data["indexer"].isin(excluded)
 
     def _assign_indexers_to_subgraph(self):

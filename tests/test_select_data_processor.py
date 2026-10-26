@@ -961,6 +961,28 @@ class TestScaleSetByPickableIndexers:
         data = processor.data.set_index("indexer")
         assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.0, 0.0])
 
+    @pytest.mark.parametrize(
+        "exclusion",
+        [
+            {"indexer_denylist": ["A"]},
+            {"declined_indexers": {"test_subgraph": ["A"]}},
+        ],
+        ids=["blocked", "declined"],
+    )
+    def test_blocked_group_member_does_not_set_the_uptime_bar(self, exclusion):
+        """A is in the group but blocked, so B's 95% is the bar, not A's 100%."""
+        history = self._history(**{"% up_x": [100.0, 95.0, 93.575]})
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            existing_agreements={DeploymentId("test_subgraph"): [IndexerId("A")]},
+            **exclusion,
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 1.0, 0.5])
+
     def test_zero_fee_candidates_keep_full_stake_to_fees_marks(self):
         """With only zero-fee indexers left to pick, they still score 1.0 (maximum capacity)."""
         history = self._history(stake_to_fees=[100.0, np.nan, np.nan])
