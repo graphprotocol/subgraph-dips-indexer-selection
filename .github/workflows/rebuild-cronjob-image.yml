@@ -71,8 +71,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH_NAME="chore/update-cronjob-image-${{ steps.tags.outputs.sha_short }}"
-          # The sync-status fetcher runs from the same image, so both manifests move together.
-          MANIFESTS=(k8s/score-computation-cronjob.yaml k8s/sync-status-fetcher.yaml)
+          # Every manifest that runs this image moves together (today the CronJob and the
+          # sync-status fetcher), so a new one is picked up without editing this step.
+          MANIFESTS=()
+          while IFS= read -r manifest; do
+            MANIFESTS+=("$manifest")
+          done < <(grep -rlF "image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:" k8s/)
+          if [ "${#MANIFESTS[@]}" -eq 0 ]; then
+            echo "::error::no manifest under k8s/ uses ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}, so the new tag could not be written"
+            exit 1
+          fi
           for manifest in "${MANIFESTS[@]}"; do
             sed -i 's|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: ${{ steps.tags.outputs.sha_tag }}|' "$manifest"
 
@@ -93,7 +101,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH_NAME"
           git add "${MANIFESTS[@]}"
-          git commit -m "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}"
+          git commit -m "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}" \
+            -m "Updates every manifest that runs this image: ${MANIFESTS[*]}"
           git push -u origin "$BRANCH_NAME"
 
           gh pr create \
@@ -104,7 +113,7 @@ jobs:
 
           After merging, run:
           \`\`\`bash
-          kubectl apply -f k8s/score-computation-cronjob.yaml -f k8s/sync-status-fetcher.yaml
+          kubectl apply $(printf -- '-f %s ' "${MANIFESTS[@]}")
           \`\`\`"
 
       - name: Summary
