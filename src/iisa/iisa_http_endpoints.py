@@ -1469,6 +1469,43 @@ def _log_selection_reasoning(processor: IndexerSelector, deployment_id: str) -> 
         )
 
 
+def _members_to_drop(history: pd.DataFrame, request: SelectionRequest) -> dict[str, str]:
+    """Group members that must leave, each with the reason: the request blocklists it, or its
+    own DIPs info fails a price check. A member with no score row or no DIPs info stays, since
+    a failed /dips/info fetch looks the same, and dipper cancels the agreement of any member
+    left out.
+    """
+    members = request.existing_indexers or []
+    blocked = set(request.blocklist or [])
+    reasons = {member: "blocklisted" for member in members if member in blocked}
+    if "dips_info_available" not in history.columns:
+        return reasons
+    rows = history[history["indexer"].isin(members) & ~history["indexer"].isin(list(reasons))]
+    with_info, _ = _keep_with_dips_info(rows)
+    passing, _ = _filter_by_price(
+        with_info,
+        request.chain_id,
+        request.max_grt_per_30_days,
+        request.max_grt_per_billion_entities_per_30_days,
+    )
+    for member in set(with_info["indexer"]) - set(passing["indexer"]):
+        reasons[member] = "its advertised prices fail the price checks"
+    return reasons
+
+
+def _without_failing_members(history: pd.DataFrame, request: SelectionRequest) -> SelectionRequest:
+    """The request with any group member that must leave taken out of existing_indexers."""
+    dropped = _members_to_drop(history, request)
+    if not dropped:
+        return request
+    for member, reason in sorted(dropped.items()):
+        logger.info(
+            "deployment=%s dropping group member %s: %s", request.deployment_id, member, reason
+        )
+    kept = [member for member in request.existing_indexers or [] if member not in dropped]
+    return request.model_copy(update={"existing_indexers": kept})
+
+
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """Run IndexerSelector and return a SelectionResponse for the deployment.
 
@@ -1479,10 +1516,18 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     if _state.history is None:
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
 
-    # Filter by price constraints before scoring
+    request = _without_failing_members(_state.history, request)
+
+    # Filter by price constraints before scoring. With no candidate left, the members that
+    # may stay are the answer, since an empty one makes dipper cancel every agreement.
     filtered_history = _price_filtered_candidates(_state.history, request)
     if filtered_history is None:
-        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+        return SelectionResponse(
+            deployment_id=request.deployment_id,
+            indexers=_build_selected_indexers(
+                list(request.existing_indexers or []), _state.history, request.chain_id
+            ),
+        )
 
     # Enrich with chain-specific price columns for normalization
     enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
