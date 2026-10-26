@@ -28,7 +28,7 @@ from functools import lru_cache, partial
 from typing import Annotated, Any, NamedTuple, Optional, cast
 
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -273,6 +273,24 @@ class SyncStatusAcceptedResponse(BaseModel):
     indexers: int
 
 
+class ErrorResponse(BaseModel):
+    """Body of each error answer other than a 422: what went wrong, in words."""
+
+    detail: str
+
+
+_ERROR_RESPONSES: dict[int, dict[str, Any]] = {
+    400: {"model": ErrorResponse, "description": "The body could not be read as text"},
+    401: {"model": ErrorResponse, "description": "The bearer token is missing or wrong"},
+    503: {"model": ErrorResponse, "description": "The service has not started or has no scores"},
+}
+
+
+def _documented_errors(*codes: int) -> dict[int | str, dict[str, Any]]:
+    """OpenAPI entries for the error answers a route gives besides FastAPI's own 422."""
+    return {code: _ERROR_RESPONSES[code] for code in codes}
+
+
 # =============================================================================
 # Service State
 # =============================================================================
@@ -500,9 +518,9 @@ def _supports_chain(networks_json: Any, chain_id: str) -> bool:
 def _require_push_token(authorization: Optional[str]) -> None:
     """Validate the bearer token against IISA_PUSH_TOKEN.
 
-    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). Uses
-    hmac.compare_digest to dodge timing oracles. "Bearer" prefix matched
-    case-insensitively per RFC 6750 §2.1; the token itself is case-sensitive.
+    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). "Bearer" is
+    matched in any letter case per RFC 6750 §2.1, the token exactly. hmac.compare_digest
+    dodges timing oracles; it compares bytes, since it refuses text with non-ASCII letters.
     """
     expected = get_settings().push_token
     if not expected:
@@ -510,7 +528,7 @@ def _require_push_token(authorization: Optional[str]) -> None:
     if not authorization or authorization[:7].lower() != "bearer ":
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
     provided = authorization[7:].strip()
-    if not hmac.compare_digest(provided, expected):
+    if not hmac.compare_digest(provided.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
@@ -650,9 +668,11 @@ async def health_check() -> HealthResponse:
     )
 
 
-@app.post("/scores", response_model=ScoresAcceptedResponse)
+@app.post(
+    "/scores", response_model=ScoresAcceptedResponse, responses=_documented_errors(400, 401, 503)
+)
 def push_scores(
-    payload: list[dict[str, Any]],
+    payload: Annotated[list[dict[str, Any]], Body(min_length=1)],
     authorization: Optional[str] = Header(None),
 ) -> ScoresAcceptedResponse:
     """Accept a pushed scores snapshot from the cronjob.
@@ -663,12 +683,6 @@ def push_scores(
     """
     _require_push_token(authorization)
 
-    if not payload:
-        raise HTTPException(
-            status_code=422,
-            detail="scores payload must be a non-empty list of records",
-        )
-
     if not _state._initialized:
         raise HTTPException(
             status_code=503,
@@ -678,9 +692,9 @@ def push_scores(
     try:
         rows = _state.load_scores_from_records(payload)
     except ScoresPayloadError as e:
-        # Wrong-shape body: the caller's problem, so 422 not 500.
+        # Wrong-shape body: the caller's problem, so a 422 in the error list every 422 carries.
         logger.warning("Rejected pushed scores: %s", e)
-        raise HTTPException(status_code=422, detail=str(e)) from e
+        raise RequestValidationError(e.errors) from e
     except Exception:
         logger.exception("Failed to accept pushed scores")
         raise HTTPException(status_code=500, detail="Failed to accept scores")
@@ -689,7 +703,7 @@ def push_scores(
     return ScoresAcceptedResponse(status="success", rows=rows)
 
 
-@app.get("/scores/status", response_model=ScoresStatusResponse)
+@app.get("/scores/status", response_model=ScoresStatusResponse, responses=_documented_errors(401))
 def scores_status(
     authorization: Optional[str] = Header(None),
 ) -> ScoresStatusResponse:
@@ -711,7 +725,7 @@ def scores_status(
     return ScoresStatusResponse(computed_at=computed_at, rows=rows)
 
 
-@app.get("/scores", response_model=ScoresSnapshotResponse)
+@app.get("/scores", response_model=ScoresSnapshotResponse, responses=_documented_errors(401))
 def scores_snapshot(
     authorization: Optional[str] = Header(None),
 ) -> ScoresSnapshotResponse:
@@ -852,7 +866,9 @@ def _chain_scores(
     return scores
 
 
-@app.get("/scores/weighted", response_model=WeightedScoresResponse)
+@app.get(
+    "/scores/weighted", response_model=WeightedScoresResponse, responses=_documented_errors(401)
+)
 def scores_weighted(
     authorization: Optional[str] = Header(None),
 ) -> WeightedScoresResponse:
@@ -892,7 +908,7 @@ def scores_weighted(
     )
 
 
-@app.get("/dips-indexers", response_model=DipsIndexersResponse)
+@app.get("/dips-indexers", response_model=DipsIndexersResponse, responses=_documented_errors(401))
 def dips_indexers(
     chain: str,
     max_grt_per_30_days: Optional[float] = Query(default=None, ge=0, allow_inf_nan=False),
@@ -939,7 +955,11 @@ def dips_indexers(
     )
 
 
-@app.post("/sync-status", response_model=SyncStatusAcceptedResponse)
+@app.post(
+    "/sync-status",
+    response_model=SyncStatusAcceptedResponse,
+    responses=_documented_errors(400, 401, 503),
+)
 def push_sync_status(
     payload: dict[str, Any],
     authorization: Optional[str] = Header(None),
@@ -968,7 +988,7 @@ def push_sync_status(
     return SyncStatusAcceptedResponse(status="success", indexers=indexer_count)
 
 
-@app.post("/get-score", response_model=ScoreResponse)
+@app.post("/get-score", response_model=ScoreResponse, responses=_documented_errors(400, 401, 503))
 async def get_score(
     request: ScoreRequest,
     authorization: Optional[str] = Header(None),
@@ -1003,7 +1023,9 @@ async def get_score(
     )
 
 
-@app.post("/select-indexers", response_model=SelectionResponse)
+@app.post(
+    "/select-indexers", response_model=SelectionResponse, responses=_documented_errors(400, 503)
+)
 async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     """Select N indexers for a deployment via weighted scoring.
 
@@ -1499,6 +1521,43 @@ def _log_selection_reasoning(processor: IndexerSelector, deployment_id: str) -> 
         )
 
 
+def _members_to_drop(history: pd.DataFrame, request: SelectionRequest) -> dict[str, str]:
+    """Group members that must leave, each with the reason: the request blocklists it, or its
+    own DIPs info fails a price check. A member with no score row or no DIPs info stays, since
+    a failed /dips/info fetch looks the same, and dipper cancels the agreement of any member
+    left out.
+    """
+    members = request.existing_indexers or []
+    blocked = set(request.blocklist or [])
+    reasons = {member: "blocklisted" for member in members if member in blocked}
+    if "dips_info_available" not in history.columns:
+        return reasons
+    rows = history[history["indexer"].isin(members) & ~history["indexer"].isin(list(reasons))]
+    with_info, _ = _keep_with_dips_info(rows)
+    passing, _ = _filter_by_price(
+        with_info,
+        request.chain_id,
+        request.max_grt_per_30_days,
+        request.max_grt_per_billion_entities_per_30_days,
+    )
+    for member in set(with_info["indexer"]) - set(passing["indexer"]):
+        reasons[member] = "its advertised prices fail the price checks"
+    return reasons
+
+
+def _without_failing_members(history: pd.DataFrame, request: SelectionRequest) -> SelectionRequest:
+    """The request with any group member that must leave taken out of existing_indexers."""
+    dropped = _members_to_drop(history, request)
+    if not dropped:
+        return request
+    for member, reason in sorted(dropped.items()):
+        logger.info(
+            "deployment=%s dropping group member %s: %s", request.deployment_id, member, reason
+        )
+    kept = [member for member in request.existing_indexers or [] if member not in dropped]
+    return request.model_copy(update={"existing_indexers": kept})
+
+
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """Run IndexerSelector and return a SelectionResponse for the deployment.
 
@@ -1509,10 +1568,18 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     if _state.history is None:
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
 
-    # Filter by price constraints before scoring
+    request = _without_failing_members(_state.history, request)
+
+    # Filter by price constraints before scoring. With no candidate left, the members that
+    # may stay are the answer, since an empty one makes dipper cancel every agreement.
     filtered_history = _price_filtered_candidates(_state.history, request)
     if filtered_history is None:
-        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+        return SelectionResponse(
+            deployment_id=request.deployment_id,
+            indexers=_build_selected_indexers(
+                list(request.existing_indexers or []), _state.history, request.chain_id
+            ),
+        )
 
     # Enrich with chain-specific price columns for normalization
     enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)

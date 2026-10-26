@@ -98,4 +98,5 @@ From those scores it selects the number of indexers the caller asks for, shaped 
 | `src/iisa/` | The HTTP service: the score cache, the weighting, and the selection logic. |
 | `cronjobs/compute_scores/` | The daily measurement job: gateway-traffic replay, metric computation, and the client that pushes scores. |
 | `k8s/` | The Kubernetes manifests for the service and the daily job. |
-| `tests/` | The test suite. |
+| `tests/` | The service's tests, run in CI against the exact versions pinned in `uv.lock`, which the service image installs, under the Python in `.python-version` that the image runs. |
+| `tests/cronjob/` | The daily job's tests, run in CI against what its `requirements.txt` resolves to. |

@@ -46,12 +46,27 @@ def _is_fresh(fetched_at: datetime, now: datetime, staleness_threshold_hours: fl
     return age_hours <= staleness_threshold_hours
 
 
+def _readable_deployments(indexer: str, deployments: Any) -> list[str]:
+    """Return the deployment ids an entry lists, or none when it lists none.
+
+    Anything other than a list of text ids also yields none, after logging a warning.
+    """
+    if deployments is None:
+        return []
+    if isinstance(deployments, list) and all(isinstance(d, str) for d in deployments):
+        return deployments
+    logger.warning(
+        "sync_status: ignoring unreadable deployments for %s: %.200r", indexer[:10], deployments
+    )
+    return []
+
+
 class SyncStatusData:
     """Reverse index: deployment -> set[indexer] for synced+healthy deployments."""
 
     def __init__(
         self,
-        raw: dict[str, dict],
+        raw: dict[str, Any],
         staleness_threshold_hours: float = 6.0,
     ):
         now = datetime.now(timezone.utc)
@@ -59,11 +74,19 @@ class SyncStatusData:
         self._indexer_count = 0
 
         for indexer, entry in raw.items():
+            if not isinstance(entry, dict):
+                logger.warning(
+                    "sync_status: ignoring entry for %s that is not an object: %.200r",
+                    indexer[:10],
+                    entry,
+                )
+                continue
+
             fetched_at = _parse_fetched_at(indexer, entry.get("fetched_at"))
             if fetched_at is None or not _is_fresh(fetched_at, now, staleness_threshold_hours):
                 continue
 
-            deployments = entry.get("deployments", [])
+            deployments = _readable_deployments(indexer, entry.get("deployments"))
             if not deployments:
                 continue
 

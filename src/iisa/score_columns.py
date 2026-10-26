@@ -15,6 +15,7 @@ SUCCESS_RATE = "success_rate"
 STAKE_TO_FEES = "stake_to_fees"
 DST_LAT = "dst_lat"
 DST_LON = "dst_lon"
+ORG = "org"
 
 # Columns as consumed by IndexerSelector after the transform.
 SEL_LATENCY_CI = "Latency Coefficient + Error Confidence Interval"

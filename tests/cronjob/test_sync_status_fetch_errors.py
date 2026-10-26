@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "cronjobs" / "compute_scores"))
+sys.path.insert(0, str(Path(__file__).parents[2] / "cronjobs" / "compute_scores"))
 
 import sync_status_fetcher  # noqa: E402
 from sync_status_fetcher import (  # noqa: E402
