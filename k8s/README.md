@@ -11,6 +11,7 @@ its daily score-computation job and its hourly sync-status fetcher.
 - `service.yaml` - internal ClusterIP service on port 8080
 - `iisa-scores-cache-pvc.yaml` - the service's own cache volume for pushed scores and sync status
 - `networkpolicy.yaml` - restricts ingress to dipper, the score-computation job and the sync-status fetcher
+- `sync-status-fetcher-egress.yaml` - limits the fetcher to DNS, IISA and public addresses
 - `kustomization.yaml` - bundles the manifests above for `kubectl apply -k`
 
 ## How it fits together
@@ -79,6 +80,12 @@ time, so no geo API key is needed at runtime.
 Only pods labelled `app: dipper` (the consumer), `app: iisa-score-computation`
 (the daily job) or `app: iisa-sync-status-fetcher` (the hourly fetcher) may reach the
 service on port 8080; all other ingress is denied.
+
+The sync-status fetcher calls whatever URL each indexer registers on-chain, so its own
+egress is limited to DNS, the IISA service and public addresses. A registered URL that
+points at a private, link-local or loopback address, such as another service in the
+cluster or the metadata server, is dropped. The score-computation job calls the same
+URLs but has no egress limit yet.
 
 ## Service discovery
 

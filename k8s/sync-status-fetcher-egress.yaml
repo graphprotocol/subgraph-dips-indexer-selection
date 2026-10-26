@@ -1,0 +1,49 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: iisa-sync-status-fetcher-egress
+  namespace: subgraph-dips-indexer-selection-iisa-daily-cronjob-samuel
+  labels:
+    app: iisa-sync-status-fetcher
+spec:
+  # The fetcher calls whatever URL each indexer registers on-chain, so it may only reach DNS, IISA
+  # and public addresses; a URL pointing inside the cluster or at the metadata server is dropped.
+  podSelector:
+    matchLabels:
+      app: iisa-sync-status-fetcher
+  policyTypes:
+    - Egress
+  egress:
+    # Autopilot answers lookups from NodeLocal DNSCache on each node (169.254.20.10), backed by kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: iisa
+      ports:
+        - protocol: TCP
+          port: 8080
+    # The network subgraph gateway and indexers' public endpoints, on any port.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+              - 127.0.0.0/8
