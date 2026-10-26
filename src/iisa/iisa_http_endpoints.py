@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache, partial
-from typing import Any, NamedTuple, Optional, cast
+from typing import Annotated, Any, NamedTuple, Optional, cast
 
 import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -122,7 +122,12 @@ class SelectionRequest(BaseModel):
     max_grt_per_billion_entities_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
     )  # e.g., 2000.0
-    optimistic_dips_fees: Optional[dict[str, float]] = None  # indexer address -> GRT per 30 days
+    # indexer address -> GRT per 30 days, added to the indexer's query fees before its
+    # stake-to-fees is scored. A negative or infinite fee would skew that score and a NaN
+    # one would be silently treated as 0, so each is a 422.
+    optimistic_dips_fees: Optional[
+        dict[str, Annotated[float, Field(ge=0, allow_inf_nan=False)]]
+    ] = None
 
 
 class SelectedIndexer(BaseModel):

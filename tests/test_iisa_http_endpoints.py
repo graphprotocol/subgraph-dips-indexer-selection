@@ -3118,6 +3118,25 @@ class TestSelectIndexersEndToEndPricing:
         )
         assert response.status_code == 422
 
+    @pytest.mark.parametrize("fees", ["-1", "NaN", "Infinity"])
+    def test_unusable_optimistic_dips_fees_are_rejected(self, fees):
+        """A negative or infinite fee would skew an indexer's stake-to-fees score and a NaN one
+        was silently treated as 0. Sent as raw JSON, since the test client can't encode NaN.
+        """
+        from iisa.iisa_http_endpoints import app
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            content=(
+                '{"deployment_id": "QmFeesTest", "chain_id": "arb", "num_candidates": 1, '
+                f'"optimistic_dips_fees": {{"0xindexer": {fees}}}}}'
+            ),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"] == ["body", "optimistic_dips_fees", "0xindexer"]
+
     @pytest.mark.parametrize("ceiling", [None, 1000.0])
     @pytest.mark.parametrize("bad_price", ["NaN", float("nan"), -500.0, "-500"])
     def test_unusable_advertised_base_price_never_wins(self, bad_price, ceiling):
