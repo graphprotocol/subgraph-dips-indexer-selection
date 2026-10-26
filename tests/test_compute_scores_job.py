@@ -232,6 +232,26 @@ class TestTransformToScoresSchema:
         assert list(result["query_count"]) == [1000, 2000, 1500]
 
 
+class TestComputeDegradedScores:
+    """Degraded mode sends equal placeholder quality metrics for every indexer."""
+
+    def test_sends_raw_placeholders_without_pre_scaled_uptime_or_success(self, monkeypatch):
+        # Arrange
+        urls = {"0xa": "https://a.example/", "0xb": "https://b.example/"}
+        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda _: urls)
+        monkeypatch.setattr(processing, "fetch_dips_info", lambda _: pd.DataFrame())
+        monkeypatch.setattr(processing, "fetch_and_filter_graph_node_versions", lambda df, _: df)
+
+        # Act
+        result = processing.compute_degraded_scores("https://network.example/")
+
+        # Assert
+        assert list(result["uptime_score"]) == [0.5, 0.5]
+        assert list(result["success_rate"]) == [0.5, 0.5]
+        assert "norm_uptime_score" not in result.columns
+        assert "norm_success_rate" not in result.columns
+
+
 class TestIsPrivateIp:
     """Tests for the is_private_ip function."""
 
