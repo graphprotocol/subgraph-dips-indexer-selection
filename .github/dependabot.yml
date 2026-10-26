@@ -21,17 +21,20 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
-  # The cronjob image installs from its own requirements.txt. Each merged bump rebuilds
-  # the image, which then needs a manual kubectl apply (see CLAUDE.md).
+  # CI's type check and cronjob tests install this list with pyproject.toml's, and both fail when
+  # a package the 2 share needs a version the other refuses (e.g. pyarrow 26 against a <25 cap).
+  # Each merged bump rebuilds the image, which then needs a manual kubectl apply (see CLAUDE.md).
   - package-ecosystem: pip
     directory: /cronjobs/compute_scores
     schedule:
       interval: weekly
     versioning-strategy: increase
+    # Every update, majors included, goes in 1 weekly PR. With only ranges and no lock file,
+    # Dependabot can't tell a major from a patch, so an update-types filter pushes each bump into
+    # its own PR. The service group above can split because uv.lock holds exact versions.
     groups:
       cronjob-python:
         patterns: ["*"]
-        update-types: ["minor", "patch"]
 
   - package-ecosystem: docker
     directories:
