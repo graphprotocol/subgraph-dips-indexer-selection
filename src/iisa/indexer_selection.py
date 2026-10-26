@@ -12,7 +12,7 @@ from typing import Callable, NewType, Optional, TypedDict, Union, cast
 import numpy as np
 import pandas as pd
 
-from .score_columns import SEL_LATENCY_CI
+from .score_columns import NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI
 
 __all__ = [
     "IndexerSelector",
@@ -631,9 +631,9 @@ class IndexerSelector:
 
 
 # Norm columns the CronJob ships already normalised and the selector keeps: latency, and
-# stake_to_fees in degraded mode (a neutral 0.5). Every other norm_ column is recomputed from
-# its raw value, so a pre-scaled copy can't replace the selector's own scaling.
-_PRECOMPUTED_NORM_COLUMNS = frozenset({"norm_lat_lin_reg_coefficient", "norm_stake_to_fees"})
+# stake_to_fees in degraded mode (a neutral 0.5). Every other metric in _normalize_metrics is
+# recomputed from its raw value, so a pre-scaled copy can't replace the selector's own scaling.
+_PRECOMPUTED_NORM_COLUMNS = frozenset({NORM_LAT_LIN_REG_COEFFICIENT, "norm_stake_to_fees"})
 
 
 def _normalize_metrics(
@@ -648,7 +648,7 @@ def _normalize_metrics(
     """
     # (norm column, source column, normaliser), in the order the columns are added.
     metrics: list[tuple[str, str, Callable[[pd.Series], Union[pd.Series, float]]]] = [
-        ("norm_lat_lin_reg_coefficient", SEL_LATENCY_CI, _normalize_latency),
+        (NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI, _normalize_latency),
         # higher is better
         ("norm_uptime_score", "% up_x", _normalize_uptime_and_success_rate),
         ("norm_stake_to_fees", "stake_to_fees", _normalize_stake_to_fees),
