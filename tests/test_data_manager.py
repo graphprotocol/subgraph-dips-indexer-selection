@@ -29,8 +29,6 @@ class TestDataManager:
                 "uptime_score": [0.98, 0.95, 0.99],
                 "success_rate": [0.95, 0.90, 0.97],
                 "stake_to_fees": [0.5, 1.0, 0.75],
-                "norm_uptime_score": [0.9, 0.7, 0.95],
-                "norm_success_rate": [0.85, 0.6, 0.9],
                 "norm_stake_to_fees": [0.5, 0.8, 0.65],
                 "org": ["hetzner", "amazon", "google"],
                 "dst_lat": [50.0, 40.0, 35.0],
@@ -179,10 +177,8 @@ class TestDataManager:
 
         data = data_manager.get_data()
 
-        assert "norm_uptime_score" in data.columns
-        assert "norm_success_rate" in data.columns
-        assert data["norm_uptime_score"].iloc[0] == pytest.approx(0.9)
-        assert data["norm_success_rate"].iloc[0] == pytest.approx(0.85)
+        assert data["norm_lat_lin_reg_coefficient"].iloc[0] == pytest.approx(0.8)
+        assert data["norm_stake_to_fees"].iloc[0] == pytest.approx(0.5)
 
     def test_load_scores_from_df_success(self, mock_scores_df):
         """load_scores_from_df accepts an in-memory DataFrame and runs the full transform."""

@@ -1,6 +1,7 @@
 """Tests for the sync status fetcher service."""
 
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +11,7 @@ import pytest
 jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
+import sync_status_fetcher  # noqa: E402
 from sync_status_fetcher import (  # noqa: E402
     _fetch_all_statuses,
     _fetch_single_status,
@@ -233,11 +235,56 @@ class TestRunFetchCycle:
 
         assert result is False
 
-    def test_skips_when_no_indexers(self):
-        with patch(
-            "sync_status_fetcher.discover_indexers_from_network_subgraph",
-            return_value={},
+    def test_raises_when_indexer_urls_cannot_be_read(self):
+        """The main loop logs the error with its traceback and skips the cycle."""
+        with (
+            patch(
+                "sync_status_fetcher.discover_indexers_from_network_subgraph",
+                side_effect=ValueError("GRAPH_NETWORK_SUBGRAPH_URL is not set"),
+            ),
+            patch("sync_status_fetcher._push_sync_status") as mock_push,
         ):
-            result = run_fetch_cycle()
+            with pytest.raises(ValueError):
+                run_fetch_cycle()
 
-        assert result is False
+        mock_push.assert_not_called()
+
+
+class TestMain:
+    """main() refuses to start without a usable network subgraph URL: every cycle would fail."""
+
+    @pytest.mark.parametrize(
+        "url",
+        ["", "graph-node:8000/subgraphs/name/graph-network"],
+        ids=["unset", "no_scheme"],
+    )
+    def test_refuses_to_start_without_a_usable_subgraph_url(self, monkeypatch, caplog, url):
+        monkeypatch.setattr(sync_status_fetcher, "GRAPH_NETWORK_SUBGRAPH_URL", url)
+
+        with (
+            patch("sync_status_fetcher.HTTPServer") as mock_server,
+            patch("sync_status_fetcher.run_fetch_cycle") as mock_cycle,
+        ):
+            assert sync_status_fetcher.main() == 1
+
+        mock_server.assert_not_called()
+        mock_cycle.assert_not_called()
+        assert "GRAPH_NETWORK_SUBGRAPH_URL" in caplog.text
+
+    def test_starts_with_a_usable_subgraph_url(self, monkeypatch):
+        monkeypatch.setattr(
+            sync_status_fetcher, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x"
+        )
+        # Already told to stop, so main() runs 1 cycle and returns.
+        stop = threading.Event()
+        stop.set()
+        monkeypatch.setattr(sync_status_fetcher, "_stop_event", stop)
+
+        with (
+            patch("sync_status_fetcher.signal.signal"),
+            patch("sync_status_fetcher.HTTPServer"),
+            patch("sync_status_fetcher.run_fetch_cycle") as mock_cycle,
+        ):
+            assert sync_status_fetcher.main() == 0
+
+        mock_cycle.assert_called_once()

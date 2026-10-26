@@ -913,6 +913,161 @@ class TestUptimeAndSuccessRateScaling:
         assert list(data["norm_success_rate"]) == pytest.approx([1.0, 0.5, 0.0])
 
 
+class TestScaleSetByPickableIndexers:
+    """Only the group and indexers this request can pick set each metric's best and worst."""
+
+    @staticmethod
+    def _history(**metrics):
+        return pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C"],
+                "destination_loc": ["loc1", "loc2", "loc3"],
+                "org": ["org1", "org2", "org3"],
+                **metrics,
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "exclusion",
+        [
+            {"indexer_denylist": ["A"]},
+            {"declined_indexers": {"test_subgraph": ["A"]}},
+            {"pending_agreements": {"other_subgraph": ["A"]}},
+        ],
+        ids=["blocked", "declined", "pending"],
+    )
+    def test_unpickable_indexer_does_not_set_the_uptime_bar(self, exclusion):
+        """A at 100% can't be picked, so B at 95% is the best and C halfway to the cutoff."""
+        history = self._history(**{"% up_x": [100.0, 95.0, 93.575]})
+
+        processor = IndexerSelector(
+            history=history, deployment_id=DeploymentId("test_subgraph"), **exclusion
+        )
+
+        # A sits above the bar B sets, so it is clipped to 1.
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 1.0, 0.5])
+
+    def test_group_member_still_sets_the_uptime_bar(self):
+        """A is already in the group, so its 100% stays the bar the candidates are held to."""
+        history = self._history(**{"% up_x": [100.0, 95.0, 93.575]})
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            existing_agreements={DeploymentId("test_subgraph"): [IndexerId("A")]},
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.0, 0.0])
+
+    @pytest.mark.parametrize(
+        "exclusion",
+        [
+            {"indexer_denylist": ["A"]},
+            {"declined_indexers": {"test_subgraph": ["A"]}},
+        ],
+        ids=["blocked", "declined"],
+    )
+    def test_blocked_group_member_does_not_set_the_uptime_bar(self, exclusion):
+        """A is in the group but blocked, so B's 95% is the bar, not A's 100%."""
+        history = self._history(**{"% up_x": [100.0, 95.0, 93.575]})
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            existing_agreements={DeploymentId("test_subgraph"): [IndexerId("A")]},
+            **exclusion,
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 1.0, 0.5])
+
+    def test_zero_fee_candidates_keep_full_stake_to_fees_marks(self):
+        """With only zero-fee indexers left to pick, they still score 1.0 (maximum capacity)."""
+        history = self._history(stake_to_fees=[100.0, np.nan, np.nan])
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data.loc[["B", "C"], "norm_stake_to_fees"]) == [1.0, 1.0]
+
+    def test_pricier_blocked_indexer_scores_zero_not_negative(self):
+        """A blocked indexer above the pickable price range is held at 0, not pushed below it."""
+        history = self._history(price_per_entity=[2.0, 1.0, 0.5])
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_price_per_entity"]) == pytest.approx([0.0, 0.0, 0.5])
+
+    def test_blocked_indexer_does_not_stretch_a_min_max_scale(self):
+        """A blocked indexer's outsized stake_to_fees doesn't squash the pickable ones together."""
+        history = self._history(stake_to_fees=[100.0, 10.0, 5.0])
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 1.0, 0.0])
+
+    def test_scales_against_everyone_when_no_indexer_can_be_picked(self):
+        history = self._history(**{"% up_x": [100.0, 95.0, 93.575]})
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A"), IndexerId("B"), IndexerId("C")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.0, 0.0])
+
+    def test_unreadable_value_scores_zero_without_moving_the_pickable_scale(self):
+        """D's text scores 0 and blocked A sets nothing, so B and C alone set the scale."""
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C", "D"],
+                "destination_loc": ["loc1", "loc2", "loc3", "loc4"],
+                "org": ["org1", "org2", "org3", "org4"],
+                "stake_to_fees": [100.0, 10.0, 5.0, "abc"],
+            }
+        )
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 1.0, 0.0, 0.0])
+
+    def test_scales_against_readable_values_when_no_pickable_value_reads(self):
+        """C, the only pickable indexer, sent text, so blocked A and B set the scale instead."""
+        history = self._history(stake_to_fees=[100.0, 50.0, "abc"])
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A"), IndexerId("B")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 0.0, 0.0])
+
+
 class TestAssignAction:
     """The assigning log line names the action picked from group size against target."""
 
@@ -1075,6 +1230,15 @@ class TestNormalizeMetrics:
         assert result.min() == 0
         assert result.max() == 1
         assert len(result) == len(series)
+
+    def test_normalize_generic_scales_against_scale_rows_and_clips_the_rest(self):
+        """Rows outside scale_rows are scored on its min and max, clipped to [0, 1]."""
+        series = pd.Series([0.0, 5.0, 10.0, 20.0, -10.0])
+        scale_rows = pd.Series([True, True, True, False, False])
+
+        result = _normalize_generic(series, scale_rows)
+
+        assert result.tolist() == pytest.approx([0.0, 0.5, 1.0, 1.0, 0.0])
 
     def test_normalize_uptime_and_success_rate(self):
         # Test the normalize_uptime_and_success_rate function
