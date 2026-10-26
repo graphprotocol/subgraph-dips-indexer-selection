@@ -18,7 +18,8 @@ sys.path.insert(0, str(jobs_path))
 
 import main  # noqa: E402
 import processing  # noqa: E402
-from processing import discover_indexers_from_network_subgraph  # noqa: E402
+import subgraph  # noqa: E402
+from subgraph import discover_indexers_from_network_subgraph  # noqa: E402
 
 SUBGRAPH_URL = "https://subgraph.example.com"
 
@@ -26,7 +27,7 @@ SUBGRAPH_URL = "https://subgraph.example.com"
 @pytest.fixture
 def no_retry_wait():
     """Skip the retry backoff, which otherwise sleeps for about 30s."""
-    with patch.object(processing._query_indexer_urls.retry, "sleep", lambda _: None):
+    with patch.object(subgraph._query_indexer_urls.retry, "sleep", lambda _: None):
         yield
 
 
@@ -36,7 +37,7 @@ def _page(indexers):
     return response
 
 
-@patch("processing.paginate_subgraph_query")
+@patch("subgraph.paginate_subgraph_query")
 def test_returns_id_to_url_mapping(mock_paginate):
     mock_paginate.return_value = [
         {"id": "0xaaa", "url": "https://indexer-a.example.com"},
@@ -52,7 +53,7 @@ def test_returns_id_to_url_mapping(mock_paginate):
     mock_paginate.assert_called_once()
 
 
-@patch("processing.paginate_subgraph_query")
+@patch("subgraph.paginate_subgraph_query")
 def test_skips_indexers_without_a_url(mock_paginate):
     mock_paginate.return_value = [
         {"id": "0xaaa", "url": "https://indexer-a.example.com"},
@@ -72,7 +73,7 @@ def test_skips_indexers_without_a_url(mock_paginate):
 )
 def test_unusable_url_raises_without_querying(url, expected):
     """An empty answer would score every indexer as failing its DIPs probe."""
-    with patch("processing.paginate_subgraph_query") as mock_paginate:
+    with patch("subgraph.paginate_subgraph_query") as mock_paginate:
         with pytest.raises(ValueError, match=f"GRAPH_NETWORK_SUBGRAPH_URL {expected}"):
             discover_indexers_from_network_subgraph(url)
     mock_paginate.assert_not_called()

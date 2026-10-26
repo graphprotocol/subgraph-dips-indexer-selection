@@ -24,8 +24,7 @@ if TYPE_CHECKING:
     import aiohttp
 
 from iisa_client import IISAPushError, get_push_token, post_sync_status
-from processing import discover_indexers_from_network_subgraph
-from subgraph import subgraph_url_problem
+from subgraph import discover_indexers_from_network_subgraph, subgraph_url_problem
 
 logging.basicConfig(
     level=logging.INFO,

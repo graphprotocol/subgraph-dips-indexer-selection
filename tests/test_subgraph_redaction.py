@@ -18,7 +18,6 @@ import requests
 jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
-import processing  # noqa: E402
 import subgraph  # noqa: E402
 from redpanda import RedpandaProvider  # noqa: E402
 
@@ -157,14 +156,14 @@ class TestCallersHideKey:
         caplog.set_level(logging.INFO)
 
         with (
-            patch.object(processing._query_indexer_urls.retry, "sleep", lambda _: None),
+            patch.object(subgraph._query_indexer_urls.retry, "sleep", lambda _: None),
             patch(
                 "subgraph.requests.post",
                 return_value=_http_error_response(503, "Server Error: Service Unavailable"),
             ),
         ):
             with pytest.raises(requests.HTTPError) as excinfo:
-                processing.discover_indexers_from_network_subgraph(KEYED_URL)
+                subgraph.discover_indexers_from_network_subgraph(KEYED_URL)
 
         formatted = "".join(traceback.format_exception(excinfo.value))
         assert "Retrying" in caplog.text

@@ -19,11 +19,10 @@ from iisa_client import IISAPushError, get_push_token
 from processing import (
     compute_all_scores,
     compute_degraded_scores,
-    discover_indexers_from_network_subgraph,
     validate_geoip_databases,
 )
 from redpanda import RedpandaProvider
-from subgraph import subgraph_url_problem
+from subgraph import discover_indexers_from_network_subgraph, subgraph_url_problem
 
 logging.basicConfig(
     level=logging.INFO,
