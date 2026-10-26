@@ -844,7 +844,7 @@ class TestFetchStakeToFees:
 
         # Act
         with patch(
-            "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
+            "subgraph.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
         ):
             result = provider.fetch_stake_to_fees()
 
@@ -865,7 +865,7 @@ class TestFetchStakeToFees:
 
         # Act
         with patch(
-            "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
+            "subgraph.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
         ):
             result = provider.fetch_stake_to_fees()
 
@@ -903,13 +903,73 @@ class TestFetchStakeToFees:
 
         # Act
         with patch(
-            "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
+            "subgraph.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
         ):
             result = provider.fetch_stake_to_fees()
 
         # Assert
         assert result.loc[EXPECTED_INDEXER, "stake_to_fees"] == 10000.0
         assert pd.isna(result.loc[unknown_indexer, "stake_to_fees"])
+
+    def _graphql_error(self, message: str):
+        response = MagicMock()
+        response.json.return_value = {"errors": [{"message": message}]}
+        return response
+
+    def test_retries_a_temporary_gateway_error(self):
+        """A failing indexer behind the gateway must not leave the day's scores without stake."""
+        provider = self._build_provider_with_fees({EXPECTED_INDEXER: 100.0})
+        stake = [{"id": EXPECTED_INDEXER, "stakedTokens": "1000000", "lockedTokens": "0"}]
+        replies = [
+            self._graphql_error("bad indexers: {0x1234: Unavailable(no status)}"),
+            self._mock_subgraph_response(stake),
+        ]
+
+        with (
+            patch.object(
+                RedpandaProvider._paginate_graphql_indexers.retry, "sleep", lambda _: None
+            ),
+            patch("subgraph.requests.post", side_effect=replies) as post,
+        ):
+            result = provider.fetch_stake_to_fees()
+
+        assert post.call_count == 2
+        assert result.loc[EXPECTED_INDEXER, "stake_to_fees"] == 10000.0
+
+    def test_retries_an_empty_answer(self):
+        """The gateway may answer from an indexer that is behind and lists no one."""
+        provider = self._build_provider_with_fees({EXPECTED_INDEXER: 100.0})
+        stake = [{"id": EXPECTED_INDEXER, "stakedTokens": "1000000", "lockedTokens": "0"}]
+        replies = [self._mock_subgraph_response([]), self._mock_subgraph_response(stake)]
+
+        with (
+            patch.object(
+                RedpandaProvider._paginate_graphql_indexers.retry, "sleep", lambda _: None
+            ),
+            patch("subgraph.requests.post", side_effect=replies) as post,
+        ):
+            result = provider.fetch_stake_to_fees()
+
+        assert post.call_count == 2
+        assert result.loc[EXPECTED_INDEXER, "stake_to_fees"] == 10000.0
+
+    def test_does_not_retry_a_rejected_key(self):
+        """The gateway answers a bad key with HTTP 200 and an auth error; retrying won't help."""
+        provider = self._build_provider_with_fees({EXPECTED_INDEXER: 100.0})
+
+        with (
+            patch.object(
+                RedpandaProvider._paginate_graphql_indexers.retry, "sleep", lambda _: None
+            ),
+            patch(
+                "subgraph.requests.post",
+                return_value=self._graphql_error("auth error: API key not found"),
+            ) as post,
+        ):
+            result = provider.fetch_stake_to_fees()
+
+        assert post.call_count == 1
+        assert result.empty
 
     def test_output_schema(self):
         """Output must be indexed by 'indexer' with a 'stake_to_fees' column."""
@@ -922,7 +982,7 @@ class TestFetchStakeToFees:
 
         # Act
         with patch(
-            "redpanda.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
+            "subgraph.requests.post", return_value=self._mock_subgraph_response(subgraph_indexers)
         ):
             result = provider.fetch_stake_to_fees()
 

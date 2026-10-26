@@ -27,11 +27,12 @@ KEYED_URL = f"https://gateway.thegraph.com/api/{FAKE_KEY}/subgraphs/id/QmNetwork
 QUERY = "query($first: Int!, $lastId: String!) { indexers(first: $first) { id } }"
 
 
-def _http_error_response():
-    """A response whose raise_for_status fails the way requests does, URL included."""
+def _http_error_response(status=404, reason="Client Error: Not Found"):
+    """A response whose raise_for_status fails the way requests does, URL and reply included."""
     response = MagicMock()
+    response.status_code = status
     response.raise_for_status.side_effect = requests.HTTPError(
-        f"404 Client Error: Not Found for url: {KEYED_URL}"
+        f"{status} {reason} for url: {KEYED_URL}", response=response
     )
     return response
 
@@ -157,7 +158,10 @@ class TestCallersHideKey:
 
         with (
             patch.object(processing._query_indexer_urls.retry, "sleep", lambda _: None),
-            patch("subgraph.requests.post", return_value=_http_error_response()),
+            patch(
+                "subgraph.requests.post",
+                return_value=_http_error_response(503, "Server Error: Service Unavailable"),
+            ),
         ):
             with pytest.raises(requests.HTTPError) as excinfo:
                 processing.discover_indexers_from_network_subgraph(KEYED_URL)

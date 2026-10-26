@@ -91,13 +91,122 @@ def test_raises_when_every_attempt_fails(no_retry_wait):
     assert post.call_count == 5
 
 
-def test_raises_on_graphql_errors(no_retry_wait):
+def _graphql_error(message):
     response = MagicMock()
-    response.json.return_value = {"errors": [{"message": "indexer unavailable"}]}
+    response.json.return_value = {"errors": [{"message": message}]}
+    return response
 
-    with patch("subgraph.requests.post", return_value=response):
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "bad indexers: {0x1234: Unavailable(no status: indexer not available)}",
+        "no indexers found",
+        "internal error: database timeout",
+    ],
+)
+def test_retries_gateway_errors_that_can_clear(no_retry_wait, message):
+    """The gateway reports an indexer that failed to serve the query as a GraphQL error."""
+    with patch("subgraph.requests.post", return_value=_graphql_error(message)) as post:
         with pytest.raises(RuntimeError, match="GraphQL errors"):
             discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 5
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "auth error: API key not found",
+        "auth error: missing authorization header",
+        "subgraph not found: no allocations",
+        "bad query: failed to parse",
+    ],
+)
+def test_does_not_retry_gateway_errors_that_cannot_clear(no_retry_wait, message):
+    """The gateway sends these with HTTP 200, so they arrive as GraphQL errors, not a 401."""
+    with patch("subgraph.requests.post", return_value=_graphql_error(message)) as post:
+        with pytest.raises(RuntimeError, match="GraphQL errors"):
+            discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 1
+
+
+def _http_error(status):
+    response = MagicMock()
+    response.status_code = status
+    response.raise_for_status.side_effect = requests.HTTPError(f"{status} Error", response=response)
+    return response
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
+def test_retries_rate_limits_and_server_errors(no_retry_wait, status):
+    page = _page([{"id": "0xaaa", "url": "https://indexer-a.example.com"}])
+
+    with patch("subgraph.requests.post", side_effect=[_http_error(status), page]) as post:
+        result = discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 2
+    assert result == {"0xaaa": "https://indexer-a.example.com"}
+
+
+def _unreadable_reply():
+    response = MagicMock()
+    response.json.side_effect = requests.exceptions.JSONDecodeError(
+        "Expecting value", "<html>maintenance</html>", 0
+    )
+    return response
+
+
+@pytest.mark.parametrize(
+    "first_reply",
+    [
+        requests.exceptions.ChunkedEncodingError("Connection broken: IncompleteRead"),
+        requests.exceptions.ContentDecodingError("Received response with content-encoding: gzip"),
+        ConnectionResetError("Connection reset by peer"),
+        _unreadable_reply(),
+    ],
+    ids=["dropped_mid_reply", "corrupt_encoding", "socket_reset", "not_json"],
+)
+def test_retries_replies_cut_off_or_unreadable(no_retry_wait, first_reply):
+    page = _page([{"id": "0xaaa", "url": "https://indexer-a.example.com"}])
+
+    with patch("subgraph.requests.post", side_effect=[first_reply, page]) as post:
+        result = discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 2
+    assert result == {"0xaaa": "https://indexer-a.example.com"}
+
+
+@pytest.mark.parametrize(
+    "post_kwargs",
+    [
+        {"return_value": _http_error(401)},
+        {"return_value": _http_error(403)},
+        {"return_value": _http_error(404)},
+        {"side_effect": requests.exceptions.MissingSchema("No scheme supplied")},
+        {"side_effect": requests.exceptions.InvalidURL("Invalid URL")},
+    ],
+    ids=["401_rejected_key", "403_forbidden", "404_wrong_url", "missing_scheme", "invalid_url"],
+)
+def test_does_not_retry_errors_that_cannot_clear(no_retry_wait, post_kwargs):
+    with patch("subgraph.requests.post", **post_kwargs) as post:
+        with pytest.raises(requests.RequestException):
+            discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 1
+
+
+def test_retries_a_reply_without_data(no_retry_wait):
+    empty_reply = MagicMock()
+    empty_reply.json.return_value = {"data": None}
+    page = _page([{"id": "0xaaa", "url": "https://indexer-a.example.com"}])
+
+    with patch("subgraph.requests.post", side_effect=[empty_reply, page]) as post:
+        result = discover_indexers_from_network_subgraph(SUBGRAPH_URL)
+
+    assert post.call_count == 2
+    assert result == {"0xaaa": "https://indexer-a.example.com"}
 
 
 def test_raises_when_no_indexer_has_a_url(no_retry_wait):
