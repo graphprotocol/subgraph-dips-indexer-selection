@@ -1646,6 +1646,19 @@ class TestValidateConfigurationSubgraphURL:
 
         main.validate_configuration()
 
+    def test_job_exits_before_scoring_without_a_url(self, monkeypatch):
+        """The job runs this check on startup, before it reads Redpanda or scores anything."""
+        from unittest.mock import MagicMock
+
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "IISA_REQUIRE_PUSH_TOKEN", False)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "")
+        run_scoring = MagicMock()
+        monkeypatch.setattr(main, "run_scoring", run_scoring)
+
+        assert main.main() == 1
+        run_scoring.assert_not_called()
+
 
 class TestValidateConfigurationRedpandaTopic:
     """validate_configuration() must refuse to run without an explicit REDPANDA_TOPIC.
