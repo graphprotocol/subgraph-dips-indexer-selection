@@ -889,6 +889,30 @@ class TestOptimisticDipsFees:
         assert list(history["norm_stake_to_fees"]) == [0.5, 0.5, 0.5]
 
 
+class TestUptimeAndSuccessRateScaling:
+    """Selection scores uptime and success rate against 97% of the best candidate."""
+
+    def test_selector_ignores_pre_scaled_uptime_and_success_rate(self):
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C"],
+                "destination_loc": ["loc1", "loc2", "loc3"],
+                "org": ["org1", "org2", "org3"],
+                "% up_x": [100.0, 98.5, 90.0],
+                "average_status": [1.0, 0.985, 0.9],
+                # The CronJob's worst-to-best copies, which must not be used.
+                "norm_uptime_score": [1.0, 0.85, 0.0],
+                "norm_success_rate": [1.0, 0.85, 0.0],
+            }
+        )
+
+        processor = IndexerSelector(history=history, deployment_id=DeploymentId("test_subgraph"))
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.5, 0.0])
+        assert list(data["norm_success_rate"]) == pytest.approx([1.0, 0.5, 0.0])
+
+
 class TestAssignAction:
     """The assigning log line names the action picked from group size against target."""
 

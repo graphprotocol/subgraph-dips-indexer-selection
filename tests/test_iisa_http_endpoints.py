@@ -360,11 +360,9 @@ def mock_history_df():
             "indexer": ["0xabc", "0xxyz", "0x123"],  # lowercase for case-insensitive matching
             "url": ["https://a.com/", "https://b.com/", "https://c.com/"],
             "norm_lat_lin_reg_coefficient": [0.8, 0.9, 0.6],
-            "norm_uptime_score": [0.9, 0.7, 0.95],
-            "norm_success_rate": [0.85, 0.6, 0.9],
             "norm_stake_to_fees": [0.5, 0.8, 0.65],
-            "norm_base_price_per_epoch": [0.7, 0.8, 0.9],
-            "norm_price_per_entity": [0.6, 0.7, 0.8],
+            "% up_x": [99.0, 97.0, 100.0],
+            "average_status": [0.99, 0.97, 1.0],
             "dips_info_available": [True, True, False],
             "dips_min_grt_per_30_days": [
                 '{"arbitrum-one": "450"}',
