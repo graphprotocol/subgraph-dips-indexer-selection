@@ -51,7 +51,8 @@ generous headroom:
 - Liveness probe: 120s initial delay
 
 The sync-status fetcher reports healthy only after its first push, which probes every
-indexer, so its startup probe allows 15 minutes. It has no readiness probe, since nothing
+indexer, so its startup probe allows 15 minutes. It turns unhealthy again once 2 hourly
+pushes in a row fail, and the liveness probe then restarts it. It has no readiness probe, since nothing
 sends it traffic.
 
 ## Prerequisites
