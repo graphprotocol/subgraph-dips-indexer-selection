@@ -157,8 +157,8 @@ class ScoreRequest(BaseModel):
 class ChainScore(BaseModel):
     """An indexer's weighted score and component scores, prices included, on one chain.
 
-    Scored like a selection for that chain with no budget: against every indexer that supports
-    the chain and has set a price for it.
+    Scored against every indexer that supports the chain and has priced it, as selection does
+    before it applies a request's budget, blocklist and expected fees.
     """
 
     weighted_score: Optional[float] = None
@@ -707,60 +707,71 @@ def scores_snapshot(
     )
 
 
-# Normalised metric columns reported per indexer, paired with the name each is reported under.
-_SCORE_COMPONENTS = (
-    ("norm_lat_lin_reg_coefficient", "latency"),
-    ("norm_uptime_score", "uptime"),
-    ("norm_success_rate", "success_rate"),
-    ("norm_stake_to_fees", "stake_to_fees"),
-    ("norm_base_price_per_epoch", "base_price"),
-    ("norm_price_per_entity", "price_per_entity"),
-)
-# Price columns only exist once a chain is chosen, so the network-wide score leaves them out.
-_PRICE_COMPONENTS = ("norm_base_price_per_epoch", "norm_price_per_entity")
+# Prices only exist once a chain is chosen, so the network-wide score leaves these weights out.
+_PRICE_WEIGHTS = ("base_price_per_epoch", "price_per_entity")
 
 
-def _scores_by_indexer(normalized: pd.DataFrame) -> dict[str, ChainScore]:
+def _scores_by_indexer(
+    normalized: pd.DataFrame,
+    weights: Mapping[str, object],
+    indexer_id: Optional[str] = None,
+) -> dict[str, ChainScore]:
     """Weighted score and component scores for each indexer in an already normalised table.
 
-    A weight whose column is missing is left out of the weighted score.
+    Only the metrics in ``weights`` count. ``indexer_id``, when given, scores just that indexer.
+    An indexer with more than 1 row is scored from its first.
     """
-    from .indexer_selection import DEFAULT_WEIGHTS, _calculate_weighted_scores
+    from .indexer_selection import WeightsDict, _calculate_weighted_scores
 
-    # Score every indexer in one vectorised pass. _normalize_metrics fills all
-    # norm_ columns, so the zero-weight case can't arise here; degrade to
+    if indexer_id is not None:
+        normalized = normalized[normalized["indexer"] == indexer_id]
+    if normalized.empty:
+        return {}
+
+    # Score every indexer in one vectorised pass. _normalize_metrics fills every
+    # weighted norm_ column, so the zero-weight case can't arise here; degrade to
     # unscored rather than 500 if it somehow does.
     try:
-        weighted_scores = _calculate_weighted_scores(normalized, DEFAULT_WEIGHTS).to_numpy()
+        weighted_scores = _calculate_weighted_scores(
+            normalized, cast(WeightsDict, dict(weights))
+        ).to_numpy()
     except ValueError as e:
         logger.warning("weighted scoring failed: %s", e)
         weighted_scores = pd.Series(float("nan"), index=normalized.index).to_numpy()
 
+    reported = [
+        (col, name) for col, name in _BREAKDOWN_COMPONENTS if col.removeprefix("norm_") in weights
+    ]
     scores: dict[str, ChainScore] = {}
     for position, (_, row) in enumerate(normalized.iterrows()):
-        indexer_id = row.get("indexer")
-        if indexer_id is None or (isinstance(indexer_id, float) and pd.isna(indexer_id)):
+        row_indexer = row.get("indexer")
+        if row_indexer is None or (isinstance(row_indexer, float) and pd.isna(row_indexer)):
             logger.debug("skipping row with missing indexer field")
+            continue
+        if str(row_indexer) in scores:
+            logger.warning("indexer %s has more than 1 score row; using the first", row_indexer)
             continue
 
         score = weighted_scores[position]
-        scores[str(indexer_id)] = ChainScore(
+        scores[str(row_indexer)] = ChainScore(
             weighted_score=float(score) if pd.notna(score) else None,
             components={
                 name: float(row[col])
-                for col, name in _SCORE_COMPONENTS
+                for col, name in reported
                 if col in row.index and pd.notna(row[col])
             },
         )
     return scores
 
 
-def _network_scores(history: pd.DataFrame) -> dict[str, ChainScore]:
+def _network_scores(
+    history: pd.DataFrame, indexer_id: Optional[str] = None
+) -> dict[str, ChainScore]:
     """Each indexer scored against every loaded indexer, with prices left out."""
-    from .indexer_selection import _normalize_metrics
+    from .indexer_selection import DEFAULT_WEIGHTS, _normalize_metrics
 
-    normalized = _normalize_metrics(history.copy()).drop(columns=list(_PRICE_COMPONENTS))
-    return _scores_by_indexer(normalized)
+    weights = {k: v for k, v in DEFAULT_WEIGHTS.items() if k not in _PRICE_WEIGHTS}
+    return _scores_by_indexer(_normalize_metrics(history.copy()), weights, indexer_id)
 
 
 def _priced_chains(history: pd.DataFrame) -> list[str]:
@@ -779,18 +790,25 @@ def _priced_chains(history: pd.DataFrame) -> list[str]:
     return sorted(chains)
 
 
-def _chain_scores(history: pd.DataFrame, chains: list[str]) -> dict[str, dict[str, ChainScore]]:
+def _chain_scores(
+    history: pd.DataFrame, chains: list[str], indexer_id: Optional[str] = None
+) -> dict[str, dict[str, ChainScore]]:
     """Scores by indexer, then by chain, each chain scored like a selection with no budget."""
-    from .indexer_selection import _normalize_metrics
+    from .indexer_selection import DEFAULT_WEIGHTS, _normalize_metrics
 
     scores: dict[str, dict[str, ChainScore]] = {}
     for chain in chains:
         pool, _ = _filter_by_price(history, chain, None)
+        # _filter_by_price skips its checks on data without DIPs columns, so drop indexers that
+        # haven't priced this chain; their missing price would otherwise count as free.
+        pool, _ = _keep_with_chain_price(pool, chain)
         if pool.empty:
             continue
         normalized = _normalize_metrics(_enrich_with_chain_prices(pool, chain))
-        for indexer_id, score in _scores_by_indexer(normalized).items():
-            scores.setdefault(indexer_id, {})[chain] = score
+        for row_indexer, score in _scores_by_indexer(
+            normalized, DEFAULT_WEIGHTS, indexer_id
+        ).items():
+            scores.setdefault(row_indexer, {})[chain] = score
     return scores
 
 
@@ -931,12 +949,12 @@ async def get_score(
     if match.empty:
         return ScoreResponse(indexer_id=request.indexer_id, found=False)
 
-    network = _network_scores(history)[indexer_id]
+    network = _network_scores(history, indexer_id)[indexer_id]
     return ScoreResponse(
         indexer_id=request.indexer_id,
         weighted_score=network.weighted_score,
         components=network.components,
-        chains=_chain_scores(history, _priced_chains(match)).get(indexer_id, {}),
+        chains=_chain_scores(history, _priced_chains(match), indexer_id).get(indexer_id, {}),
         found=True,
     )
 

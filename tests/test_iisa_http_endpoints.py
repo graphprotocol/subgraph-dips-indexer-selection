@@ -2890,7 +2890,7 @@ class TestSelectIndexersEndToEndPricing:
 
 
 class TestPricedChains:
-    """Tests for _priced_chains -- the chains the score endpoints report a score for."""
+    """Tests for _priced_chains: the chains the score endpoints report a score for."""
 
     def test_lists_every_priced_chain_once_skipping_unreadable_maps(self):
         from iisa.iisa_http_endpoints import _priced_chains
@@ -2913,3 +2913,43 @@ class TestPricedChains:
         from iisa.iisa_http_endpoints import _priced_chains
 
         assert _priced_chains(pd.DataFrame({"indexer": ["0xa"]})) == []
+
+
+class TestScoreHelpers:
+    """Tests for the helpers behind /get-score and /scores/weighted."""
+
+    def test_network_scores_leave_prices_out_without_a_missing_column_warning(self, caplog):
+        from iisa.iisa_http_endpoints import _network_scores
+
+        history = pd.DataFrame({"indexer": ["0xa", "0xb"], "% up_x": [100.0, 98.5]})
+
+        with caplog.at_level(logging.WARNING):
+            scores = _network_scores(history)
+
+        assert "base_price" not in scores["0xa"].components
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_chain_scores_skip_indexers_that_have_not_priced_the_chain(self):
+        """Without the DIPs info column nothing else filters them, and unpriced would mean free."""
+        from iisa.iisa_http_endpoints import _chain_scores
+
+        history = pd.DataFrame(
+            {
+                "indexer": ["0xa", "0xb"],
+                "% up_x": [100.0, 98.5],
+                "dips_min_grt_per_30_days": ['{"base": "40"}', "{}"],
+            }
+        )
+
+        assert set(_chain_scores(history, ["base"])) == {"0xa"}
+
+    def test_duplicate_indexer_rows_score_from_the_first_with_a_warning(self, caplog):
+        from iisa.iisa_http_endpoints import _scores_by_indexer
+
+        normalized = pd.DataFrame({"indexer": ["0xa", "0xa"], "norm_uptime_score": [1.0, 0.0]})
+
+        with caplog.at_level(logging.WARNING):
+            scores = _scores_by_indexer(normalized, {"uptime_score": 1.0})
+
+        assert scores["0xa"].weighted_score == 1.0
+        assert any("more than 1 score row" in r.getMessage() for r in caplog.records)
