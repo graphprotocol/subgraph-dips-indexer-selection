@@ -31,7 +31,6 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from subgraph import paginate_subgraph_query
 
 if TYPE_CHECKING:
     import aiohttp
@@ -199,41 +198,6 @@ def _get_min_graph_node_version_strict() -> bool:
     """
     raw = os.environ.get("MIN_GRAPH_NODE_VERSION_STRICT", "").strip().lower()
     return raw not in _MIN_GRAPH_NODE_VERSION_STRICT_FALSE_VALUES
-
-
-def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
-    """Query the Graph Network subgraph for indexer addresses and service URLs.
-
-    The subgraph is the source of truth — Redpanda only sees indexers the gateway
-    has routed to, so newly registered ones are invisible without this lookup.
-    Returns {address: url} for indexers with a URL, or {} on any failure.
-    """
-    if not network_subgraph_url:
-        logger.warning("GRAPH_NETWORK_SUBGRAPH_URL not set, cannot discover indexers from subgraph")
-        return {}
-
-    query = """
-    query($first: Int!, $lastId: String!) {
-      indexers(first: $first, where: { id_gt: $lastId, url_not: "" }, orderBy: id) {
-        id
-        url
-      }
-    }
-    """
-    try:
-        raw_indexers = paginate_subgraph_query(network_subgraph_url, query, entity="indexers")
-    except Exception as e:
-        logger.warning(f"Failed to query network subgraph: {e}")
-        return {}
-
-    all_indexers: Dict[str, str] = {}
-    for indexer in raw_indexers:
-        url = indexer.get("url", "")
-        if url:
-            all_indexers[indexer["id"]] = url
-
-    logger.info(f"Discovered {len(all_indexers)} indexers from network subgraph")
-    return all_indexers
 
 
 def _extract_dips_prices(data: dict) -> tuple:
@@ -970,6 +934,7 @@ def _attach_dips_info(merged: pd.DataFrame, indexer_urls: Dict[str, str]) -> pd.
 
 def compute_all_scores(
     provider,
+    indexer_urls: Dict[str, str],
     start_date: date,
     num_days: int,
     target_rows: int,
@@ -980,6 +945,7 @@ def compute_all_scores(
 
     Full (geoip_available=True): GeoIP + latency regression + uptime + success + stake.
     Partial: latency neutral (0.5), other metrics from real Redpanda data.
+    indexer_urls is the network subgraph's {address: url}, probed for DIP pricing.
     """
     # Fetch initial query results to determine sampling
     initial_query_results = provider.fetch_initial_query_results(start_date, num_days)
@@ -1029,17 +995,14 @@ def compute_all_scores(
         drop_missing_latency=geoip_available,
     )
 
-    # DIP pricing fetched directly from indexers; the indexer list comes from
-    # the network subgraph (Redpanda only has indexers the gateway has queried,
-    # so newly registered ones would be invisible without this lookup).
-    indexer_urls = discover_indexers_from_network_subgraph(provider.graph_network_url)
+    # DIP pricing fetched directly from indexers
     merged = _attach_dips_info(merged, indexer_urls)
 
     # Attach graph-node versions and drop indexers below the configured
     # minimum (no-op when MIN_GRAPH_NODE_VERSION is unset).
     merged = fetch_and_filter_graph_node_versions(merged, indexer_urls)
 
-    # Transform to indexer_scores schema with pre-normalized values
+    # Transform to indexer_scores schema
     scores_df = transform_to_scores_schema(merged)
     scores_df["scoring_mode"] = "full" if geoip_available else "partial_no_geoip"
 
@@ -1055,7 +1018,7 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     """
     Transform the merged DataFrame to the indexer_scores output schema.
 
-    Includes pre-normalizing static metrics.
+    Pre-normalizes latency only; the IISA service scales the other metrics itself.
     """
     # Build the output DataFrame
     scores = pd.DataFrame()
@@ -1088,10 +1051,6 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     scores["stake_to_fees"] = merged.get("stake_to_fees")
     scores["total_query_fees"] = merged.get("total_query_fees", 0.0)
     scores["last_known_slashable_stake"] = merged.get("last_known_slashable_stake", 0.0)
-
-    # Pre-normalized scores
-    scores["norm_uptime_score"] = normalize_to_0_1(scores["uptime_score"])
-    scores["norm_success_rate"] = normalize_to_0_1(scores["success_rate"])
 
     # Organization/location
     scores["org"] = merged.get("org")
@@ -1756,16 +1715,12 @@ def merge_and_prepare_dataframes(
     return merged
 
 
-def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
+def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     """Equal quality metrics for every indexer, real per-indexer pricing from /dips/info.
 
-    Last-resort fallback when the full pipeline can't run. Indexer list comes
-    from the network subgraph; per-indexer pricing from /dips/info.
+    Last-resort fallback when the full pipeline can't run. indexer_urls is the network
+    subgraph's {address: url}; per-indexer pricing comes from /dips/info.
     """
-    indexer_urls = discover_indexers_from_network_subgraph(graph_network_subgraph_url)
-    if not indexer_urls:
-        return pd.DataFrame()
-
     dips_info_df = fetch_dips_info(indexer_urls)
     now = datetime.now(timezone.utc)
 
@@ -1786,8 +1741,6 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
     scores["uptime_duration_seconds"] = None
     scores["success_rate"] = 0.5
     scores["stake_to_fees"] = None
-    scores["norm_uptime_score"] = 0.5
-    scores["norm_success_rate"] = 0.5
     scores["norm_stake_to_fees"] = 0.5
     scores["org"] = None
     scores["dst_lat"] = None

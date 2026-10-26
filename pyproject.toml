@@ -4,11 +4,11 @@ version = "0.1.0"
 description = "Indexing Indexer Selection Algorithm for The Graph DIPs service"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     # Data processing
     "pandas>=2.0,<4.0",
-    "pyarrow>=23.0.1,<25.0",
+    "pyarrow>=23.0.1,<27.0",
     "numpy>=1.24,<3.0",
     # FastAPI service. `!= 0.136.3` skips a single release that pulls in
     # a typosquat package via its `[standard]` extras (OSV MAL-2026-4750).
@@ -87,7 +87,6 @@ select = ["E", "F", "I", "W", "C4", "ARG", "PD002"]
 files = ["src/**/*.py", "cronjobs/compute_scores/**/*.py"]
 mypy_path = "cronjobs/compute_scores"
 explicit_package_bases = true
-python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

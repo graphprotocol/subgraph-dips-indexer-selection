@@ -24,6 +24,9 @@ spec:
         - podSelector:
             matchLabels:
               app: iisa-score-computation
+        - podSelector:
+            matchLabels:
+              app: iisa-sync-status-fetcher
       ports:
         - protocol: TCP
           port: 8080

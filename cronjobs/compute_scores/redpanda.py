@@ -36,7 +36,6 @@ from typing import Callable, Dict, List, Optional, Tuple, cast
 import base58
 import numpy as np
 import pandas as pd
-import requests
 from gateway_queries_pb2 import ClientQueryProtobuf  # type: ignore[attr-defined]
 from iisa_client import (
     IISAPushError,
@@ -44,12 +43,11 @@ from iisa_client import (
     get_scores_status,
     post_scores,
 )
-from subgraph import paginate_subgraph_query, redact_url
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
+from subgraph import (
+    SubgraphResponseError,
+    paginate_subgraph_query,
+    redact_url,
+    retry_subgraph_read,
 )
 
 logger = logging.getLogger(__name__)
@@ -583,22 +581,11 @@ class RedpandaProvider:
         Returns a DataFrame indexed by 'indexer' with a 'stake_to_fees' column,
         matching the schema expected by compute_all_scores.
         """
-        if not self.graph_network_url:
-            logger.warning(
-                "GRAPH_NETWORK_SUBGRAPH_URL not set — returning empty stake data. "
-                "stake_to_fees will be NaN for all indexers."
-            )
-            return pd.DataFrame(columns=["stake_to_fees"])
-
         logger.info("Fetching stake data from %s", redact_url(self.graph_network_url))
         try:
             indexers = self._paginate_graphql_indexers()
         except Exception:
             logger.exception("Failed to fetch stake data from subgraph")
-            return pd.DataFrame(columns=["stake_to_fees"])
-
-        if not indexers:
-            logger.warning("Subgraph returned no indexer records")
             return pd.DataFrame(columns=["stake_to_fees"])
 
         df = pd.DataFrame(indexers)
@@ -960,19 +947,7 @@ class RedpandaProvider:
     # Internal: GraphQL pagination
     # -----------------------------------------------------------------------
 
-    @retry(
-        retry=retry_if_exception_type(
-            (
-                ConnectionError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.HTTPError,
-            )
-        ),
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, max=60),
-        reraise=True,
-    )
+    @retry_subgraph_read
     def _paginate_graphql_indexers(self) -> List[dict]:
         """Paginate through all indexers from the Graph Network subgraph.
 
@@ -991,6 +966,9 @@ class RedpandaProvider:
         indexers: List[dict] = paginate_subgraph_query(
             self.graph_network_url, query, entity="indexers"
         )
+        if not indexers:
+            # Retried: the gateway may have served the query from an indexer that is behind.
+            raise SubgraphResponseError("network subgraph returned no indexer records")
         return indexers
 
 

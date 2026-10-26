@@ -71,16 +71,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH_NAME="chore/update-cronjob-image-${{ steps.tags.outputs.sha_short }}"
-          sed -i 's|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: ${{ steps.tags.outputs.sha_tag }}|' k8s/score-computation-cronjob.yaml
-
-          # sed succeeds even when nothing matches, so confirm the new tag was actually written
-          if ! grep -qF "image: ${{ steps.tags.outputs.sha_tag }}" k8s/score-computation-cronjob.yaml; then
-            echo "::error::k8s/score-computation-cronjob.yaml has no image under ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}, so the new tag could not be written"
+          # Every manifest that runs this image moves together (today the CronJob and the
+          # sync-status fetcher), so a new one is picked up without editing this step.
+          MANIFESTS=()
+          while IFS= read -r manifest; do
+            MANIFESTS+=("$manifest")
+          done < <(grep -rlF "image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:" k8s/)
+          if [ "${#MANIFESTS[@]}" -eq 0 ]; then
+            echo "::error::no manifest under k8s/ uses ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}, so the new tag could not be written"
             exit 1
           fi
+          for manifest in "${MANIFESTS[@]}"; do
+            sed -i 's|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:.*|image: ${{ steps.tags.outputs.sha_tag }}|' "$manifest"
+
+            # sed succeeds even when nothing matches, so confirm the new tag was actually written
+            if ! grep -qF "image: ${{ steps.tags.outputs.sha_tag }}" "$manifest"; then
+              echo "::error::$manifest has no image under ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}, so the new tag could not be written"
+              exit 1
+            fi
+          done
 
           # Check if there are actual changes
-          if git diff --quiet k8s/score-computation-cronjob.yaml; then
+          if git diff --quiet "${MANIFESTS[@]}"; then
             echo "No changes to k8s yaml, skipping PR creation"
             exit 0
           fi
@@ -88,19 +100,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH_NAME"
-          git add k8s/score-computation-cronjob.yaml
-          git commit -m "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}"
+          git add "${MANIFESTS[@]}"
+          git commit -m "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}" \
+            -m "Updates every manifest that runs this image: ${MANIFESTS[*]}"
           git push -u origin "$BRANCH_NAME"
 
           gh pr create \
             --title "chore(k8s): update cronjob image to sha-${{ steps.tags.outputs.sha_short }}" \
-            --body "Updates the CronJob to use image \`${{ steps.tags.outputs.sha_tag }}\`
+            --body "Updates the CronJob and the sync-status fetcher to use image \`${{ steps.tags.outputs.sha_tag }}\`
 
           **Merge order:** Land this **before** any open \`chore(main): release\` PR. After this lands, wait 1-2 minutes for release-please to force-push the release PR with the new SHA bump — otherwise you'll need to land a third PR.
 
           After merging, run:
           \`\`\`bash
-          kubectl apply -f k8s/score-computation-cronjob.yaml
+          kubectl apply $(printf -- '-f %s ' "${MANIFESTS[@]}")
           \`\`\`"
 
       - name: Summary
