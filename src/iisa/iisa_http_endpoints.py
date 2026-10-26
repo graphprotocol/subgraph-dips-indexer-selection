@@ -481,7 +481,8 @@ def _parse_supported_networks(networks_json: Any) -> list[str]:
     """
     try:
         networks = json.loads(networks_json) if isinstance(networks_json, str) else []
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        logger.debug("Ignoring unreadable supported networks %.200r", networks_json)
         return []
     return networks if isinstance(networks, list) else []
 
@@ -1055,12 +1056,16 @@ def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[floa
     """
     try:
         prices = json.loads(dips_min_grt_json) if isinstance(dips_min_grt_json, str) else {}
+        if not isinstance(prices, dict):
+            raise TypeError(f"price map is a JSON {type(prices).__name__}, not an object")
         val = prices.get(chain_id)
         if val is None:
             return None
         price = float(val)
-    except (TypeError, ValueError, OverflowError):
-        logger.debug("Ignoring unreadable price for chain '%s' in %r", chain_id, dips_min_grt_json)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        logger.debug(
+            "Ignoring unreadable price for chain '%s' in %.200r", chain_id, dips_min_grt_json
+        )
         return None
     if isinstance(val, bool) or not math.isfinite(price) or price < 0:
         logger.debug("Ignoring unusable price %r for chain '%s'", val, chain_id)

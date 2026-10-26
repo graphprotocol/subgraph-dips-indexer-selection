@@ -7,7 +7,7 @@ metrics including latency, uptime, success rate, and economic security.
 
 import logging
 from types import MappingProxyType
-from typing import Callable, NewType, Optional, TypedDict, Union, cast
+from typing import Any, Callable, NewType, Optional, TypedDict, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -663,7 +663,9 @@ def _normalize_metrics(
 
     price_ceiling, when given, caps pricing instead of the observed max. scale_rows, when given,
     marks the rows that set each metric's best and worst; other rows are scored against them.
-    Missing metrics score 0. Input norm_ columns outside _PRECOMPUTED_NORM_COLUMNS are recomputed.
+    Missing metrics score 0, and so does a value that does not read as a number, such as text.
+    Input norm_ columns outside _PRECOMPUTED_NORM_COLUMNS are recomputed; those inside score 0
+    when outside [0, 1].
     """
     # (norm column, source column, normaliser), in the order the columns are added.
     metrics: list[tuple[str, str, _Normaliser]] = [
@@ -692,9 +694,9 @@ def _normalize_metrics(
 
     for norm_col, source_col, normalize in metrics:
         if norm_col in _PRECOMPUTED_NORM_COLUMNS and norm_col in merged.columns:
-            continue
-        if source_col in merged.columns:
-            merged[norm_col] = normalize(merged[source_col], scale_rows)
+            merged[norm_col] = _carried_scores(merged, norm_col)
+        elif source_col in merged.columns:
+            merged[norm_col] = _normalize_column(merged, source_col, normalize, scale_rows)
         else:
             merged[norm_col] = np.nan
 
@@ -705,14 +707,83 @@ def _normalize_metrics(
     return merged
 
 
+def _normalize_column(
+    merged: pd.DataFrame,
+    column: str,
+    normalize: _Normaliser,
+    scale_rows: Optional[pd.Series] = None,
+) -> pd.Series:
+    """Normalise one metric column after reading it as numbers. An unreadable value scores 0
+    and is left out of the normalisation, so it cannot move any other indexer's score.
+    """
+    numbers, unreadable = _read_metric(merged, column)
+    readable = ~unreadable.to_numpy()
+    rows = None if scale_rows is None else scale_rows[readable]
+    # With every row that sets the scale unreadable, scale against the readable rows.
+    if rows is not None and not rows.any():
+        rows = None
+    scores = np.zeros(len(merged))
+    scores[readable] = normalize(numbers[readable], rows)
+    return pd.Series(scores, index=merged.index)
+
+
+def _carried_scores(merged: pd.DataFrame, column: str) -> pd.Series:
+    """Read a norm_ column the input already carries. A value that is not a finite number in
+    [0, 1] scores 0, so a corrupt pushed score cannot outrank every other indexer.
+    """
+    numbers, unreadable = _read_metric(merged, column)
+    outside = numbers.notna() & ~numbers.between(0, 1)
+    if outside.any():
+        _warn_scored_as_zero(merged, column, outside, "fall outside [0, 1]")
+    return numbers.mask(unreadable | outside, 0.0)
+
+
+def _read_metric(merged: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
+    """Return (numbers, unreadable) for a metric column read as floats.
+
+    None and NaN stay NaN, as missing. Any other value that does not read as a
+    number, such as text, also becomes NaN and is flagged in ``unreadable``.
+    """
+    values = merged[column]
+    if pd.api.types.is_numeric_dtype(values):
+        return values.astype(float), pd.Series(False, index=values.index)
+    numbers = values.map(_float_or_nan).astype(float)
+    unreadable = values.notna() & numbers.isna()
+    if unreadable.any():
+        _warn_scored_as_zero(merged, column, unreadable, "do not read as numbers")
+    return numbers, unreadable
+
+
+def _float_or_nan(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float("nan")
+
+
+def _warn_scored_as_zero(merged: pd.DataFrame, column: str, rows: pd.Series, why: str) -> None:
+    """Log the indexers whose ``column`` value scores 0 because of ``why``."""
+    indexers = merged.loc[rows, "indexer"].tolist() if "indexer" in merged.columns else []
+    examples = merged.loc[rows, column].head(3).tolist()
+    logger.warning(
+        "scoring %d %r value(s) as 0 because they %s: indexers=%.300s examples=%.200r",
+        int(rows.sum()),
+        column,
+        why,
+        indexers,
+        examples,
+    )
+
+
 def _scale_values(values: pd.Series, scale_rows: Optional[pd.Series]) -> pd.Series:
     """The values that set a metric's scale: only scale_rows when given, otherwise all."""
     return values if scale_rows is None else values[scale_rows]
 
 
 def _normalize_latency(latency: pd.Series, scale_rows: Optional[pd.Series] = None) -> pd.Series:
-    """Normalise the latency linear regression score."""
-    return 1 - _normalize_generic(latency, scale_rows)  # lower is better
+    """Normalise the latency linear regression score. A missing latency scores 0, the worst."""
+    # lower is better
+    return (1 - _normalize_generic(latency, scale_rows)).mask(latency.isna(), 0.0)
 
 
 def _normalize_stake_to_fees(
@@ -816,9 +887,10 @@ def _normalize_uptime_and_success_rate(
 
 def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Series:
     """Weighted average of each row's present norm_* metrics by `weights`.
-    One matrix multiply over the present norm_* columns: NaN cells drop out of
-    both the numerator and the per-row weight total, so each row renormalises
-    over the metrics it has. Raises ValueError if any row has no usable column.
+    NaN cells drop out of both the numerator and the per-row weight total, so each
+    row renormalises over the metrics it has. Both sums add their terms in the same
+    order, so scores within [0, 1] cannot round to an average above 1.
+    Raises ValueError if any row has no usable column.
     """
     columns = []
     column_weights = []
@@ -837,8 +909,8 @@ def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Ser
     weight_vector = np.array(column_weights, dtype=float)
     matrix = df[columns].to_numpy(dtype=float)
     present = ~np.isnan(matrix)
-    weighted_sum = np.nansum(matrix * weight_vector, axis=1)
-    weight_total = present @ weight_vector  # weights of the columns each row has
+    weighted_sum = (np.where(present, matrix, 0.0) * weight_vector).sum(axis=1)
+    weight_total = (present * weight_vector).sum(axis=1)  # weights of the columns each row has
 
     if (weight_total == 0).any():
         logger.error("Total sum of weights is 0. Sum of weights should be non-zero, ideally 1.")
