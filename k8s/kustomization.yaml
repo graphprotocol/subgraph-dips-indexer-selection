@@ -8,3 +8,4 @@ resources:
   - iisa-scores-cache-pvc.yaml
   - service.yaml
   - networkpolicy.yaml
+  - sync-status-fetcher-egress.yaml
