@@ -22,14 +22,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.3,<10.0",
-    "pytest-asyncio>=0.21,<1.0",
+    "pytest-asyncio>=0.21,<2.0",
     "pytest-mock>=3.0,<4.0",
     "pytest-cov>=7.0,<8.0",
     "hypothesis>=6.100,<7.0",
     # Exact, since each release can change the requests it generates and the checks it runs,
     # which would fail the API fuzz test on unrelated changes. Bump it in a change of its own.
     "schemathesis==4.30.0",
-    "faker>=18.0,<40.0",
+    "faker>=18.0,<41.0",
     "faker-airtravel>=0.4,<1.0",
     "mypy>=1.11,<3.0",
     "ruff>=0.1,<1.0",
