@@ -238,12 +238,11 @@ class TestComputeDegradedScores:
     def test_sends_raw_placeholders_without_pre_scaled_uptime_or_success(self, monkeypatch):
         # Arrange
         urls = {"0xa": "https://a.example/", "0xb": "https://b.example/"}
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda _: urls)
         monkeypatch.setattr(processing, "fetch_dips_info", lambda _: pd.DataFrame())
         monkeypatch.setattr(processing, "fetch_and_filter_graph_node_versions", lambda df, _: df)
 
         # Act
-        result = processing.compute_degraded_scores("https://network.example/")
+        result = processing.compute_degraded_scores(urls)
 
         # Assert
         assert list(result["uptime_score"]) == [0.5, 0.5]
