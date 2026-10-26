@@ -907,9 +907,9 @@ async def get_score(
         _normalize_metrics,
     )
 
-    # Normalisation is relative (min-max across all indexers), so scoring one
-    # row alone is degenerate. Normalise the whole table like /scores/weighted,
-    # then pull this indexer's row, so the two endpoints agree.
+    # Normalisation is relative to the other indexers, so score this one against the whole
+    # table like /scores/weighted (the two endpoints agree). Selection scores against only the
+    # request's price-filtered candidates, so its values can differ from these.
     indexer_id = request.indexer_id.lower()
     normalized = _normalize_metrics(_state.history.copy())
     match = normalized[normalized["indexer"] == indexer_id]
