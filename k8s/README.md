@@ -52,7 +52,10 @@ generous headroom:
 
 The sync-status fetcher reports healthy only after its first push, which probes every
 indexer, so its startup probe allows 15 minutes. It turns unhealthy again once 2 hourly
-pushes in a row fail, and the liveness probe then restarts it. It has no readiness probe, since nothing
+pushes in a row fail, and the liveness probe then restarts it. A restart fixes a cause
+inside the pod, such as a rotated push token. If IISA or the network subgraph stays
+unreachable instead, each new pod fails its first push and then its startup probe, so it
+shows CrashLoopBackOff and retries every 15 to 20 minutes until the cause clears. It has no readiness probe, since nothing
 sends it traffic.
 
 ## Prerequisites
