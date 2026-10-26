@@ -1,15 +1,16 @@
 """Shared GraphQL pagination helper for querying Graph Network subgraphs.
 
-Both the indexer discovery path (processing.py) and the stake data path
-(redpanda.py) need cursor-based pagination over subgraph entities. This
-module provides a single implementation so the pagination logic, error
-handling, and page-size defaults live in one place.
+Both the indexer discovery below and the stake data path (redpanda.py) need
+cursor-based pagination over subgraph entities. This module provides a single
+implementation so the pagination logic, error handling, and page-size defaults
+live in one place. Indexer discovery lives here rather than in processing.py so
+the sync-status fetcher can use it without loading the scoring libraries.
 """
 
 import logging
 import re
 import time
-from typing import List
+from typing import Dict, List
 
 import requests
 from tenacity import (
@@ -160,3 +161,43 @@ def paginate_subgraph_query(
 
     logger.info("Pagination complete: %d entities across %d page(s)", len(all_entities), page_num)
     return all_entities
+
+
+INDEXER_URLS_QUERY = """
+query($first: Int!, $lastId: String!) {
+  indexers(first: $first, where: { id_gt: $lastId, url_not: "" }, orderBy: id) {
+    id
+    url
+  }
+}
+"""
+
+
+@retry_subgraph_read
+def _query_indexer_urls(network_subgraph_url: str) -> Dict[str, str]:
+    """Map each indexer with a URL to that URL; raise when the subgraph lists none."""
+    raw_indexers = paginate_subgraph_query(
+        network_subgraph_url, INDEXER_URLS_QUERY, entity="indexers"
+    )
+    indexer_urls = {
+        indexer["id"]: indexer["url"] for indexer in raw_indexers if indexer.get("url", "")
+    }
+    if not indexer_urls:
+        # Retried: the gateway may have served the query from an indexer that is behind.
+        raise SubgraphResponseError("network subgraph returned no indexers with a URL")
+    return indexer_urls
+
+
+def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
+    """Return {address: url} for every indexer the network subgraph lists with a URL.
+
+    Redpanda only sees indexers the gateway has routed to, so this lookup finds new ones.
+    Raises when no URL is set, the subgraph can't be read or it lists no one: without URLs
+    every indexer fails its DIPs probe, selection picks no one and dipper cancels everything.
+    """
+    if not network_subgraph_url:
+        raise ValueError("GRAPH_NETWORK_SUBGRAPH_URL is not set")
+
+    all_indexers = _query_indexer_urls(network_subgraph_url)
+    logger.info(f"Discovered {len(all_indexers)} indexers from network subgraph")
+    return all_indexers
