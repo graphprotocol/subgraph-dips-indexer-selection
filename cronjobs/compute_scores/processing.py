@@ -1050,7 +1050,7 @@ def compute_all_scores(
     # minimum (no-op when MIN_GRAPH_NODE_VERSION is unset).
     merged = fetch_and_filter_graph_node_versions(merged, indexer_urls)
 
-    # Transform to indexer_scores schema with pre-normalized values
+    # Transform to indexer_scores schema
     scores_df = transform_to_scores_schema(merged)
     scores_df["scoring_mode"] = "full" if geoip_available else "partial_no_geoip"
 
@@ -1066,7 +1066,7 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     """
     Transform the merged DataFrame to the indexer_scores output schema.
 
-    Includes pre-normalizing static metrics.
+    Pre-normalizes latency only; the IISA service scales the other metrics itself.
     """
     # Build the output DataFrame
     scores = pd.DataFrame()
@@ -1099,10 +1099,6 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     scores["stake_to_fees"] = merged.get("stake_to_fees")
     scores["total_query_fees"] = merged.get("total_query_fees", 0.0)
     scores["last_known_slashable_stake"] = merged.get("last_known_slashable_stake", 0.0)
-
-    # Pre-normalized scores
-    scores["norm_uptime_score"] = normalize_to_0_1(scores["uptime_score"])
-    scores["norm_success_rate"] = normalize_to_0_1(scores["success_rate"])
 
     # Organization/location
     scores["org"] = merged.get("org")
@@ -1793,8 +1789,6 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["uptime_duration_seconds"] = None
     scores["success_rate"] = 0.5
     scores["stake_to_fees"] = None
-    scores["norm_uptime_score"] = 0.5
-    scores["norm_success_rate"] = 0.5
     scores["norm_stake_to_fees"] = 0.5
     scores["org"] = None
     scores["dst_lat"] = None
