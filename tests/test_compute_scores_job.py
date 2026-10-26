@@ -186,8 +186,6 @@ class TestTransformToScoresSchema:
             "uptime_duration_seconds",
             "success_rate",
             "stake_to_fees",
-            "norm_uptime_score",
-            "norm_success_rate",
             "org",
             "dst_lat",
             "dst_lon",
@@ -196,6 +194,9 @@ class TestTransformToScoresSchema:
         ]
         for col in required_columns:
             assert col in result.columns, f"Missing column: {col}"
+        # The selector scales uptime and success rate itself from the raw values.
+        assert "norm_uptime_score" not in result.columns
+        assert "norm_success_rate" not in result.columns
 
     def test_transform_uptime_conversion(self, sample_merged_df):
         # Act
@@ -219,14 +220,9 @@ class TestTransformToScoresSchema:
         # Act
         result = transform_to_scores_schema(sample_merged_df)
 
-        # Assert - all normalized scores should be between 0 and 1
-        for col in [
-            "norm_uptime_score",
-            "norm_success_rate",
-            "lat_normalized_score",
-        ]:
-            values = result[col].dropna()
-            assert all(0 <= v <= 1 for v in values), f"{col} has values outside [0, 1]"
+        # Assert - the normalized latency score should be between 0 and 1
+        values = result["lat_normalized_score"].dropna()
+        assert all(0 <= v <= 1 for v in values), "lat_normalized_score has values outside [0, 1]"
 
     def test_transform_query_count_preserved(self, sample_merged_df):
         # Act

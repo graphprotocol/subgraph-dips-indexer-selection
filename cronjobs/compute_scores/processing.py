@@ -998,10 +998,6 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     scores["total_query_fees"] = merged.get("total_query_fees", 0.0)
     scores["last_known_slashable_stake"] = merged.get("last_known_slashable_stake", 0.0)
 
-    # Pre-normalized scores
-    scores["norm_uptime_score"] = normalize_to_0_1(scores["uptime_score"])
-    scores["norm_success_rate"] = normalize_to_0_1(scores["success_rate"])
-
     # Organization/location
     scores["org"] = merged.get("org")
     scores["dst_lat"] = merged.get("dst_lat")
@@ -1695,8 +1691,6 @@ def compute_degraded_scores(graph_network_subgraph_url: str) -> pd.DataFrame:
     scores["uptime_duration_seconds"] = None
     scores["success_rate"] = 0.5
     scores["stake_to_fees"] = None
-    scores["norm_uptime_score"] = 0.5
-    scores["norm_success_rate"] = 0.5
     scores["norm_stake_to_fees"] = 0.5
     scores["org"] = None
     scores["dst_lat"] = None
