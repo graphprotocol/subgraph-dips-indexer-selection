@@ -961,6 +961,19 @@ class TestScaleSetByPickableIndexers:
         data = processor.data.set_index("indexer")
         assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.0, 0.0])
 
+    def test_zero_fee_candidates_keep_full_stake_to_fees_marks(self):
+        """With only zero-fee indexers left to pick, they still score 1.0 (maximum capacity)."""
+        history = self._history(stake_to_fees=[100.0, np.nan, np.nan])
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data.loc[["B", "C"], "norm_stake_to_fees"]) == [1.0, 1.0]
+
     def test_blocked_indexer_does_not_stretch_a_min_max_scale(self):
         """A blocked indexer's outsized stake_to_fees doesn't squash the pickable ones together."""
         history = self._history(stake_to_fees=[100.0, 10.0, 5.0])

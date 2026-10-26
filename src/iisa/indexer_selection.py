@@ -724,7 +724,9 @@ def _normalize_stake_to_fees(
     finite_max = _scale_values(stf, scale_rows).max()
     fill_value = (finite_max + 1.0) if pd.notna(finite_max) else 1.0
     stf = stf.fillna(fill_value)
-    return _normalize_generic(stf, scale_rows)
+    # When every indexer on the scale has zero fees the scale is flat and min-max gives 0, so
+    # set zero-fee rows to 1.0 directly.
+    return _normalize_generic(stf, scale_rows).where(stake_to_fees.notna(), 1.0)
 
 
 def _normalize_base_price_per_epoch(
