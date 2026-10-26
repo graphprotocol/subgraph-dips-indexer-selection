@@ -6,7 +6,7 @@ This job runs daily and computes:
 - Uptime scores
 - Success rates
 - Stake-to-fees ratios
-- Pre-normalized versions of all static metrics
+- A pre-normalized latency score (the IISA service scales the other metrics itself)
 
 Results are POSTed to the IISA HTTP service, which persists them to its own cache
 file (no shared filesystem).
