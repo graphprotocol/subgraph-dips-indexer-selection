@@ -512,6 +512,17 @@ class IndexerSelector:
             return existing_indexer, candidate, candidate_score - current_score
         return None
 
+    def _unpickable_indexers(self) -> set[IndexerId]:
+        """Indexers this request can't pick: already in the group, on the denylist, with a
+        pending (unaccepted) agreement on any subgraph, or that declined this subgraph.
+        """
+        return set(
+            self.current_group
+            + self.indexer_denylist
+            + [indexer for pending in self.pending_agreements.values() for indexer in pending]
+            + self.declined_indexers.get(self.deployment_id, [])
+        )
+
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None
     ) -> Optional[IndexerId]:
@@ -521,20 +532,7 @@ class IndexerSelector:
         replacing_indexer, when set, simulates the swap for the decentralisation
         check. Returns the best indexer ID, or None if none qualify.
         """
-
-        def flatten_list_of_lists(list_of_lists):
-            flattened_list = []
-            for sublist in list_of_lists:
-                for item in sublist:
-                    flattened_list.append(item)
-            return flattened_list
-
-        unpickable_indexers = set(
-            self.current_group
-            + self.indexer_denylist
-            + flatten_list_of_lists(self.pending_agreements.values())
-            + self.declined_indexers.get(self.deployment_id, [])
-        )
+        unpickable_indexers = self._unpickable_indexers()
         logger.debug(
             "deployment=%s unpickable: %d in_group, %d denylisted, %d pending, %d declined",
             self.deployment_id,
