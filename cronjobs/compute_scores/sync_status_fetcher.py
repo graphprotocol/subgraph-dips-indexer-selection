@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
     import aiohttp
 
 from iisa_client import IISAPushError, get_push_token, post_sync_status
-from processing import discover_indexers_from_network_subgraph
+from subgraph import discover_indexers_from_network_subgraph, subgraph_url_problem
 
 logging.basicConfig(
     level=logging.INFO,
@@ -153,10 +154,8 @@ def run_fetch_cycle() -> bool:
     """Run one fetch cycle. Returns True on success."""
     global _last_write_time
 
+    # A failed read raises; the main loop logs it with its traceback and skips the cycle.
     indexer_urls = discover_indexers_from_network_subgraph(GRAPH_NETWORK_SUBGRAPH_URL)
-    if not indexer_urls:
-        logger.warning("No indexers discovered, skipping cycle")
-        return False
 
     logger.info("Fetching /status from %d indexers...", len(indexer_urls))
     data = asyncio.run(_fetch_all_statuses(indexer_urls))
@@ -217,7 +216,14 @@ class HealthHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> int:
+    """Fetch every FETCH_INTERVAL until told to stop; return the process exit code."""
+    # Without a usable URL every cycle fails, so refuse to start rather than fail every hour.
+    url_problem = subgraph_url_problem(GRAPH_NETWORK_SUBGRAPH_URL)
+    if url_problem:
+        logger.critical("GRAPH_NETWORK_SUBGRAPH_URL %s; refusing to start", url_problem)
+        return 1
+
     def handle_signal(signum, _frame):
         logger.info("Received signal %d, shutting down", signum)
         _stop_event.set()
@@ -258,7 +264,8 @@ def main():
 
     server.shutdown()
     logger.info("Sync status fetcher stopped")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
