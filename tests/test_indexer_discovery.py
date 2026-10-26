@@ -65,11 +65,16 @@ def test_skips_indexers_without_a_url(mock_paginate):
     assert result == {"0xaaa": "https://indexer-a.example.com"}
 
 
-def test_unset_url_raises_without_querying():
+@pytest.mark.parametrize(
+    "url, expected",
+    [("", "is required"), ("http://graph-node:8000/x\n", "contains whitespace")],
+    ids=["unset", "trailing_newline"],
+)
+def test_unusable_url_raises_without_querying(url, expected):
     """An empty answer would score every indexer as failing its DIPs probe."""
     with patch("processing.paginate_subgraph_query") as mock_paginate:
-        with pytest.raises(ValueError, match="GRAPH_NETWORK_SUBGRAPH_URL is not set"):
-            discover_indexers_from_network_subgraph("")
+        with pytest.raises(ValueError, match=f"GRAPH_NETWORK_SUBGRAPH_URL {expected}"):
+            discover_indexers_from_network_subgraph(url)
     mock_paginate.assert_not_called()
 
 

@@ -9,7 +9,8 @@ handling, and page-size defaults live in one place.
 import logging
 import re
 import time
-from typing import List
+from typing import List, Optional
+from urllib.parse import urlparse
 
 import requests
 from tenacity import (
@@ -31,6 +32,26 @@ _GATEWAY_API_KEY = re.compile(r"(/api/)[^/?#\s]+(?=/(?:subgraphs|deployments)/)"
 def redact_url(text: str) -> str:
     """Return ``text`` with any gateway API key in a URL path replaced by ``<redacted>``."""
     return _GATEWAY_API_KEY.sub(r"\1<redacted>", text)
+
+
+def subgraph_url_problem(url: str) -> Optional[str]:
+    """Say what is wrong with a network subgraph URL, or None if it looks usable.
+
+    Never repeats the URL, which can carry an API key or credentials anywhere in it.
+    """
+    if not url:
+        return "is required"
+    # urlparse quietly drops a stray newline, which requests would then send as part of the path
+    if any(char.isspace() for char in url):
+        return "contains whitespace"
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+    except ValueError:
+        return "is not a valid URL"
+    if parsed.scheme not in ("http", "https") or not host:
+        return "must be an http(s) URL with a host"
+    return None
 
 
 # The gateway answers a rejected key, an unknown subgraph and an invalid query with HTTP 200 and a
