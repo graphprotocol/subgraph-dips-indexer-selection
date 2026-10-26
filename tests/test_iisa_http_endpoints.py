@@ -958,17 +958,27 @@ class TestScoresWeightedEndpoint:
         mock_dm.snapshot = ScoresSnapshot(
             data=pd.DataFrame(
                 {
-                    "indexer": ["0xabc", "0xxyz"],
-                    "url": ["https://a.example/", "https://b.example/"],
-                    "norm_lat_lin_reg_coefficient": [0.8, 0.6],
-                    "norm_stake_to_fees": [0.5, 0.65],
+                    "indexer": ["0xabc", "0xxyz", "0x123"],
+                    "url": ["https://a.example/", "https://b.example/", "https://c.example/"],
+                    "norm_lat_lin_reg_coefficient": [0.8, 0.6, 0.4],
+                    "norm_stake_to_fees": [0.5, 0.65, 0.3],
                     # Pre-scaled copies the selector must ignore in favour of the raw values.
-                    "norm_uptime_score": [0.9, 0.95],
-                    "norm_success_rate": [0.85, 0.9],
-                    "% up_x": [98.5, 100.0],
-                    "average_status": [0.985, 1.0],
-                    "base_price_per_epoch": [100.0, 50.0],
-                    "price_per_entity": [0.4, 0.2],
+                    "norm_uptime_score": [0.9, 0.95, 0.1],
+                    "norm_success_rate": [0.85, 0.9, 0.1],
+                    "% up_x": [98.5, 100.0, 90.0],
+                    "average_status": [0.985, 1.0, 0.9],
+                    "dips_info_available": [True, True, False],
+                    "dips_supported_networks": [
+                        '["arbitrum-one", "base"]',
+                        '["arbitrum-one"]',
+                        "[]",
+                    ],
+                    "dips_min_grt_per_30_days": [
+                        '{"arbitrum-one": "100", "base": "40"}',
+                        '{"arbitrum-one": "50"}',
+                        "{}",
+                    ],
+                    "dips_min_grt_per_billion_entities_per_30_days": ["0.4", "0.2", None],
                 }
             ),
             computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
@@ -980,32 +990,42 @@ class TestScoresWeightedEndpoint:
 
         assert response.status_code == 200
         body = response.json()
-        assert body["count"] == 2
+        assert body["count"] == 3
         assert "2026-05-28" in body["computed_at"]
-        assert len(body["scores"]) == 2
 
         entries_by_id = {e["indexer"]: e for e in body["scores"]}
-        assert set(entries_by_id) == {"0xabc", "0xxyz"}
+        assert set(entries_by_id) == {"0xabc", "0xxyz", "0x123"}
 
+        # The network-wide score compares every indexer and leaves prices out, so it's the
+        # weighted average of latency, stake_to_fees, uptime and success rate alone. Latency and
+        # stake_to_fees arrive pre-scaled and are kept; 98.5% uptime and success sit halfway
+        # between the 97%-of-best cutoff and the best.
         abc = entries_by_id["0xabc"]
-        assert isinstance(abc["weighted_score"], float)
-        assert 0.0 <= abc["weighted_score"] <= 1.0
-        # Latency and stake_to_fees arrive pre-scaled and are kept; the rest are scaled here.
-        # 98.5% of the best sits halfway between the 97% cutoff and the best.
-        assert abc["components"]["latency"] == 0.8
-        assert abc["components"]["uptime"] == pytest.approx(0.5)
-        assert abc["components"]["success_rate"] == pytest.approx(0.5)
-        assert abc["components"]["stake_to_fees"] == 0.5
-        assert abc["components"]["base_price"] == pytest.approx(0.0)
-        assert abc["components"]["price_per_entity"] == pytest.approx(0.0)
+        assert abc["components"] == pytest.approx(
+            {"latency": 0.8, "stake_to_fees": 0.5, "uptime": 0.5, "success_rate": 0.5}
+        )
+        assert abc["weighted_score"] == pytest.approx(
+            (0.8 * 0.20 + 0.5 * 0.30 + 0.5 * 0.15 + 0.5 * 0.05) / 0.70
+        )
+
+        # Each chain is scored against the indexers that support it and priced it, prices in.
+        assert set(abc["chains"]) == {"arbitrum-one", "base"}
+        arbitrum = abc["chains"]["arbitrum-one"]
+        assert arbitrum["components"]["base_price"] == pytest.approx(0.0)
+        assert arbitrum["components"]["price_per_entity"] == pytest.approx(0.0)
+        assert arbitrum["weighted_score"] == pytest.approx(
+            0.8 * 0.20 + 0.5 * 0.30 + 0.5 * 0.15 + 0.5 * 0.05
+        )
+        # abc is alone on base, so it is the best uptime there.
+        assert abc["chains"]["base"]["components"]["uptime"] == pytest.approx(1.0)
 
         xyz = entries_by_id["0xxyz"]
-        assert xyz["components"]["latency"] == 0.6
-        assert xyz["components"]["uptime"] == pytest.approx(1.0)
-        assert xyz["components"]["success_rate"] == pytest.approx(1.0)
-        assert xyz["components"]["stake_to_fees"] == 0.65
-        assert xyz["components"]["base_price"] == pytest.approx(0.5)
-        assert xyz["components"]["price_per_entity"] == pytest.approx(0.5)
+        assert set(xyz["chains"]) == {"arbitrum-one"}
+        assert xyz["chains"]["arbitrum-one"]["components"]["base_price"] == pytest.approx(0.5)
+        assert xyz["chains"]["arbitrum-one"]["components"]["price_per_entity"] == pytest.approx(0.5)
+
+        # 0x123 has priced no chain, so it only has the network-wide score.
+        assert entries_by_id["0x123"]["chains"] == {}
 
     def test_nan_component_normalised_to_zero(self):
         from iisa import iisa_http_endpoints
@@ -1330,6 +1350,10 @@ class TestGetScoreEndpoint:
         assert data["found"] is True
         assert data["weighted_score"] is not None
         assert isinstance(data["components"], dict)
+        # Prices only appear per chain: 450 GRT against arbitrum-one's highest price of 500.
+        assert "base_price" not in data["components"]
+        assert set(data["chains"]) == {"arbitrum-one"}
+        assert data["chains"]["arbitrum-one"]["components"]["base_price"] == pytest.approx(0.1)
 
     @patch("iisa.iisa_http_endpoints.DataManager")
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
@@ -2863,3 +2887,29 @@ class TestSelectIndexersEndToEndPricing:
         assert response.status_code == 200
         indexers = response.json()["indexers"]
         assert len(indexers) <= 2, f"requested 2 candidates but got {len(indexers)}"
+
+
+class TestPricedChains:
+    """Tests for _priced_chains -- the chains the score endpoints report a score for."""
+
+    def test_lists_every_priced_chain_once_skipping_unreadable_maps(self):
+        from iisa.iisa_http_endpoints import _priced_chains
+
+        history = pd.DataFrame(
+            {
+                "dips_min_grt_per_30_days": [
+                    '{"base": "40", "arbitrum-one": "100"}',
+                    '{"arbitrum-one": "50"}',
+                    "not json",
+                    '["arbitrum-one"]',
+                    None,
+                ]
+            }
+        )
+
+        assert _priced_chains(history) == ["arbitrum-one", "base"]
+
+    def test_no_price_column_means_no_chains(self):
+        from iisa.iisa_http_endpoints import _priced_chains
+
+        assert _priced_chains(pd.DataFrame({"indexer": ["0xa"]})) == []
