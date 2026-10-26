@@ -26,8 +26,8 @@ from functools import lru_cache, partial
 from typing import Any, Optional, cast
 
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
@@ -108,6 +108,9 @@ class SelectionRequest(BaseModel):
     declined_indexers: Optional[dict[str, list[str]]] = None
     chain_id: Optional[str] = None  # e.g., "arbitrum-one"
     max_grt_per_30_days: Optional[float] = None  # e.g., 4500.0
+    max_grt_per_billion_entities_per_30_days: Optional[float] = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )  # e.g., 2000.0
     optimistic_dips_fees: Optional[dict[str, float]] = None  # indexer address -> GRT per 30 days
 
 
@@ -775,13 +778,15 @@ def scores_weighted(
 def dips_indexers(
     chain: str,
     max_grt_per_30_days: Optional[float] = None,
+    max_grt_per_billion_entities_per_30_days: Optional[float] = Query(
+        default=None, ge=0, allow_inf_nan=False
+    ),
     authorization: Optional[str] = Header(None),
 ) -> DipsIndexersResponse:
     """Indexers selection would pick for ``chain``: answered their DIPs probe, support
-    the chain, and priced it within the optional ``max_grt_per_30_days`` ceiling (omit
-    to ignore price). ``chain`` is required; omitting it is a 422. Example::
-
-        GET /dips-indexers?chain=arbitrum-one&max_grt_per_30_days=4500 -> count 2
+    the chain, and priced within the optional ``max_grt_per_30_days`` and
+    ``max_grt_per_billion_entities_per_30_days`` ceilings (omit either to skip it).
+    Omitting ``chain`` is a 422. Example: ``?chain=arbitrum-one&max_grt_per_30_days=4500``.
     """
     _require_push_token(authorization)
 
@@ -797,8 +802,10 @@ def dips_indexers(
 
     # Reuse the selection path's test so this endpoint and selection can't disagree:
     # an indexer accepts DIPs for a chain only if it answered its probe, supports the
-    # chain, and priced it within the optional ceiling (None skips the ceiling).
-    matched, _ = _filter_by_price(snap.data, chain, max_grt_per_30_days)
+    # chain, and priced it within the optional ceilings (None skips a ceiling).
+    matched, _ = _filter_by_price(
+        snap.data, chain, max_grt_per_30_days, max_grt_per_billion_entities_per_30_days
+    )
 
     indexers: list[str] = []
     for value in matched.get("indexer", pd.Series(dtype=object)):
@@ -923,13 +930,18 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
 
     logger.info(
         "select-indexers request: deployment=%s chain=%s num_candidates=%d "
-        "existing=%d blocked=%d budget=%s",
+        "existing=%d blocked=%d budget=%s entity_budget=%s",
         request.deployment_id,
         request.chain_id,
         request.num_candidates,
         len(request.existing_indexers or []),
         len(request.blocklist or []),
-        f"{request.max_grt_per_30_days} GRT/30d" if request.max_grt_per_30_days else "none",
+        f"{request.max_grt_per_30_days} GRT/30d"
+        if request.max_grt_per_30_days is not None
+        else "none",
+        f"{request.max_grt_per_billion_entities_per_30_days} GRT per billion entities/30d"
+        if request.max_grt_per_billion_entities_per_30_days is not None
+        else "none",
     )
 
     try:
@@ -1025,13 +1037,45 @@ def _keep_within_budget(
     return df, ""
 
 
+def _keep_within_entity_budget(
+    df: pd.DataFrame, max_grt_per_billion_entities_per_30_days: Optional[float]
+) -> tuple[pd.DataFrame, str]:
+    """Price filter step: keep indexers whose per-entity price is at or below the ceiling.
+
+    An indexer with no per-entity price passes, since it is scored and offered as 0. A
+    price that is present but not a number fails, since it sets no usable floor.
+    """
+    column = "dips_min_grt_per_billion_entities_per_30_days"
+    if max_grt_per_billion_entities_per_30_days is None or column not in df.columns:
+        return df, ""
+    ceiling = max_grt_per_billion_entities_per_30_days
+
+    prices = pd.to_numeric(df[column], errors="coerce")
+    pre_filter = len(df)
+    df = df[df[column].isna() | (prices <= ceiling)]
+    logger.debug(
+        "price filter: %d/%d indexers within budget of %s GRT per billion entities/30d",
+        len(df),
+        pre_filter,
+        ceiling,
+    )
+    if df.empty:
+        return (
+            df,
+            f"all {pre_filter} indexers exceed payment "
+            f"ceiling of {ceiling} GRT per billion entities/30d",
+        )
+    return df, ""
+
+
 def _filter_by_price(
     history: pd.DataFrame,
     chain_id: Optional[str],
     max_grt_per_30_days: Optional[float],
+    max_grt_per_billion_entities_per_30_days: Optional[float] = None,
 ) -> tuple[pd.DataFrame, str]:
-    """Drop indexers that lack DIP info, don't support the chain, lack a
-    chain price, or exceed max_grt_per_30_days for the chain.
+    """Drop indexers that lack DIP info, don't support the chain, lack a chain price,
+    exceed max_grt_per_30_days for the chain, or exceed the per-entity ceiling.
 
     Returns (filtered_df, reason). ``reason`` is empty unless filtering left
     no candidates, in which case it explains why.
@@ -1050,6 +1094,10 @@ def _filter_by_price(
         partial(_keep_supporting_chain, chain_id=chain_id),
         partial(_keep_with_chain_price, chain_id=chain_id),
         partial(_keep_within_budget, chain_id=chain_id, max_grt_per_30_days=max_grt_per_30_days),
+        partial(
+            _keep_within_entity_budget,
+            max_grt_per_billion_entities_per_30_days=max_grt_per_billion_entities_per_30_days,
+        ),
     )
     for step in steps:
         df, reason = step(df)
@@ -1151,6 +1199,7 @@ def _price_filtered_candidates(
         history,
         request.chain_id,
         request.max_grt_per_30_days,
+        request.max_grt_per_billion_entities_per_30_days,
     )
 
     if filtered_history.empty:

@@ -1153,6 +1153,13 @@ class TestDipsIndexersEndpoint:
                         None,
                         "{}",
                     ],
+                    "dips_min_grt_per_billion_entities_per_30_days": [
+                        "300",
+                        "100",
+                        None,
+                        None,
+                        None,
+                    ],
                 }
             ),
             computed_at=datetime(2026, 6, 2, 8, 30, tzinfo=timezone.utc),
@@ -1215,6 +1222,37 @@ class TestDipsIndexersEndpoint:
         # A ceiling above both prices keeps both.
         high = client.get("/dips-indexers", params={"chain": "mainnet", "max_grt_per_30_days": 250})
         assert set(high.json()["indexers"]) == {"0xaaa", "0xbbb"}
+
+    def test_entity_price_ceiling_drops_over_ceiling_indexers(self, monkeypatch):
+        """``max_grt_per_billion_entities_per_30_days`` drops indexers whose per-entity
+        price is above it, matching what selection would offer at that ceiling.
+        """
+        from iisa.iisa_http_endpoints import app
+
+        self._seed_snapshot(monkeypatch)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # 0xaaa charges 300 per billion entities and 0xbbb charges 100.
+        capped = client.get(
+            "/dips-indexers",
+            params={"chain": "mainnet", "max_grt_per_billion_entities_per_30_days": 200},
+        )
+        assert capped.status_code == 200
+        assert capped.json()["indexers"] == ["0xbbb"]
+
+    @pytest.mark.parametrize("ceiling", ["nan", "inf", "-1"])
+    def test_entity_price_ceiling_rejects_unusable_values(self, monkeypatch, ceiling):
+        """A NaN, infinite or negative ceiling would silently drop every priced indexer."""
+        from iisa.iisa_http_endpoints import app
+
+        self._seed_snapshot(monkeypatch)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.get(
+            "/dips-indexers",
+            params={"chain": "mainnet", "max_grt_per_billion_entities_per_30_days": ceiling},
+        )
+        assert response.status_code == 422
 
     def test_chain_filter_excludes_advertised_but_unpriced_indexer(self, monkeypatch):
         """An indexer that lists a chain but never priced it is excluded for that
@@ -2290,6 +2328,55 @@ class TestFilterByPrice:
         _filter_by_price(df, "arb", 200.0)
         assert list(df["indexer"]) == ["0xA", "0xB"]
 
+    def _entity_priced(self, indexer, entity_price):
+        row = self._priced(indexer, ["arb"], {"arb": 100})
+        row["dips_min_grt_per_billion_entities_per_30_days"] = entity_price
+        return row
+
+    def test_excludes_indexers_over_entity_ceiling(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [self._entity_priced("0xA", "1000"), self._entity_priced("0xB", "3000")]
+        )
+        result, reason = _filter_by_price(df, "arb", None, 2000.0)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+    def test_entity_price_equal_to_entity_ceiling_is_kept(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history([self._entity_priced("0xA", "2000")])
+        result, _ = _filter_by_price(df, "arb", None, 2000.0)
+        assert list(result["indexer"]) == ["0xA"]
+
+    def test_missing_entity_price_passes_entity_ceiling(self):
+        """No per-entity price means no per-entity floor: it is scored and offered as 0."""
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history([self._entity_priced("0xA", None)])
+        result, _ = _filter_by_price(df, "arb", None, 2000.0)
+        assert list(result["indexer"]) == ["0xA"]
+
+    def test_unparsable_entity_price_fails_entity_ceiling(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [self._entity_priced("0xA", "abc"), self._entity_priced("0xB", "100")]
+        )
+        result, _ = _filter_by_price(df, "arb", None, 2000.0)
+        assert list(result["indexer"]) == ["0xB"]
+
+    def test_reason_text_when_all_over_entity_ceiling(self):
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history([self._entity_priced("0xA", "3000")])
+        result, reason = _filter_by_price(df, "arb", None, 2000.0)
+        assert result.empty
+        assert reason == (
+            "all 1 indexers exceed payment ceiling of 2000.0 GRT per billion entities/30d"
+        )
+
     def test_logs_each_step_at_debug(self, caplog):
         from iisa.iisa_http_endpoints import _filter_by_price
 
@@ -2322,6 +2409,7 @@ class TestPriceFilterSteps:
             ("_keep_supporting_chain", ("arb",)),
             ("_keep_with_chain_price", ("arb",)),
             ("_keep_within_budget", ("arb", 1.0)),
+            ("_keep_within_entity_budget", (1.0,)),
         ],
     )
     def test_passes_rows_through_when_its_column_is_missing(self, step_name, args):
@@ -2352,6 +2440,16 @@ class TestPriceFilterSteps:
             ]
         )
         result, reason = _keep_within_budget(df, "arb", 200.0)
+        assert list(result["indexer"]) == ["0xA"]
+        assert reason == ""
+
+    def test_keep_within_entity_budget_passes_rows_through_without_a_ceiling(self):
+        from iisa.iisa_http_endpoints import _keep_within_entity_budget
+
+        df = pd.DataFrame(
+            [{"indexer": "0xA", "dips_min_grt_per_billion_entities_per_30_days": "5000"}]
+        )
+        result, reason = _keep_within_entity_budget(df, None)
         assert list(result["indexer"]) == ["0xA"]
         assert reason == ""
 
@@ -2753,14 +2851,14 @@ class TestSelectIndexersEndToEndPricing:
             )
 
     @staticmethod
-    def _row(address, chain, price, loc="US", org="org1"):
+    def _row(address, chain, price, loc="US", org="org1", entity_price=500.0):
         """Build a minimal indexer row with all columns IndexerSelector needs."""
         return {
             "indexer": address,
             "dips_info_available": True,
             "dips_supported_networks": json.dumps([chain]),
             "dips_min_grt_per_30_days": json.dumps({chain: price}),
-            "dips_min_grt_per_billion_entities_per_30_days": 500.0,
+            "dips_min_grt_per_billion_entities_per_30_days": entity_price,
             "destination_loc": loc,
             "org": org,
         }
@@ -2800,6 +2898,52 @@ class TestSelectIndexersEndToEndPricing:
         assert "0xexpensive" not in indexer_ids, (
             "indexer priced at 5000 GRT/30d should be excluded with budget of 400"
         )
+
+    def test_entity_budget_enforcement_excludes_expensive_indexers(self):
+        """Indexers whose per-entity price exceeds the per-entity ceiling must be excluded."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        history = pd.DataFrame(
+            [
+                self._row("0xcheap", "arb", 100.0, entity_price=200.0),
+                self._row("0xexpensive", "arb", 100.0, entity_price=50000.0),
+            ]
+        )
+
+        iisa_http_endpoints._state._history = history
+        iisa_http_endpoints._state._initialized = True
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmEntityBudgetTest",
+                "chain_id": "arb",
+                "num_candidates": 2,
+                "max_grt_per_billion_entities_per_30_days": 2000.0,
+            },
+        )
+
+        assert response.status_code == 200
+        assert [i["id"] for i in response.json()["indexers"]] == ["0xcheap"]
+
+    def test_negative_entity_ceiling_is_rejected(self):
+        """A negative ceiling would silently drop every indexer with a per-entity price."""
+        from iisa.iisa_http_endpoints import app
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            json={
+                "deployment_id": "QmEntityBudgetTest",
+                "chain_id": "arb",
+                "num_candidates": 1,
+                "max_grt_per_billion_entities_per_30_days": -1,
+            },
+        )
+        assert response.status_code == 422
 
     def test_blocklist_excludes_indexers(self):
         """Blocklisted indexers must not appear in the response."""
