@@ -1,6 +1,6 @@
-# The service is tested against uv.lock, the versions the OSV scan checks. Neither image reads
-# that lock, so each part is also tested against what pip resolves for its image on the day:
-# the service's tests on pyproject.toml's resolve, tests/cronjob on its requirements.txt's.
+# The service is tested against uv.lock, the versions its image installs and the OSV scan checks.
+# The cronjob image has no lock, so tests/cronjob runs on what pip resolves from its
+# requirements.txt on the day, as the image's build does.
 name: CI
 
 on:
@@ -113,27 +113,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Matches the python:3.12-slim base of the service image's Dockerfile.
-      - uses: actions/setup-python@v7
+      # The service image installs uv.lock on a python:3.12-slim base, so its tests also run on
+      # those versions under Python 3.12.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
+          version: "0.12.24"
           python-version: "3.12"
+          activate-environment: true
 
-      # The same pip install of pyproject.toml's dependencies that the service image runs, which
-      # can pick newer versions than uv.lock holds.
-      - name: Install service dependencies
-        run: |
-          pip install -e .
-          pip freeze > "$RUNNER_TEMP/service-packages.txt"
-
-      - name: Install test tools
-        run: |
-          pip install -e ".[dev]"
-          changed=$(pip freeze | grep -vxFf - "$RUNNER_TEMP/service-packages.txt" || true)
-          if [ -n "$changed" ]; then
-            echo "::error::Installing the test tools changed packages the service image ships:"
-            echo "$changed"
-            exit 1
-          fi
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
 
       - name: Test
         run: pytest --tb=short -q --ignore=tests/cronjob
