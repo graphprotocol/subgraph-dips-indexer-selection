@@ -52,12 +52,13 @@ spec:
                   key: IISA_PUSH_TOKEN
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
-          # /health answers 503 until the first snapshot is pushed. The first cycle probes every
-          # indexer, so it gets 15 minutes; a pod that never pushes is restarted, which retries
-          # sooner than the hourly loop. No readiness probe: nothing sends this pod traffic.
+          # /health is 503 until the first push, then 200 even if later pushes fail. The first cycle
+          # probes every indexer, so it gets 15 minutes; a pod that never pushes is restarted, which
+          # retries sooner than the hourly loop. No readiness probe: nothing sends this pod traffic.
           startupProbe:
             httpGet:
               path: /health
@@ -79,3 +80,10 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The root filesystem is read-only, so anything that needs scratch space gets /tmp.
+        - name: tmp
+          emptyDir: {}
