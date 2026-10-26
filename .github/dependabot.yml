@@ -22,7 +22,7 @@ updates:
         update-types: ["minor", "patch"]
 
   # The cronjob image installs from its own requirements.txt. Each merged bump rebuilds
-  # the image, which then needs a manual kubectl apply (see CLAUDE.md).
+  # the image, which then needs a manual kubectl apply.
   - package-ecosystem: pip
     directory: /cronjobs/compute_scores
     schedule:
