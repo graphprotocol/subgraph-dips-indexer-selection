@@ -889,6 +889,30 @@ class TestOptimisticDipsFees:
         assert list(history["norm_stake_to_fees"]) == [0.5, 0.5, 0.5]
 
 
+class TestUptimeAndSuccessRateScaling:
+    """Selection scores uptime and success rate against 97% of the best candidate."""
+
+    def test_selector_ignores_pre_scaled_uptime_and_success_rate(self):
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C"],
+                "destination_loc": ["loc1", "loc2", "loc3"],
+                "org": ["org1", "org2", "org3"],
+                "% up_x": [100.0, 98.5, 90.0],
+                "average_status": [1.0, 0.985, 0.9],
+                # The CronJob's worst-to-best copies, which must not be used.
+                "norm_uptime_score": [1.0, 0.85, 0.0],
+                "norm_success_rate": [1.0, 0.85, 0.0],
+            }
+        )
+
+        processor = IndexerSelector(history=history, deployment_id=DeploymentId("test_subgraph"))
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.5, 0.0])
+        assert list(data["norm_success_rate"]) == pytest.approx([1.0, 0.5, 0.0])
+
+
 class TestAssignAction:
     """The assigning log line names the action picked from group size against target."""
 
@@ -1059,6 +1083,43 @@ class TestNormalizeMetrics:
         assert result.max() == 1
         assert result.min() == 0
         assert len(result) == len(series)
+
+    def test_normalize_uptime_and_success_rate_scores_missing_value_zero(self):
+        """A missing value scores 0, not full marks, and leaves the others unchanged."""
+        series = pd.Series([100, np.nan, 98.5, 90])
+
+        result = _normalize_uptime_and_success_rate(series)
+
+        assert result.tolist() == pytest.approx([1.0, 0.0, 0.5, 0.0])
+
+    def test_pre_scaled_uptime_and_success_rate_are_rescored_from_raw_values(self):
+        """The CronJob's min-max copies don't override the 97%-of-best scaling."""
+        # Arrange: the shape the score loader hands the selector.
+        df = pd.DataFrame(
+            {
+                "% up_x": [100.0, 98.5, 90.0],
+                "average_status": [1.0, 0.985, 0.9],
+                "norm_uptime_score": [1.0, 0.85, 0.0],
+                "norm_success_rate": [1.0, 0.85, 0.0],
+                "norm_lat_lin_reg_coefficient": [0.2, 0.4, 0.6],
+                "norm_stake_to_fees": [0.5, 0.5, 0.5],
+            }
+        )
+
+        # Act
+        result = _normalize_metrics(df)
+
+        # Assert: uptime and success rate rescored, latency and stake_to_fees kept.
+        assert result["norm_uptime_score"].tolist() == pytest.approx([1.0, 0.5, 0.0])
+        assert result["norm_success_rate"].tolist() == pytest.approx([1.0, 0.5, 0.0])
+        assert result["norm_lat_lin_reg_coefficient"].tolist() == [0.2, 0.4, 0.6]
+        assert result["norm_stake_to_fees"].tolist() == [0.5, 0.5, 0.5]
+
+    def test_normalize_uptime_and_success_rate_all_zero_scores_zero(self):
+        """When the best is 0 every indexer scores 0, not full marks."""
+        result = _normalize_uptime_and_success_rate(pd.Series([0.0, 0.0]))
+
+        assert result.tolist() == [0.0, 0.0]
 
     def test_empty_dataframe(self, sample_df):
         # Test with an empty DataFrame
