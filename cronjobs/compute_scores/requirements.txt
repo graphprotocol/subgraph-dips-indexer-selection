@@ -32,7 +32,7 @@ base58>=2.1.1,<3.0
 aiohttp>=3.14.5,<4.0
 
 # PEP 440 version comparison for the graph-node minimum-version filter
-packaging>=21.0,<26.0
+packaging>=26.3,<27.0
 
 # Transitive pins to keep the vulnerability scanner happy.
 idna>=3.20
