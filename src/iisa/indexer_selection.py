@@ -241,7 +241,9 @@ class IndexerSelector:
         falls back to raw data / NaN scores rather than raising.
         """
         try:
-            normalized_data = _normalize_metrics(self.data, price_ceiling=self.price_ceiling)
+            normalized_data = _normalize_metrics(
+                self.data, price_ceiling=self.price_ceiling, scale_rows=self._scale_rows()
+            )
             logger.debug(
                 "deployment=%s normalized %d indexers",
                 self.deployment_id,
@@ -263,6 +265,20 @@ class IndexerSelector:
             normalized_data["weighted_score"] = np.nan
 
         return normalized_data
+
+    def _scale_rows(self) -> Optional[pd.Series]:
+        """Rows that set each metric's scale: the group plus every indexer this request can pick.
+
+        Blocked and declined indexers are left out even when in the group, so one with the best
+        uptime can't push every real candidate below the 97%-of-best cutoff.
+        """
+        if "indexer" not in self.data.columns:
+            return None
+        blocked = set(self.indexer_denylist) | set(
+            self.declined_indexers.get(self.deployment_id, [])
+        )
+        excluded = (self._unpickable_indexers() - set(self.current_group)) | blocked
+        return ~self.data["indexer"].isin(excluded)
 
     def _assign_indexers_to_subgraph(self):
         """
@@ -512,6 +528,17 @@ class IndexerSelector:
             return existing_indexer, candidate, candidate_score - current_score
         return None
 
+    def _unpickable_indexers(self) -> set[IndexerId]:
+        """Indexers this request can't pick: already in the group, on the denylist, with a
+        pending (unaccepted) agreement on any subgraph, or that declined this subgraph.
+        """
+        return set(
+            self.current_group
+            + self.indexer_denylist
+            + [indexer for pending in self.pending_agreements.values() for indexer in pending]
+            + self.declined_indexers.get(self.deployment_id, [])
+        )
+
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None
     ) -> Optional[IndexerId]:
@@ -521,20 +548,7 @@ class IndexerSelector:
         replacing_indexer, when set, simulates the swap for the decentralisation
         check. Returns the best indexer ID, or None if none qualify.
         """
-
-        def flatten_list_of_lists(list_of_lists):
-            flattened_list = []
-            for sublist in list_of_lists:
-                for item in sublist:
-                    flattened_list.append(item)
-            return flattened_list
-
-        unpickable_indexers = set(
-            self.current_group
-            + self.indexer_denylist
-            + flatten_list_of_lists(self.pending_agreements.values())
-            + self.declined_indexers.get(self.deployment_id, [])
-        )
+        unpickable_indexers = self._unpickable_indexers()
         logger.debug(
             "deployment=%s unpickable: %d in_group, %d denylisted, %d pending, %d declined",
             self.deployment_id,
@@ -635,19 +649,24 @@ class IndexerSelector:
 # recomputed from its raw value, so a pre-scaled copy can't replace the selector's own scaling.
 _PRECOMPUTED_NORM_COLUMNS = frozenset({NORM_LAT_LIN_REG_COEFFICIENT, "norm_stake_to_fees"})
 
+# A normaliser takes a metric's values and, optionally, a mask of the rows whose values set its
+# scale (best, worst, cutoff). Rows outside the mask are scored on that scale, clipped to [0, 1].
+_Normaliser = Callable[[pd.Series, Optional[pd.Series]], Union[pd.Series, float]]
+
 
 def _normalize_metrics(
     merged: pd.DataFrame,
     price_ceiling: Optional[float] = None,
+    scale_rows: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """Normalise each metric to [0, 1] where 1 is best (lower-is-better inverted).
 
-    price_ceiling, when given, caps pricing normalisation instead of using the
-    observed max, so one outlier price can't compress the rest. Missing metrics
-    score 0. Input norm_ columns outside _PRECOMPUTED_NORM_COLUMNS are recomputed.
+    price_ceiling, when given, caps pricing instead of the observed max. scale_rows, when given,
+    marks the rows that set each metric's best and worst; other rows are scored against them.
+    Missing metrics score 0. Input norm_ columns outside _PRECOMPUTED_NORM_COLUMNS are recomputed.
     """
     # (norm column, source column, normaliser), in the order the columns are added.
-    metrics: list[tuple[str, str, Callable[[pd.Series], Union[pd.Series, float]]]] = [
+    metrics: list[tuple[str, str, _Normaliser]] = [
         (NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI, _normalize_latency),
         # higher is better
         ("norm_uptime_score", "% up_x", _normalize_uptime_and_success_rate),
@@ -657,7 +676,7 @@ def _normalize_metrics(
         (
             "norm_base_price_per_epoch",
             "base_price_per_epoch",
-            lambda prices: _normalize_base_price_per_epoch(prices, price_ceiling),
+            lambda prices, rows: _normalize_base_price_per_epoch(prices, price_ceiling, rows),
         ),
         ("norm_price_per_entity", "price_per_entity", _normalize_price_per_entity),
     ]
@@ -667,11 +686,15 @@ def _normalize_metrics(
             merged[norm_col] = pd.Series(dtype=float)
         return merged
 
+    # With no row left to set the scale, scale against every row.
+    if scale_rows is not None and not scale_rows.any():
+        scale_rows = None
+
     for norm_col, source_col, normalize in metrics:
         if norm_col in _PRECOMPUTED_NORM_COLUMNS and norm_col in merged.columns:
             continue
         if source_col in merged.columns:
-            merged[norm_col] = normalize(merged[source_col])
+            merged[norm_col] = normalize(merged[source_col], scale_rows)
         else:
             merged[norm_col] = np.nan
 
@@ -682,26 +705,37 @@ def _normalize_metrics(
     return merged
 
 
-def _normalize_latency(latency: pd.Series) -> pd.Series:
+def _scale_values(values: pd.Series, scale_rows: Optional[pd.Series]) -> pd.Series:
+    """The values that set a metric's scale: only scale_rows when given, otherwise all."""
+    return values if scale_rows is None else values[scale_rows]
+
+
+def _normalize_latency(latency: pd.Series, scale_rows: Optional[pd.Series] = None) -> pd.Series:
     """Normalise the latency linear regression score."""
-    return 1 - _normalize_generic(latency)  # lower is better
+    return 1 - _normalize_generic(latency, scale_rows)  # lower is better
 
 
-def _normalize_stake_to_fees(stake_to_fees: pd.Series) -> pd.Series:
+def _normalize_stake_to_fees(
+    stake_to_fees: pd.Series, scale_rows: Optional[pd.Series] = None
+) -> pd.Series:
     """Normalise stake to fees ratio (higher = more capacity = better).
 
     Indexers with zero fees get NaN (infinite ratio = maximum capacity).
     Fill NaN above the max finite value so they normalise to 1.0.
     """
     stf = stake_to_fees.copy()
-    finite_max = stf.max()
+    finite_max = _scale_values(stf, scale_rows).max()
     fill_value = (finite_max + 1.0) if pd.notna(finite_max) else 1.0
     stf = stf.fillna(fill_value)
-    return _normalize_generic(stf)
+    # When every indexer on the scale has zero fees the scale is flat and min-max gives 0, so
+    # set zero-fee rows to 1.0 directly.
+    return _normalize_generic(stf, scale_rows).where(stake_to_fees.notna(), 1.0)
 
 
 def _normalize_base_price_per_epoch(
-    base_price_per_epoch: pd.Series, price_ceiling: Optional[float]
+    base_price_per_epoch: pd.Series,
+    price_ceiling: Optional[float],
+    scale_rows: Optional[pd.Series] = None,
 ) -> Union[pd.Series, float]:
     """Normalize base price per epoch (lower is better).
 
@@ -709,13 +743,16 @@ def _normalize_base_price_per_epoch(
     so outlier prices cannot compress differentiation among others.
     """
     prices = pd.to_numeric(base_price_per_epoch, errors="coerce").fillna(0.0).clip(lower=0)
-    ceiling = price_ceiling if price_ceiling is not None and price_ceiling > 0 else prices.max()
-    if ceiling > 0 and ceiling > prices.min():
+    scale = _scale_values(prices, scale_rows)
+    ceiling = price_ceiling if price_ceiling is not None and price_ceiling > 0 else scale.max()
+    if ceiling > 0 and ceiling > scale.min():
         return (1 - (prices / ceiling)).clip(lower=0)
     return 0.5
 
 
-def _normalize_price_per_entity(price_per_entity: pd.Series) -> pd.Series:
+def _normalize_price_per_entity(
+    price_per_entity: pd.Series, scale_rows: Optional[pd.Series] = None
+) -> pd.Series:
     """Normalize price per entity (lower is better).
 
     price_ceiling applies to base epoch price; entity pricing uses observed max since there is
@@ -724,33 +761,37 @@ def _normalize_price_per_entity(price_per_entity: pd.Series) -> pd.Series:
     """
     prices = pd.to_numeric(price_per_entity, errors="coerce").astype(float)
     prices = prices.where(np.isfinite(prices) & (prices >= 0))
-    ceiling = prices.max()
-    if ceiling > 0 and ceiling > prices.min():
-        scores = 1 - (prices / ceiling)
+    scale = _scale_values(prices, scale_rows)
+    ceiling = scale.max()
+    if ceiling > 0 and ceiling > scale.min():
+        scores = cast(pd.Series, (1 - (prices / ceiling)).clip(lower=0))
     else:
         scores = pd.Series(0.5, index=prices.index)
     return scores.where(prices.notna(), 0.0)
 
 
-def _normalize_generic(series: pd.Series) -> pd.Series:
+def _normalize_generic(series: pd.Series, scale_rows: Optional[pd.Series] = None) -> pd.Series:
     """Min-max normalise a Series to [0, 1].
 
     NaN and division-by-zero (a constant series, where max == min) both fill
     to 0.
     """
-    min_val = series.min()
-    max_val = series.max()
+    scale = _scale_values(series, scale_rows)
+    min_val = scale.min()
+    max_val = scale.max()
 
-    # Normalize to between 0 and 1 range
-    normalized = (series - min_val) / (max_val - min_val)
+    # Normalize to between 0 and 1 range, clipping rows that fall outside the scale.
+    normalized = ((series - min_val) / (max_val - min_val)).clip(0, 1)
 
-    # Handle any potential NaN or inf values
+    # Handle any potential NaN values
     normalized = normalized.fillna(0)
 
     return cast(pd.Series, normalized)
 
 
-def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
+def _normalize_uptime_and_success_rate(
+    series: pd.Series, scale_rows: Optional[pd.Series] = None
+) -> pd.Series:
     """Piecewise-scale uptime/success rate, rewarding only the top band.
 
     Values below NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD of the best
@@ -758,7 +799,7 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
     (e.g. 98.5% of the best maps to ~0.5). A missing value scores 0.
     """
     # Find the best uptime/success rate score in the series first
-    best = series.max()
+    best = _scale_values(series, scale_rows).max()
 
     # Threshold whereby indexers that have less uptime/success rate than this get no score.
     threshold = best * NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD
