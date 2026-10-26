@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
   - score-computation-cronjob.yaml
+  - sync-status-fetcher.yaml
   - deployment.yaml
   - iisa-scores-cache-pvc.yaml
   - service.yaml
