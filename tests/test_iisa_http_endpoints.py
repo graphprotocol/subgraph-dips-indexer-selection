@@ -3440,3 +3440,90 @@ class TestSelectIndexersEndToEndPricing:
         assert response.status_code == 200
         indexers = response.json()["indexers"]
         assert len(indexers) <= 2, f"requested 2 candidates but got {len(indexers)}"
+
+
+class TestSelectIndexersGroupMembers:
+    """Indexers already in the group: dipper cancels the agreement of any member left out of
+    the answer, so a member goes only when its own data shows it must.
+    """
+
+    _row = staticmethod(TestSelectIndexersEndToEndPricing._row)
+
+    @staticmethod
+    def _select(rows, **request):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints._state._history = pd.DataFrame(rows)
+        iisa_http_endpoints._state._initialized = True
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            json={"deployment_id": "QmGroupTest", "chain_id": "arb", **request},
+        )
+        assert response.status_code == 200, response.text
+        return [indexer["id"] for indexer in response.json()["indexers"]]
+
+    def test_drops_a_blocklisted_member(self):
+        rows = [self._row("0xa", "arb", 100.0), self._row("0xb", "arb", 100.0, "EU", "org2")]
+        selected = self._select(
+            rows, num_candidates=1, existing_indexers=["0xa"], blocklist=["0xa"]
+        )
+        assert selected == ["0xb"]
+
+    @pytest.mark.parametrize(
+        ("member", "request_caps"),
+        [
+            (
+                {"dips_min_grt_per_30_days": json.dumps({"arb": 5000.0})},
+                {"max_grt_per_30_days": 400},
+            ),
+            ({"dips_min_grt_per_30_days": json.dumps({"arb": "abc"})}, {}),
+            ({"dips_supported_networks": json.dumps(["other"])}, {}),
+            ({"dips_min_grt_per_billion_entities_per_30_days": -1}, {}),
+            (
+                {"dips_min_grt_per_billion_entities_per_30_days": 9000.0},
+                {"max_grt_per_billion_entities_per_30_days": 2000},
+            ),
+        ],
+        ids=["over-base-cap", "invalid-base", "chain-dropped", "invalid-entity", "over-entity-cap"],
+    )
+    def test_drops_a_member_whose_own_prices_fail_the_checks(self, member, request_caps):
+        rows = [
+            {**self._row("0xbad", "arb", 100.0), **member},
+            self._row("0xgood", "arb", 100.0, "EU", "org2"),
+        ]
+        selected = self._select(rows, num_candidates=1, existing_indexers=["0xbad"], **request_caps)
+        assert selected == ["0xgood"]
+
+    def test_keeps_a_member_with_no_price_data(self):
+        # A failed /dips/info fetch and a missing score row look the same as no DIPs at all,
+        # so neither is reason enough to cancel a working agreement.
+        rows = [
+            {**self._row("0xquiet", "arb", 100.0), "dips_info_available": False},
+            self._row("0xgood", "arb", 100.0, "EU", "org2"),
+        ]
+        selected = self._select(rows, num_candidates=2, existing_indexers=["0xquiet", "0xunscored"])
+        assert sorted(selected) == ["0xquiet", "0xunscored"]
+
+    def test_keeps_members_with_no_price_data_when_no_candidate_is_left(self):
+        # The day the score job reaches no indexer's /dips/info, every row lacks DIPs info.
+        rows = [
+            {**self._row(address, "arb", 100.0), "dips_info_available": False}
+            for address in ("0xa", "0xb", "0xc")
+        ]
+        selected = self._select(rows, num_candidates=2, existing_indexers=["0xa", "0xb"])
+        assert sorted(selected) == ["0xa", "0xb"]
+
+    def test_drops_failing_members_when_no_candidate_is_left(self):
+        rows = [
+            {**self._row("0xa", "arb", 100.0), "dips_info_available": False},
+            self._row("0xb", "arb", 5000.0, "EU", "org2"),
+        ]
+        selected = self._select(
+            rows,
+            num_candidates=2,
+            existing_indexers=["0xa", "0xb"],
+            max_grt_per_30_days=400,
+        )
+        assert selected == ["0xa"]
