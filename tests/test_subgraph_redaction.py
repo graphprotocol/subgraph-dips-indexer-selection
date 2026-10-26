@@ -126,7 +126,8 @@ def _provider_with_keyed_url() -> RedpandaProvider:
 
 
 class TestCallersHideKey:
-    """The 2 production callers catch the error and log it; neither log may carry the key."""
+    """The stake fetch logs the error it catches; indexer discovery logs each retry, then
+    raises. Neither the logs nor the raised error may carry the key."""
 
     def test_stake_fetch_still_retries_a_failed_request(self, no_retry_wait):
         page = MagicMock()
@@ -151,12 +152,17 @@ class TestCallersHideKey:
         assert "Failed to fetch stake data" in caplog.text
         assert FAKE_KEY not in caplog.text
 
-    def test_indexer_discovery_logs_hide_key(self, caplog):
+    def test_indexer_discovery_logs_and_error_hide_key(self, caplog):
         caplog.set_level(logging.INFO)
 
-        with patch("subgraph.requests.post", return_value=_http_error_response()):
-            result = processing.discover_indexers_from_network_subgraph(KEYED_URL)
+        with (
+            patch.object(processing._query_indexer_urls.retry, "sleep", lambda _: None),
+            patch("subgraph.requests.post", return_value=_http_error_response()),
+        ):
+            with pytest.raises(requests.HTTPError) as excinfo:
+                processing.discover_indexers_from_network_subgraph(KEYED_URL)
 
-        assert result == {}
-        assert "Failed to query network subgraph" in caplog.text
+        formatted = "".join(traceback.format_exception(excinfo.value))
+        assert "Retrying" in caplog.text
         assert FAKE_KEY not in caplog.text
+        assert FAKE_KEY not in formatted

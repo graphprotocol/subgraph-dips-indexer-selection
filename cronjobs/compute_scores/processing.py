@@ -24,6 +24,7 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
+import requests
 from numpy.linalg import pinv
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
@@ -32,6 +33,13 @@ from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from subgraph import paginate_subgraph_query
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 if TYPE_CHECKING:
     import aiohttp
@@ -201,37 +209,49 @@ def _get_min_graph_node_version_strict() -> bool:
     return raw not in _MIN_GRAPH_NODE_VERSION_STRICT_FALSE_VALUES
 
 
-def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
-    """Query the Graph Network subgraph for indexer addresses and service URLs.
+INDEXER_URLS_QUERY = """
+query($first: Int!, $lastId: String!) {
+  indexers(first: $first, where: { id_gt: $lastId, url_not: "" }, orderBy: id) {
+    id
+    url
+  }
+}
+"""
 
-    The subgraph is the source of truth — Redpanda only sees indexers the gateway
-    has routed to, so newly registered ones are invisible without this lookup.
-    Returns {address: url} for indexers with a URL, or {} on any failure.
+
+@retry(
+    # RuntimeError covers GraphQL errors and an answer that lists no indexers.
+    retry=retry_if_exception_type((requests.RequestException, RuntimeError)),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, max=60),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _query_indexer_urls(network_subgraph_url: str) -> Dict[str, str]:
+    """Map each indexer with a URL to that URL; raise when the subgraph lists none."""
+    raw_indexers = paginate_subgraph_query(
+        network_subgraph_url, INDEXER_URLS_QUERY, entity="indexers"
+    )
+    indexer_urls = {
+        indexer["id"]: indexer["url"] for indexer in raw_indexers if indexer.get("url", "")
+    }
+    if not indexer_urls:
+        raise RuntimeError("network subgraph returned no indexers with a URL")
+    return indexer_urls
+
+
+def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
+    """Return {address: url} for indexers with a URL, or {} when no subgraph URL is set.
+
+    Redpanda only sees indexers the gateway has routed to, so this lookup finds new ones.
+    Raises when the subgraph can't be read or lists no one: without URLs every indexer
+    fails its DIPs probe, selection picks no one and dipper cancels every agreement.
     """
     if not network_subgraph_url:
         logger.warning("GRAPH_NETWORK_SUBGRAPH_URL not set, cannot discover indexers from subgraph")
         return {}
 
-    query = """
-    query($first: Int!, $lastId: String!) {
-      indexers(first: $first, where: { id_gt: $lastId, url_not: "" }, orderBy: id) {
-        id
-        url
-      }
-    }
-    """
-    try:
-        raw_indexers = paginate_subgraph_query(network_subgraph_url, query, entity="indexers")
-    except Exception as e:
-        logger.warning(f"Failed to query network subgraph: {e}")
-        return {}
-
-    all_indexers: Dict[str, str] = {}
-    for indexer in raw_indexers:
-        url = indexer.get("url", "")
-        if url:
-            all_indexers[indexer["id"]] = url
-
+    all_indexers = _query_indexer_urls(network_subgraph_url)
     logger.info(f"Discovered {len(all_indexers)} indexers from network subgraph")
     return all_indexers
 
