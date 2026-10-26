@@ -58,6 +58,10 @@ _last_write_time: Optional[datetime] = None
 _stop_event = threading.Event()
 
 
+class NoIndexerRespondedError(RuntimeError):
+    """Every indexer's /status fetch failed, so there is no snapshot worth pushing."""
+
+
 def _synced_deployments(body: object) -> list[str]:
     """Return the synced, healthy deployments in a /status reply; raise ValueError if malformed."""
     data = body.get("data") if isinstance(body, dict) else None
@@ -149,6 +153,9 @@ async def _fetch_all_statuses(
         ]
         results = await asyncio.gather(*tasks)
 
+    if indexer_urls and all(result is None for result in results):
+        raise NoIndexerRespondedError(f"none of {len(indexer_urls)} indexers answered /status")
+
     output: dict[str, dict] = {}
     for result in results:
         if result is not None and result["deployments"]:
@@ -175,7 +182,13 @@ def run_fetch_cycle() -> bool:
         return False
 
     logger.info("Fetching /status from %d indexers...", len(indexer_urls))
-    data = asyncio.run(_fetch_all_statuses(indexer_urls))
+    try:
+        data = asyncio.run(_fetch_all_statuses(indexer_urls))
+    except NoIndexerRespondedError as e:
+        # Usually this pod's own network, not every indexer at once. An empty push would wipe
+        # IISA's sync status, so skip it and let the health check go stale if it persists.
+        logger.error("Not pushing sync status: %s", e)
+        return False
 
     total_deployments = sum(len(entry["deployments"]) for entry in data.values())
     logger.info(
