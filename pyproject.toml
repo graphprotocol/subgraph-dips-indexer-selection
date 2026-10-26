@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Indexing Indexer Selection Algorithm for The Graph DIPs service"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     # Data processing
     "pandas>=2.0,<4.0",
@@ -86,7 +86,6 @@ select = ["E", "F", "I", "W", "C4", "ARG", "PD002"]
 files = ["src/**/*.py", "cronjobs/compute_scores/**/*.py"]
 mypy_path = "cronjobs/compute_scores"
 explicit_package_bases = true
-python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
