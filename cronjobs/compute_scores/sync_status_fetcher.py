@@ -58,19 +58,35 @@ _last_write_time: Optional[datetime] = None
 _stop_event = threading.Event()
 
 
+def _synced_deployments(body: object) -> list[str]:
+    """Return the synced, healthy deployments in a /status reply; raise ValueError if malformed."""
+    data = body.get("data") if isinstance(body, dict) else None
+    statuses = data.get("indexingStatuses") if isinstance(data, dict) else None
+    if not isinstance(statuses, list):
+        raise ValueError("reply has no indexingStatuses list")
+
+    deployments = []
+    for status in statuses:
+        if not isinstance(status, dict) or not isinstance(status.get("subgraph"), str):
+            raise ValueError(f"malformed indexing status: {status!r:.100}")
+        if status.get("synced") is True and status.get("health") == "healthy":
+            deployments.append(status["subgraph"])
+    return deployments
+
+
 async def _fetch_single_status(
     session: "aiohttp.ClientSession",
     indexer: str,
     url: str,
     semaphore: asyncio.Semaphore,
 ) -> Optional[dict]:
-    """Fetch /status from a single indexer with retry logic."""
+    """Fetch /status from a single indexer with retry logic; None if it never answers properly."""
     import aiohttp
 
     status_url = url.rstrip("/") + "/status"
     payload = json.dumps({"query": STATUS_QUERY}).encode()
 
-    async def do_fetch() -> list:
+    async def do_fetch() -> object:
         async with semaphore:
             async with session.post(
                 status_url,
@@ -86,23 +102,19 @@ async def _fetch_single_status(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                data = await resp.json()
-                statuses: list = data.get("data", {}).get("indexingStatuses", [])
-                return statuses
+                return await resp.json()
 
     last_error: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
         try:
-            statuses = await do_fetch()
-            synced_deployments = [
-                s["subgraph"]
-                for s in statuses
-                if s.get("synced") is True and s.get("health") == "healthy"
-            ]
             return {
                 "indexer": indexer,
-                "deployments": synced_deployments,
+                "deployments": _synced_deployments(await do_fetch()),
             }
+        except ValueError as e:
+            # Unparseable JSON or the wrong shape won't change on a retry; skip this indexer only.
+            logger.warning("Malformed /status reply from %s (%s): %s", indexer[:10], url, e)
+            return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = e
             if attempt < MAX_RETRIES - 1:
