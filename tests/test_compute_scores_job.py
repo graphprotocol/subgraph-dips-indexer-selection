@@ -1582,6 +1582,8 @@ class TestValidateConfigurationSubgraphURL:
             ("http://graph-node:99999/subgraphs/name/graph-network", "is not a valid URL"),
             ("https://gateway.thegraph.com/api/k/subgraphs/id/Qm\n", "contains whitespace"),
             (" https://gateway.thegraph.com/api/k/subgraphs/id/Qm", "contains whitespace"),
+            ("http://graph-node:8000\x00/subgraphs/name/graph-network", "invisible character"),
+            ("http://graph-node:8000/subgraphs/name/graph\u200b-network", "invisible character"),
         ],
         ids=[
             "empty",
@@ -1595,6 +1597,8 @@ class TestValidateConfigurationSubgraphURL:
             "port_out_of_range",
             "trailing_newline",
             "leading_space",
+            "null_byte",
+            "zero_width_space",
         ],
     )
     def test_unusable_url_raises_configuration_error(self, monkeypatch, caplog, url, expected):

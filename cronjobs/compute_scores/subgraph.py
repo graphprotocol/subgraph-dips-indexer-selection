@@ -41,9 +41,10 @@ def subgraph_url_problem(url: str) -> Optional[str]:
     """
     if not url:
         return "is required"
-    # urlparse quietly drops a stray newline, which requests would then send as part of the path
-    if any(char.isspace() for char in url):
-        return "contains whitespace"
+    # urlparse quietly drops a stray newline, and requests would send that or a control character
+    # such as a null byte as part of the path
+    if any(char.isspace() or not char.isprintable() for char in url):
+        return "contains whitespace or an invisible character"
     try:
         parsed = urlparse(url)
         host = parsed.hostname
