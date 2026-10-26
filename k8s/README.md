@@ -82,10 +82,12 @@ Only pods labelled `app: dipper` (the consumer), `app: iisa-score-computation`
 service on port 8080; all other ingress is denied.
 
 The sync-status fetcher calls whatever URL each indexer registers on-chain, so its own
-egress is limited to DNS, the IISA service and public addresses. A registered URL that
-points at a private, link-local or loopback address, such as another service in the
-cluster or the metadata server, is dropped. The score-computation job calls the same
-URLs but has no egress limit yet.
+egress is limited to DNS, the IISA service and public addresses. Other pods and Services
+in the cluster stay out of reach because the policy allows no pod but IISA, and the
+cluster checks the destination pod even when a URL names a Service address. Private and
+link-local ranges, which hold the nodes and the metadata server, are left out of the
+public rule. This only takes effect on a cluster that enforces network policies. The
+score-computation job calls the same URLs but has no egress limit yet.
 
 ## Service discovery
 
