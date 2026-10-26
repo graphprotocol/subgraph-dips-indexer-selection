@@ -47,6 +47,7 @@ def subgraph_url_problem(url: str) -> Optional[str]:
     try:
         parsed = urlparse(url)
         host = parsed.hostname
+        parsed.port  # raises on a port that isn't a number from 0 to 65535
     except ValueError:
         return "is not a valid URL"
     if parsed.scheme not in ("http", "https") or not host:
