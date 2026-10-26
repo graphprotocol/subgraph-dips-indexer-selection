@@ -1493,6 +1493,15 @@ import main  # noqa: E402
 from iisa_client import IISAPushError  # noqa: E402
 
 
+@pytest.fixture
+def indexer_urls_read(monkeypatch):
+    """Stand in for the network subgraph read run_scoring makes before any scoring."""
+    monkeypatch.setattr(
+        main, "discover_indexers_from_network_subgraph", lambda _url: {"0xAAA": "https://a.example"}
+    )
+
+
+@pytest.mark.usefixtures("indexer_urls_read")
 class TestRunScoringPushFailure:
     """run_scoring() must return False when IISAPushError escapes write_scores."""
 
@@ -1536,26 +1545,135 @@ class TestRunScoringPushFailure:
 class TestValidateConfigurationIISAURL:
     """validate_configuration() must fail fast when IISA_API_URL is unset."""
 
-    def test_missing_iisa_api_url_raises_configuration_error(self, monkeypatch):
-        # Arrange — satisfy the Redpanda settings so only IISA_API_URL trips.
+    def test_missing_iisa_api_url_raises_configuration_error(self, monkeypatch, caplog):
+        # Arrange — satisfy the other settings so only IISA_API_URL trips.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
         monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x")
         monkeypatch.setattr(main, "IISA_API_URL", "")
 
         # Act / Assert
-        with pytest.raises(main.ConfigurationError) as exc_info:
-            main.validate_configuration()
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError, match="Found 1 configuration error"):
+                main.validate_configuration()
 
-        assert "configuration error" in str(exc_info.value).lower()
+        assert "IISA_API_URL is required" in caplog.text
 
     def test_present_iisa_api_url_passes(self, monkeypatch):
         # Arrange — all required config set.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
         monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
         monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x")
 
         # Act / Assert — should not raise
         main.validate_configuration()
+
+
+class TestValidateConfigurationSubgraphURL:
+    """validate_configuration() must refuse to run without a usable network subgraph URL.
+
+    Without one every indexer fails its DIPs probe, so selection would pick no one and
+    dipper would cancel every agreement.
+    """
+
+    FAKE_KEY = "0123456789abcdef0123456789abcdef"
+
+    def _satisfy_the_rest(self, monkeypatch):
+        monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
+        monkeypatch.setenv("REDPANDA_TOPIC", "gateway_queries_testnet")
+        monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            ("", "GRAPH_NETWORK_SUBGRAPH_URL is required"),
+            ("graph-node:8000/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("ftp://graph-node/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("https://", "must be an http(s) URL"),
+            ("https://:8000/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("http://user:pw@/subgraphs/name/graph-network", "must be an http(s) URL"),
+            ("http://[graph-node:8000/subgraphs/name/graph-network", "is not a valid URL"),
+            ("http://graph-node:abc/subgraphs/name/graph-network", "is not a valid URL"),
+            ("http://graph-node:99999/subgraphs/name/graph-network", "is not a valid URL"),
+            ("https://gateway.thegraph.com/api/k/subgraphs/id/Qm\n", "contains whitespace"),
+            (" https://gateway.thegraph.com/api/k/subgraphs/id/Qm", "contains whitespace"),
+            ("http://graph-node:8000\x00/subgraphs/name/graph-network", "invisible character"),
+            ("http://graph-node:8000/subgraphs/name/graph\u200b-network", "invisible character"),
+        ],
+        ids=[
+            "empty",
+            "no_scheme",
+            "wrong_scheme",
+            "no_host",
+            "port_but_no_host",
+            "credentials_but_no_host",
+            "unclosed_bracket",
+            "port_not_a_number",
+            "port_out_of_range",
+            "trailing_newline",
+            "leading_space",
+            "null_byte",
+            "zero_width_space",
+        ],
+    )
+    def test_unusable_url_raises_configuration_error(self, monkeypatch, caplog, url, expected):
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
+
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError):
+                main.validate_configuration()
+
+        assert expected in caplog.text
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"htps://gateway.thegraph.com/api/{FAKE_KEY}/subgraphs/id/QmNetwork",
+            f"htps://indexer:{FAKE_KEY}@graph-node.internal/subgraphs/name/graph-network",
+            f"https//graph-node.internal/subgraphs/id/QmNetwork?api_key={FAKE_KEY}",
+        ],
+        ids=["gateway_key_in_path", "password_in_url", "key_in_query"],
+    )
+    def test_error_never_repeats_the_url(self, monkeypatch, caplog, url):
+        """The URL may carry an API key or credentials, wherever in it they sit."""
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
+
+        with caplog.at_level("ERROR", logger=main.logger.name):
+            with pytest.raises(main.ConfigurationError):
+                main.validate_configuration()
+
+        assert "GRAPH_NETWORK_SUBGRAPH_URL" in caplog.text
+        assert self.FAKE_KEY not in caplog.text
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://gateway.thegraph.com/api/key/subgraphs/id/QmNetwork",
+            "http://graph-node:8000/subgraphs/name/graph-network",
+        ],
+        ids=["gateway", "local_graph_node"],
+    )
+    def test_usable_url_passes(self, monkeypatch, url):
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
+
+        main.validate_configuration()
+
+    def test_job_exits_before_scoring_without_a_url(self, monkeypatch):
+        """The job runs this check on startup, before it reads Redpanda or scores anything."""
+        from unittest.mock import MagicMock
+
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "IISA_REQUIRE_PUSH_TOKEN", False)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "")
+        run_scoring = MagicMock()
+        monkeypatch.setattr(main, "run_scoring", run_scoring)
+
+        assert main.main() == 1
+        run_scoring.assert_not_called()
 
 
 class TestValidateConfigurationRedpandaTopic:
@@ -1570,6 +1688,7 @@ class TestValidateConfigurationRedpandaTopic:
         # Arrange — everything else valid, so only the topic trips.
         monkeypatch.setenv("REDPANDA_BOOTSTRAP_SERVERS", "localhost:9092")
         monkeypatch.setattr(main, "IISA_API_URL", "http://iisa.example:8080")
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "http://graph-node:8000/x")
         if topic is None:
             monkeypatch.delenv("REDPANDA_TOPIC", raising=False)
         else:
@@ -1577,7 +1696,7 @@ class TestValidateConfigurationRedpandaTopic:
 
         # Act / Assert
         with caplog.at_level("ERROR", logger=main.logger.name):
-            with pytest.raises(main.ConfigurationError):
+            with pytest.raises(main.ConfigurationError, match="Found 1 configuration error"):
                 main.validate_configuration()
 
         assert "REDPANDA_TOPIC is required" in caplog.text
@@ -1640,7 +1759,6 @@ class TestComputeAllScoresGeoipDemotion:
                 "last_known_slashable_stake": [100.0, 200.0, 300.0],
             }
         )
-        mock_provider.graph_network_url = "http://graph-network:8000"
 
         def fake_resolve_geoip(_combined_queries):
             # Simulate the local-network case: every URL resolves to a
@@ -1659,7 +1777,6 @@ class TestComputeAllScoresGeoipDemotion:
             )
 
         monkeypatch.setattr(processing, "resolve_indexer_geoip", fake_resolve_geoip)
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
         monkeypatch.setattr(
             processing,
             "fetch_and_filter_graph_node_versions",
@@ -1669,6 +1786,7 @@ class TestComputeAllScoresGeoipDemotion:
         with caplog.at_level("WARNING", logger="processing"):
             result = compute_all_scores(
                 provider=mock_provider,
+                indexer_urls={},
                 start_date=date(2026, 5, 1),
                 num_days=28,
                 target_rows=20_000_000,
@@ -1708,7 +1826,6 @@ class TestComputeAllScoresGeoipDemotion:
                 "last_known_slashable_stake": [100.0, 200.0, 300.0],
             }
         )
-        mock_provider.graph_network_url = "http://graph-network:8000"
 
         def fake_resolve_geoip(_combined_queries):
             # One public resolution → full mode must stay engaged.
@@ -1726,7 +1843,6 @@ class TestComputeAllScoresGeoipDemotion:
             )
 
         monkeypatch.setattr(processing, "resolve_indexer_geoip", fake_resolve_geoip)
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
         monkeypatch.setattr(
             processing,
             "fetch_and_filter_graph_node_versions",
@@ -1737,6 +1853,7 @@ class TestComputeAllScoresGeoipDemotion:
             try:
                 compute_all_scores(
                     provider=mock_provider,
+                    indexer_urls={},
                     start_date=date(2026, 5, 1),
                     num_days=28,
                     target_rows=20_000_000,
@@ -1776,13 +1893,11 @@ class TestComputeAllScoresGeoipDemotion:
                 "last_known_slashable_stake": [100.0, 200.0, 300.0],
             }
         )
-        mock_provider.graph_network_url = "http://graph-network:8000"
 
         def fail_if_called(*_args, **_kwargs):
             raise AssertionError("GeoIP resolution must not run in partial mode")
 
         monkeypatch.setattr(processing, "resolve_indexer_geoip", fail_if_called)
-        monkeypatch.setattr(processing, "discover_indexers_from_network_subgraph", lambda url: {})
         monkeypatch.setattr(
             processing,
             "fetch_and_filter_graph_node_versions",
@@ -1791,6 +1906,7 @@ class TestComputeAllScoresGeoipDemotion:
 
         result = compute_all_scores(
             provider=mock_provider,
+            indexer_urls={},
             start_date=date(2026, 5, 1),
             num_days=28,
             target_rows=20_000_000,
@@ -1804,6 +1920,7 @@ class TestComputeAllScoresGeoipDemotion:
         assert (result["dips_info_available"] == False).all()  # noqa: E712
 
 
+@pytest.mark.usefixtures("indexer_urls_read")
 class TestRunScoringModeReporting:
     """The summary log must reflect the published scoring_mode, not the input flag.
 
@@ -1871,7 +1988,7 @@ class TestRunScoringModeReporting:
         monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
         monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
         monkeypatch.setattr(main, "compute_all_scores", raise_pipeline_error)
-        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: degraded_df)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda urls: degraded_df)
 
         with caplog.at_level("INFO", logger=main.logger.name):
             result = main.run_scoring()
@@ -1890,7 +2007,7 @@ class TestRunScoringModeReporting:
         monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
         monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
         monkeypatch.setattr(main, "compute_all_scores", lambda **kwargs: pd.DataFrame())
-        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: None)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda urls: None)
 
         with caplog.at_level("INFO", logger=main.logger.name):
             result = main.run_scoring()
@@ -1909,7 +2026,7 @@ class TestRunScoringModeReporting:
         monkeypatch.setattr(main, "RedpandaProvider", lambda: mock_provider)
         monkeypatch.setattr(main, "validate_geoip_databases", lambda: True)
         monkeypatch.setattr(main, "compute_all_scores", lambda **kwargs: None)
-        monkeypatch.setattr(main, "compute_degraded_scores", lambda url: degraded_df)
+        monkeypatch.setattr(main, "compute_degraded_scores", lambda urls: degraded_df)
 
         with caplog.at_level("INFO", logger=main.logger.name):
             result = main.run_scoring()

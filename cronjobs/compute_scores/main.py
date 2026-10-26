@@ -12,12 +12,18 @@ import resource
 import sys
 import time
 from datetime import date, timedelta
-from typing import Optional
+from typing import Dict, Optional
 
 import pandas as pd
 from iisa_client import IISAPushError, get_push_token
-from processing import compute_all_scores, compute_degraded_scores, validate_geoip_databases
+from processing import (
+    compute_all_scores,
+    compute_degraded_scores,
+    discover_indexers_from_network_subgraph,
+    validate_geoip_databases,
+)
 from redpanda import RedpandaProvider
+from subgraph import subgraph_url_problem
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +73,12 @@ def validate_configuration() -> None:
     if not IISA_API_URL:
         errors.append("IISA_API_URL is required")
 
+    # Without indexer URLs every indexer fails its DIPs probe, selection picks no one and
+    # dipper cancels every agreement, so refuse to start rather than score without them.
+    url_problem = subgraph_url_problem(GRAPH_NETWORK_SUBGRAPH_URL)
+    if url_problem:
+        errors.append(f"GRAPH_NETWORK_SUBGRAPH_URL {url_problem}")
+
     if errors:
         for error in errors:
             logger.error("Configuration error: %s", error)
@@ -95,8 +107,21 @@ def _mode_from_scores(scores_df: pd.DataFrame, geoip_available: bool) -> str:
     return MODE_PARTIAL if actual == "partial_no_geoip" else MODE_FULL
 
 
+def _discover_indexer_urls() -> Optional[Dict[str, str]]:
+    """Read indexer URLs once, before any scoring; None, after logging why, if that fails.
+
+    Without them every indexer fails its DIPs probe, so the run stops and iisa keeps its
+    last scores rather than spend the replay on scores it must not push.
+    """
+    try:
+        return discover_indexers_from_network_subgraph(GRAPH_NETWORK_SUBGRAPH_URL)
+    except Exception as e:
+        logger.error("Failed to read indexer URLs from the network subgraph: %s", e, exc_info=True)
+        return None
+
+
 def _run_full_pipeline(
-    provider: RedpandaProvider, geoip_available: bool, seed: int
+    provider: RedpandaProvider, geoip_available: bool, seed: int, indexer_urls: Dict[str, str]
 ) -> tuple[Optional[pd.DataFrame], str]:
     """Run compute_all_scores over the last NUM_DAYS; return (scores, mode).
 
@@ -112,6 +137,7 @@ def _run_full_pipeline(
     try:
         scores_df = compute_all_scores(
             provider=provider,
+            indexer_urls=indexer_urls,
             start_date=start_date,
             num_days=NUM_DAYS,
             target_rows=TARGET_ROWS,
@@ -127,11 +153,11 @@ def _run_full_pipeline(
         return None, MODE_FAILED
 
 
-def _run_degraded_pipeline() -> tuple[Optional[pd.DataFrame], str]:
+def _run_degraded_pipeline(indexer_urls: Dict[str, str]) -> tuple[Optional[pd.DataFrame], str]:
     """Fallback scoring: equal quality metrics plus real pricing, no Redpanda data needed."""
     logger.info("Running degraded scoring (equal quality + real pricing)")
     try:
-        scores_df = compute_degraded_scores(GRAPH_NETWORK_SUBGRAPH_URL)
+        scores_df = compute_degraded_scores(indexer_urls)
     except Exception as e:
         logger.exception("Degraded scoring also failed: %s", e)
         return None, MODE_FAILED
@@ -186,9 +212,13 @@ def run_scoring() -> bool:
 
     provider = RedpandaProvider()
 
-    scores_df, mode = _run_full_pipeline(provider, geoip_available, seed)
-    if scores_df is None:
-        scores_df, mode = _run_degraded_pipeline()
+    indexer_urls = _discover_indexer_urls()
+    if indexer_urls is None:
+        scores_df, mode = None, MODE_FAILED
+    else:
+        scores_df, mode = _run_full_pipeline(provider, geoip_available, seed, indexer_urls)
+        if scores_df is None:
+            scores_df, mode = _run_degraded_pipeline(indexer_urls)
 
     elapsed = time.time() - pipeline_start
     success = scores_df is not None

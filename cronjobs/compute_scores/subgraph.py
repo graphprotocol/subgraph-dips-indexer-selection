@@ -9,9 +9,17 @@ handling, and page-size defaults live in one place.
 import logging
 import re
 import time
-from typing import List
+from typing import List, Optional
+from urllib.parse import urlparse
 
 import requests
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,33 +34,97 @@ def redact_url(text: str) -> str:
     return _GATEWAY_API_KEY.sub(r"\1<redacted>", text)
 
 
+def subgraph_url_problem(url: str) -> Optional[str]:
+    """Say what is wrong with a network subgraph URL, or None if it looks usable.
+
+    Never repeats the URL, which can carry an API key or credentials anywhere in it.
+    """
+    if not url:
+        return "is required"
+    # urlparse quietly drops a stray newline, and requests would send that or a control character
+    # such as a null byte as part of the path
+    if any(char.isspace() or not char.isprintable() for char in url):
+        return "contains whitespace or an invisible character"
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        parsed.port  # raises on a port that isn't a number from 0 to 65535
+    except ValueError:
+        return "is not a valid URL"
+    if parsed.scheme not in ("http", "https") or not host:
+        return "must be an http(s) URL with a host"
+    return None
+
+
+# The gateway answers a rejected key, an unknown subgraph and an invalid query with HTTP 200 and a
+# GraphQL error starting with these (its error type in edgeandnode/gateway); none clears on retry.
+_PERMANENT_GATEWAY_ERRORS = ("auth error", "subgraph not found", "bad query")
+
+
+class SubgraphResponseError(RuntimeError):
+    """The subgraph answered, but with GraphQL errors or without the data asked for."""
+
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _graphql_errors_are_permanent(errors: object) -> bool:
+    """True when any error in a GraphQL ``errors`` list is one of _PERMANENT_GATEWAY_ERRORS."""
+    if not isinstance(errors, list):
+        return False
+    messages = [str(e.get("message", "")) for e in errors if isinstance(e, dict)]
+    return any(message.startswith(_PERMANENT_GATEWAY_ERRORS) for message in messages)
+
+
+# Failures of the connection or the reply rather than of the request: no connection, a timeout,
+# a reply cut off or corrupted in transit, or a body that isn't JSON (such as a proxy's error page).
+_TRANSIENT_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+    requests.exceptions.JSONDecodeError,
+    ConnectionError,
+)
+
+
+def is_retryable_subgraph_error(error: BaseException) -> bool:
+    """True for failures a retry can clear: _TRANSIENT_ERRORS, a 408, 429 or 5xx reply, or a
+    SubgraphResponseError marked retryable (the gateway reports a failing indexer as a GraphQL
+    error).
+    A rejected key, a wrong URL or a malformed one fails the same way every time.
+    """
+    if isinstance(error, requests.HTTPError):
+        status = error.response.status_code if error.response is not None else None
+        return status is None or status in (408, 429) or status >= 500
+    if isinstance(error, SubgraphResponseError):
+        return error.retryable
+    return isinstance(error, _TRANSIENT_ERRORS)
+
+
+# Every network subgraph read retries the same way: up to 5 attempts, 2, 4, 8 then 16 seconds
+# apart, and only for the failures is_retryable_subgraph_error says can clear.
+retry_subgraph_read = retry(
+    retry=retry_if_exception(is_retryable_subgraph_error),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+
+
 def paginate_subgraph_query(
     url: str,
     query: str,
     entity: str = "indexers",
     page_size: int = 1000,
 ) -> List[dict]:
-    """Paginate a Graph Network subgraph query using id_gt cursor advancement.
+    """Return every ``entity`` across pages, paging on an ``id_gt`` cursor until a short page.
 
-    The query string must use ``$first`` (Int!) and ``$lastId`` (String!)
-    variables, and order results by ``id``.  The function fetches pages until
-    either an empty page is returned or a page smaller than ``page_size``
-    indicates there are no more results.
-
-    Raises ``RuntimeError`` on GraphQL-level errors (``"errors"`` key in
-    response).  HTTP and connection errors from ``requests`` propagate with
-    their original type, and any API key masked in the message, so the caller
-    can decide on retry/fallback policy.
-
-    Args:
-        url: Subgraph endpoint URL.
-        query: GraphQL query string with $first and $lastId variables.
-        entity: Top-level field name inside ``data`` to extract results from.
-        page_size: Number of entities per page (default 1000, the subgraph
-            maximum).
-
-    Returns:
-        Flat list of entity dicts across all pages.
+    ``query`` must take ``$first`` (Int!) and ``$lastId`` (String!) and order by ``id``.
+    Raises SubgraphResponseError on GraphQL errors; ``requests`` errors keep their type,
+    with any API key masked, so callers can choose what to retry.
     """
     last_id = ""
     all_entities: List[dict] = []
@@ -83,9 +155,15 @@ def paginate_subgraph_query(
         data = response.json()
 
         if "errors" in data:
-            raise RuntimeError(f"GraphQL errors: {data['errors']}")
+            raise SubgraphResponseError(
+                f"GraphQL errors: {data['errors']}",
+                retryable=not _graphql_errors_are_permanent(data["errors"]),
+            )
 
-        page = data.get("data", {}).get(entity, [])
+        payload = data.get("data")
+        if not isinstance(payload, dict):
+            raise SubgraphResponseError(f"subgraph reply has no data: {data}")
+        page = payload.get(entity) or []
         elapsed = time.monotonic() - t0
         logger.info(
             "Fetched page %d: %d entities in %.2fs (cumulative=%d)",

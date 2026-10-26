@@ -1,9 +1,8 @@
-"""Tests for subgraph pagination helper and indexer discovery."""
+"""Tests for the subgraph pagination helper."""
 
 from unittest.mock import MagicMock, patch
 
 import pytest
-from processing import discover_indexers_from_network_subgraph
 from subgraph import paginate_subgraph_query
 
 # ---------------------------------------------------------------------------
@@ -109,55 +108,3 @@ def test_pagination_http_error_propagates(mock_post):
 
     with pytest.raises(requests.exceptions.HTTPError):
         paginate_subgraph_query(DUMMY_URL, DUMMY_QUERY)
-
-
-# ---------------------------------------------------------------------------
-# discover_indexers_from_network_subgraph
-# ---------------------------------------------------------------------------
-
-
-@patch("processing.paginate_subgraph_query")
-def test_discover_returns_id_to_url_mapping(mock_paginate):
-    """Successful discovery maps indexer id to url."""
-    mock_paginate.return_value = [
-        {"id": "0xaaa", "url": "https://indexer-a.example.com"},
-        {"id": "0xbbb", "url": "https://indexer-b.example.com"},
-    ]
-
-    result = discover_indexers_from_network_subgraph("https://subgraph.example.com")
-
-    assert result == {
-        "0xaaa": "https://indexer-a.example.com",
-        "0xbbb": "https://indexer-b.example.com",
-    }
-    mock_paginate.assert_called_once()
-
-
-@patch("processing.paginate_subgraph_query")
-def test_discover_skips_empty_urls(mock_paginate):
-    """Indexers with empty URLs are excluded from the result."""
-    mock_paginate.return_value = [
-        {"id": "0xaaa", "url": "https://indexer-a.example.com"},
-        {"id": "0xbbb", "url": ""},
-        {"id": "0xccc"},
-    ]
-
-    result = discover_indexers_from_network_subgraph("https://subgraph.example.com")
-
-    assert result == {"0xaaa": "https://indexer-a.example.com"}
-
-
-@patch("processing.paginate_subgraph_query")
-def test_discover_catches_errors_returns_empty(mock_paginate):
-    """Any exception from the helper is caught, returning an empty dict."""
-    mock_paginate.side_effect = RuntimeError("GraphQL errors: ...")
-
-    result = discover_indexers_from_network_subgraph("https://subgraph.example.com")
-
-    assert result == {}
-
-
-def test_discover_empty_url_returns_empty():
-    """Empty URL short-circuits without calling the helper."""
-    result = discover_indexers_from_network_subgraph("")
-    assert result == {}
