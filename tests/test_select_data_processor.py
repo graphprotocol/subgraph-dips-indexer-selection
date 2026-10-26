@@ -1034,6 +1034,39 @@ class TestScaleSetByPickableIndexers:
         data = processor.data.set_index("indexer")
         assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.0, 0.0])
 
+    def test_unreadable_value_scores_zero_without_moving_the_pickable_scale(self):
+        """D's text scores 0 and blocked A sets nothing, so B and C alone set the scale."""
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C", "D"],
+                "destination_loc": ["loc1", "loc2", "loc3", "loc4"],
+                "org": ["org1", "org2", "org3", "org4"],
+                "stake_to_fees": [100.0, 10.0, 5.0, "abc"],
+            }
+        )
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 1.0, 0.0, 0.0])
+
+    def test_scales_against_readable_values_when_no_pickable_value_reads(self):
+        """C, the only pickable indexer, sent text, so blocked A and B set the scale instead."""
+        history = self._history(stake_to_fees=[100.0, 50.0, "abc"])
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A"), IndexerId("B")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 0.0, 0.0])
+
 
 class TestAssignAction:
     """The assigning log line names the action picked from group size against target."""
