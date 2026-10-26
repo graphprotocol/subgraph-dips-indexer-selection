@@ -13,7 +13,6 @@ import sys
 import time
 from datetime import date, timedelta
 from typing import Dict, Optional
-from urllib.parse import urlparse
 
 import pandas as pd
 from iisa_client import IISAPushError, get_push_token
@@ -24,6 +23,7 @@ from processing import (
     validate_geoip_databases,
 )
 from redpanda import RedpandaProvider
+from subgraph import subgraph_url_problem
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,26 +47,6 @@ MODE_FULL = "full"
 MODE_PARTIAL = "partial"
 MODE_DEGRADED = "degraded"
 MODE_FAILED = "failed"
-
-
-def _subgraph_url_problem(url: str) -> Optional[str]:
-    """Say what is wrong with the network subgraph URL, or None if it looks usable.
-
-    Never repeats the URL, which can carry an API key or credentials anywhere in it.
-    """
-    if not url:
-        return "is required"
-    # urlparse quietly drops a stray newline, which requests would then send as part of the path
-    if any(char.isspace() for char in url):
-        return "contains whitespace"
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname
-    except ValueError:
-        return "is not a valid URL"
-    if parsed.scheme not in ("http", "https") or not host:
-        return "must be an http(s) URL with a host"
-    return None
 
 
 def validate_configuration() -> None:
@@ -95,9 +75,9 @@ def validate_configuration() -> None:
 
     # Without indexer URLs every indexer fails its DIPs probe, selection picks no one and
     # dipper cancels every agreement, so refuse to start rather than score without them.
-    subgraph_url_problem = _subgraph_url_problem(GRAPH_NETWORK_SUBGRAPH_URL)
-    if subgraph_url_problem:
-        errors.append(f"GRAPH_NETWORK_SUBGRAPH_URL {subgraph_url_problem}")
+    url_problem = subgraph_url_problem(GRAPH_NETWORK_SUBGRAPH_URL)
+    if url_problem:
+        errors.append(f"GRAPH_NETWORK_SUBGRAPH_URL {url_problem}")
 
     if errors:
         for error in errors:

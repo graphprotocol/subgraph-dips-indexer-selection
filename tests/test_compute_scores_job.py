@@ -1578,8 +1578,12 @@ class TestValidateConfigurationSubgraphURL:
             ("https://:8000/subgraphs/name/graph-network", "must be an http(s) URL"),
             ("http://user:pw@/subgraphs/name/graph-network", "must be an http(s) URL"),
             ("http://[graph-node:8000/subgraphs/name/graph-network", "is not a valid URL"),
+            ("http://graph-node:abc/subgraphs/name/graph-network", "is not a valid URL"),
+            ("http://graph-node:99999/subgraphs/name/graph-network", "is not a valid URL"),
             ("https://gateway.thegraph.com/api/k/subgraphs/id/Qm\n", "contains whitespace"),
             (" https://gateway.thegraph.com/api/k/subgraphs/id/Qm", "contains whitespace"),
+            ("http://graph-node:8000\x00/subgraphs/name/graph-network", "invisible character"),
+            ("http://graph-node:8000/subgraphs/name/graph\u200b-network", "invisible character"),
         ],
         ids=[
             "empty",
@@ -1589,8 +1593,12 @@ class TestValidateConfigurationSubgraphURL:
             "port_but_no_host",
             "credentials_but_no_host",
             "unclosed_bracket",
+            "port_not_a_number",
+            "port_out_of_range",
             "trailing_newline",
             "leading_space",
+            "null_byte",
+            "zero_width_space",
         ],
     )
     def test_unusable_url_raises_configuration_error(self, monkeypatch, caplog, url, expected):
@@ -1637,6 +1645,19 @@ class TestValidateConfigurationSubgraphURL:
         monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
 
         main.validate_configuration()
+
+    def test_job_exits_before_scoring_without_a_url(self, monkeypatch):
+        """The job runs this check on startup, before it reads Redpanda or scores anything."""
+        from unittest.mock import MagicMock
+
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "IISA_REQUIRE_PUSH_TOKEN", False)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "")
+        run_scoring = MagicMock()
+        monkeypatch.setattr(main, "run_scoring", run_scoring)
+
+        assert main.main() == 1
+        run_scoring.assert_not_called()
 
 
 class TestValidateConfigurationRedpandaTopic:

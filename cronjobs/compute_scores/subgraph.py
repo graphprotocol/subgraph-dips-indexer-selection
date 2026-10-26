@@ -9,7 +9,8 @@ handling, and page-size defaults live in one place.
 import logging
 import re
 import time
-from typing import List
+from typing import List, Optional
+from urllib.parse import urlparse
 
 import requests
 from tenacity import (
@@ -31,6 +32,28 @@ _GATEWAY_API_KEY = re.compile(r"(/api/)[^/?#\s]+(?=/(?:subgraphs|deployments)/)"
 def redact_url(text: str) -> str:
     """Return ``text`` with any gateway API key in a URL path replaced by ``<redacted>``."""
     return _GATEWAY_API_KEY.sub(r"\1<redacted>", text)
+
+
+def subgraph_url_problem(url: str) -> Optional[str]:
+    """Say what is wrong with a network subgraph URL, or None if it looks usable.
+
+    Never repeats the URL, which can carry an API key or credentials anywhere in it.
+    """
+    if not url:
+        return "is required"
+    # urlparse quietly drops a stray newline, and requests would send that or a control character
+    # such as a null byte as part of the path
+    if any(char.isspace() or not char.isprintable() for char in url):
+        return "contains whitespace or an invisible character"
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        parsed.port  # raises on a port that isn't a number from 0 to 65535
+    except ValueError:
+        return "is not a valid URL"
+    if parsed.scheme not in ("http", "https") or not host:
+        return "must be an http(s) URL with a host"
+    return None
 
 
 # The gateway answers a rejected key, an unknown subgraph and an invalid query with HTTP 200 and a
@@ -63,13 +86,13 @@ _TRANSIENT_ERRORS = (
     requests.exceptions.ContentDecodingError,
     requests.exceptions.JSONDecodeError,
     ConnectionError,
-    SubgraphResponseError,
 )
 
 
 def is_retryable_subgraph_error(error: BaseException) -> bool:
     """True for failures a retry can clear: _TRANSIENT_ERRORS, a 408, 429 or 5xx reply, or a
-    SubgraphResponseError (the gateway reports a failing indexer as a GraphQL error).
+    SubgraphResponseError marked retryable (the gateway reports a failing indexer as a GraphQL
+    error).
     A rejected key, a wrong URL or a malformed one fails the same way every time.
     """
     if isinstance(error, requests.HTTPError):

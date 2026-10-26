@@ -10,7 +10,9 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
+import reprlib
 import socket
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -29,7 +31,12 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from subgraph import SubgraphResponseError, paginate_subgraph_query, retry_subgraph_read
+from subgraph import (
+    SubgraphResponseError,
+    paginate_subgraph_query,
+    retry_subgraph_read,
+    subgraph_url_problem,
+)
 
 if TYPE_CHECKING:
     import aiohttp
@@ -228,11 +235,13 @@ def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[s
     """Return {address: url} for every indexer the network subgraph lists with a URL.
 
     Redpanda only sees indexers the gateway has routed to, so this lookup finds new ones.
-    Raises when no URL is set, the subgraph can't be read or it lists no one: without URLs
-    every indexer fails its DIPs probe, selection picks no one and dipper cancels everything.
+    Raises when the URL is unset or unusable, the subgraph can't be read or it lists no one:
+    without URLs every indexer fails its DIPs probe, selection picks no one and dipper
+    cancels everything.
     """
-    if not network_subgraph_url:
-        raise ValueError("GRAPH_NETWORK_SUBGRAPH_URL is not set")
+    url_problem = subgraph_url_problem(network_subgraph_url)
+    if url_problem:
+        raise ValueError(f"GRAPH_NETWORK_SUBGRAPH_URL {url_problem}")
 
     all_indexers = _query_indexer_urls(network_subgraph_url)
     logger.info(f"Discovered {len(all_indexers)} indexers from network subgraph")
@@ -256,6 +265,105 @@ def _extract_dips_prices(data: dict) -> tuple:
     return min_prices, min_entity_price
 
 
+_LOG_REPR = reprlib.Repr()
+_LOG_REPR.maxlevel = 2
+_LOG_REPR.maxstring = _LOG_REPR.maxlong = _LOG_REPR.maxother = 60
+_MAX_LOGGED_CHARS = 200
+
+
+def _for_log(value: object) -> str:
+    """Quote a value an indexer sent for a log line: escaped, so a line break in it cannot start a
+    fake log line, and cut short, so a huge value cannot flood the log on every run.
+    """
+    text = _LOG_REPR.repr(value)
+    return text if len(text) <= _MAX_LOGGED_CHARS else text[:_MAX_LOGGED_CHARS] + "..."
+
+
+def _parse_price(value: object) -> Optional[float]:
+    """An advertised price (JSON number or text) as a float if finite and >= 0, else None.
+
+    Any indexer can serve arbitrary JSON from /dips/info: NaN was scored as the cheapest price
+    and a negative one passed every ceiling. Store the float, not the raw value: float() reads
+    text like "1_000" that the selection service's per-entity parser reads as no price.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        price = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return price if math.isfinite(price) and price >= 0 else None
+
+
+def _valid_chain_prices(indexer: str, min_prices: dict) -> dict:
+    """Keep each per-chain base price as a float, dropping and logging any that is not valid.
+
+    The selection service treats a chain with no price as unpriced and excludes the indexer there.
+    """
+    valid = {}
+    for chain, price in min_prices.items():
+        parsed = _parse_price(price)
+        if parsed is not None:
+            valid[chain] = parsed
+        else:
+            logger.warning(
+                "Ignoring invalid DIPs base price from indexer %s for chain %s: %s",
+                indexer,
+                _for_log(chain),
+                _for_log(price),
+            )
+    return valid
+
+
+def _unavailable_dips_info(indexer: str) -> dict:
+    """The stored row for an indexer whose DIPs info is missing or unusable."""
+    return {
+        "indexer": indexer,
+        "dips_info_available": False,
+        "dips_min_grt_per_30_days": "{}",
+        "dips_min_grt_per_billion_entities_per_30_days": None,
+        "dips_supported_networks": "[]",
+    }
+
+
+def _dips_info_record(indexer: str, data: object) -> dict:
+    """Turn one indexer's /dips/info response into the row stored for it."""
+    if not isinstance(data, dict):
+        logger.warning(
+            "Ignoring DIPs info from indexer %s: /dips/info body is %s, not a JSON object",
+            indexer,
+            "empty or null" if data is None else type(data).__name__,
+        )
+        return _unavailable_dips_info(indexer)
+    min_prices, min_entity_price = _extract_dips_prices(data)
+    entity_price = None if min_entity_price is None else _parse_price(min_entity_price)
+    if min_entity_price is not None and entity_price is None:
+        # A missing per-entity price means the indexer accepts any price: it passes every ceiling
+        # and is offered 0. Dropping only the bad value would reward it, so the whole response is
+        # treated as unusable instead.
+        logger.warning(
+            "Ignoring DIPs info from indexer %s: invalid per-entity price %s",
+            indexer,
+            _for_log(min_entity_price),
+        )
+        return _unavailable_dips_info(indexer)
+
+    chain_prices = _valid_chain_prices(indexer, min_prices) if isinstance(min_prices, dict) else {}
+    supported_networks = data.get("supported_networks", [])
+    # If supported_networks not explicitly provided, infer from the valid price keys
+    if not supported_networks:
+        supported_networks = list(chain_prices.keys())
+    return {
+        "indexer": indexer,
+        "dips_info_available": True,
+        "dips_min_grt_per_30_days": json.dumps(chain_prices),
+        "dips_min_grt_per_billion_entities_per_30_days": None
+        if entity_price is None
+        else str(entity_price),
+        "dips_supported_networks": json.dumps(supported_networks),
+    }
+
+
 async def _fetch_single_dips_info_async(
     session: "aiohttp.ClientSession",
     indexer: str,
@@ -267,7 +375,7 @@ async def _fetch_single_dips_info_async(
 
     dips_url = url.rstrip("/") + "/dips/info"
 
-    async def do_fetch() -> dict:
+    async def do_fetch() -> object:
         async with semaphore:
             async with session.get(
                 dips_url,
@@ -281,29 +389,12 @@ async def _fetch_single_dips_info_async(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                body: dict = await resp.json()
-                return body
+                return await resp.json()
 
     last_error: Optional[Exception] = None
     for attempt in range(DIPS_INFO_MAX_RETRIES):
         try:
             data = await do_fetch()
-            min_prices, min_entity_price = _extract_dips_prices(data)
-            supported_networks = data.get("supported_networks", [])
-            # If supported_networks not explicitly provided, infer from price keys
-            if not supported_networks and isinstance(min_prices, dict):
-                supported_networks = list(min_prices.keys())
-            return {
-                "indexer": indexer,
-                "dips_info_available": True,
-                "dips_min_grt_per_30_days": json.dumps(min_prices)
-                if isinstance(min_prices, dict)
-                else "{}",
-                "dips_min_grt_per_billion_entities_per_30_days": str(min_entity_price)
-                if min_entity_price is not None
-                else None,
-                "dips_supported_networks": json.dumps(supported_networks),
-            }
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = e
             if attempt < DIPS_INFO_MAX_RETRIES - 1:
@@ -312,15 +403,22 @@ async def _fetch_single_dips_info_async(
                     DIPS_INFO_RETRY_BACKOFF_MULTIPLIER * (2**attempt),
                 )
                 await asyncio.sleep(delay)
+            continue
+        except (ValueError, LookupError, RecursionError) as e:
+            # Not JSON, not in its declared charset, or nested too deep. That is the indexer's
+            # answer, not a network fault, so it is not retried. Uncaught, it would fail the
+            # fetch for every indexer.
+            logger.warning(
+                "Ignoring DIPs info from indexer %s: unreadable /dips/info body (%s: %s)",
+                indexer,
+                type(e).__name__,
+                e,
+            )
+            return _unavailable_dips_info(indexer)
+        return _dips_info_record(indexer, data)
 
     logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {last_error}")
-    return {
-        "indexer": indexer,
-        "dips_info_available": False,
-        "dips_min_grt_per_30_days": "{}",
-        "dips_min_grt_per_billion_entities_per_30_days": None,
-        "dips_supported_networks": "[]",
-    }
+    return _unavailable_dips_info(indexer)
 
 
 async def _fetch_all_dips_info_async(indexer_urls: Dict[str, str]) -> List[dict]:
