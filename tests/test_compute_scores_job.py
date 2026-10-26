@@ -186,8 +186,6 @@ class TestTransformToScoresSchema:
             "uptime_duration_seconds",
             "success_rate",
             "stake_to_fees",
-            "norm_uptime_score",
-            "norm_success_rate",
             "org",
             "dst_lat",
             "dst_lon",
@@ -196,6 +194,9 @@ class TestTransformToScoresSchema:
         ]
         for col in required_columns:
             assert col in result.columns, f"Missing column: {col}"
+        # The selector scales uptime and success rate itself from the raw values.
+        assert "norm_uptime_score" not in result.columns
+        assert "norm_success_rate" not in result.columns
 
     def test_transform_uptime_conversion(self, sample_merged_df):
         # Act
@@ -219,14 +220,9 @@ class TestTransformToScoresSchema:
         # Act
         result = transform_to_scores_schema(sample_merged_df)
 
-        # Assert - all normalized scores should be between 0 and 1
-        for col in [
-            "norm_uptime_score",
-            "norm_success_rate",
-            "lat_normalized_score",
-        ]:
-            values = result[col].dropna()
-            assert all(0 <= v <= 1 for v in values), f"{col} has values outside [0, 1]"
+        # Assert - the normalized latency score should be between 0 and 1
+        values = result["lat_normalized_score"].dropna()
+        assert all(0 <= v <= 1 for v in values), "lat_normalized_score has values outside [0, 1]"
 
     def test_transform_query_count_preserved(self, sample_merged_df):
         # Act
@@ -234,6 +230,25 @@ class TestTransformToScoresSchema:
 
         # Assert - query_count should be preserved from input
         assert list(result["query_count"]) == [1000, 2000, 1500]
+
+
+class TestComputeDegradedScores:
+    """Degraded mode sends equal placeholder quality metrics for every indexer."""
+
+    def test_sends_raw_placeholders_without_pre_scaled_uptime_or_success(self, monkeypatch):
+        # Arrange
+        urls = {"0xa": "https://a.example/", "0xb": "https://b.example/"}
+        monkeypatch.setattr(processing, "fetch_dips_info", lambda _: pd.DataFrame())
+        monkeypatch.setattr(processing, "fetch_and_filter_graph_node_versions", lambda df, _: df)
+
+        # Act
+        result = processing.compute_degraded_scores(urls)
+
+        # Assert
+        assert list(result["uptime_score"]) == [0.5, 0.5]
+        assert list(result["success_rate"]) == [0.5, 0.5]
+        assert "norm_uptime_score" not in result.columns
+        assert "norm_success_rate" not in result.columns
 
 
 class TestIsPrivateIp:
@@ -1578,8 +1593,12 @@ class TestValidateConfigurationSubgraphURL:
             ("https://:8000/subgraphs/name/graph-network", "must be an http(s) URL"),
             ("http://user:pw@/subgraphs/name/graph-network", "must be an http(s) URL"),
             ("http://[graph-node:8000/subgraphs/name/graph-network", "is not a valid URL"),
+            ("http://graph-node:abc/subgraphs/name/graph-network", "is not a valid URL"),
+            ("http://graph-node:99999/subgraphs/name/graph-network", "is not a valid URL"),
             ("https://gateway.thegraph.com/api/k/subgraphs/id/Qm\n", "contains whitespace"),
             (" https://gateway.thegraph.com/api/k/subgraphs/id/Qm", "contains whitespace"),
+            ("http://graph-node:8000\x00/subgraphs/name/graph-network", "invisible character"),
+            ("http://graph-node:8000/subgraphs/name/graph\u200b-network", "invisible character"),
         ],
         ids=[
             "empty",
@@ -1589,8 +1608,12 @@ class TestValidateConfigurationSubgraphURL:
             "port_but_no_host",
             "credentials_but_no_host",
             "unclosed_bracket",
+            "port_not_a_number",
+            "port_out_of_range",
             "trailing_newline",
             "leading_space",
+            "null_byte",
+            "zero_width_space",
         ],
     )
     def test_unusable_url_raises_configuration_error(self, monkeypatch, caplog, url, expected):
@@ -1637,6 +1660,19 @@ class TestValidateConfigurationSubgraphURL:
         monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", url)
 
         main.validate_configuration()
+
+    def test_job_exits_before_scoring_without_a_url(self, monkeypatch):
+        """The job runs this check on startup, before it reads Redpanda or scores anything."""
+        from unittest.mock import MagicMock
+
+        self._satisfy_the_rest(monkeypatch)
+        monkeypatch.setattr(main, "IISA_REQUIRE_PUSH_TOKEN", False)
+        monkeypatch.setattr(main, "GRAPH_NETWORK_SUBGRAPH_URL", "")
+        run_scoring = MagicMock()
+        monkeypatch.setattr(main, "run_scoring", run_scoring)
+
+        assert main.main() == 1
+        run_scoring.assert_not_called()
 
 
 class TestValidateConfigurationRedpandaTopic:

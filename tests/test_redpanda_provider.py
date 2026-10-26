@@ -872,20 +872,6 @@ class TestFetchStakeToFees:
         # Assert
         assert pd.isna(result.loc[EXPECTED_INDEXER, "stake_to_fees"])
 
-    def test_missing_subgraph_url_returns_empty(self):
-        """Without GRAPH_NETWORK_SUBGRAPH_URL, return empty DataFrame."""
-        # Arrange
-        with patch.dict(os.environ, {"REDPANDA_BOOTSTRAP_SERVERS": "localhost:9092"}, clear=False):
-            with patch.dict(os.environ, {"GRAPH_NETWORK_SUBGRAPH_URL": ""}, clear=False):
-                provider = RedpandaProvider()
-
-        # Act
-        result = provider.fetch_stake_to_fees()
-
-        # Assert
-        assert result.empty
-        assert "stake_to_fees" in result.columns
-
     def test_subgraph_indexer_not_in_replay_gets_nan(self):
         """Indexers in the subgraph but absent from the replay get NaN."""
         # Arrange — fee cache has no data for this indexer
