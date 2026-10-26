@@ -6,7 +6,8 @@ Pushes the resulting snapshot directly to the iisa HTTP service via
 iisa_client.post_sync_status; no shared filesystem is involved.
 
 HTTP endpoints:
-  GET /health  -- healthcheck (503 until first write)
+  GET /health  -- healthcheck (503 until the first push, and again once the
+                  last push is older than SYNC_STATUS_MAX_PUSH_AGE seconds)
 """
 
 import asyncio
@@ -40,6 +41,9 @@ MAX_RETRIES = int(os.environ.get("SYNC_STATUS_MAX_RETRIES", "5"))
 RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MULTIPLIER", "1"))
 RETRY_BACKOFF_MAX = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MAX", "5"))
 HTTP_PORT = int(os.environ.get("SYNC_STATUS_HTTP_PORT", "9091"))
+# Unhealthy once 2 cycles in a row fail to push. The extra half interval leaves room for the
+# cycles' own run time, so 1 failed cycle followed by a slow good one stays healthy.
+MAX_PUSH_AGE = int(os.environ.get("SYNC_STATUS_MAX_PUSH_AGE", str(FETCH_INTERVAL * 5 // 2)))
 GRAPH_NETWORK_SUBGRAPH_URL = os.environ.get("GRAPH_NETWORK_SUBGRAPH_URL", "")
 IISA_API_URL = os.environ.get("IISA_API_URL", "")
 # Read the bearer token once at module load so rotation requires a restart —
@@ -51,8 +55,28 @@ STATUS_QUERY = "{ indexingStatuses { subgraph synced health } }"
 JSON_CONTENT_TYPE = "application/json"
 
 # Service state
-_last_write_time: Optional[str] = None
+_last_write_time: Optional[datetime] = None
 _stop_event = threading.Event()
+
+
+class NoIndexerRespondedError(RuntimeError):
+    """Every indexer's /status fetch failed, so there is no snapshot worth pushing."""
+
+
+def _synced_deployments(body: object) -> list[str]:
+    """Return the synced, healthy deployments in a /status reply; raise ValueError if malformed."""
+    data = body.get("data") if isinstance(body, dict) else None
+    statuses = data.get("indexingStatuses") if isinstance(data, dict) else None
+    if not isinstance(statuses, list):
+        raise ValueError("reply has no indexingStatuses list")
+
+    deployments = []
+    for status in statuses:
+        if not isinstance(status, dict) or not isinstance(status.get("subgraph"), str):
+            raise ValueError(f"malformed indexing status: {status!r:.100}")
+        if status.get("synced") is True and status.get("health") == "healthy":
+            deployments.append(status["subgraph"])
+    return deployments
 
 
 async def _fetch_single_status(
@@ -61,13 +85,13 @@ async def _fetch_single_status(
     url: str,
     semaphore: asyncio.Semaphore,
 ) -> Optional[dict]:
-    """Fetch /status from a single indexer with retry logic."""
+    """Fetch /status from a single indexer with retry logic; None if it never answers properly."""
     import aiohttp
 
     status_url = url.rstrip("/") + "/status"
     payload = json.dumps({"query": STATUS_QUERY}).encode()
 
-    async def do_fetch() -> list:
+    async def do_fetch() -> object:
         async with semaphore:
             async with session.post(
                 status_url,
@@ -83,23 +107,19 @@ async def _fetch_single_status(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                data = await resp.json()
-                statuses: list = data.get("data", {}).get("indexingStatuses", [])
-                return statuses
+                return await resp.json()
 
     last_error: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
         try:
-            statuses = await do_fetch()
-            synced_deployments = [
-                s["subgraph"]
-                for s in statuses
-                if s.get("synced") is True and s.get("health") == "healthy"
-            ]
             return {
                 "indexer": indexer,
-                "deployments": synced_deployments,
+                "deployments": _synced_deployments(await do_fetch()),
             }
+        except ValueError as e:
+            # Unparseable JSON or the wrong shape won't change on a retry; skip this indexer only.
+            logger.warning("Malformed /status reply from %s (%s): %s", indexer[:10], url, e)
+            return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = e
             if attempt < MAX_RETRIES - 1:
@@ -134,6 +154,9 @@ async def _fetch_all_statuses(
         ]
         results = await asyncio.gather(*tasks)
 
+    if indexer_urls and all(result is None for result in results):
+        raise NoIndexerRespondedError(f"none of {len(indexer_urls)} indexers answered /status")
+
     output: dict[str, dict] = {}
     for result in results:
         if result is not None and result["deployments"]:
@@ -158,7 +181,13 @@ def run_fetch_cycle() -> bool:
     indexer_urls = discover_indexers_from_network_subgraph(GRAPH_NETWORK_SUBGRAPH_URL)
 
     logger.info("Fetching /status from %d indexers...", len(indexer_urls))
-    data = asyncio.run(_fetch_all_statuses(indexer_urls))
+    try:
+        data = asyncio.run(_fetch_all_statuses(indexer_urls))
+    except NoIndexerRespondedError as e:
+        # Usually this pod's own network, not every indexer at once. An empty push would wipe
+        # IISA's sync status, so skip it and let the health check go stale if it persists.
+        logger.error("Not pushing sync status: %s", e)
+        return False
 
     total_deployments = sum(len(entry["deployments"]) for entry in data.values())
     logger.info(
@@ -173,7 +202,7 @@ def run_fetch_cycle() -> bool:
         logger.error("Failed to push sync status to iisa: %s", e)
         return False
 
-    _last_write_time = datetime.now(timezone.utc).isoformat()
+    _last_write_time = datetime.now(timezone.utc)
     logger.info("Pushed sync status for %d indexers to iisa", len(data))
     return True
 
@@ -183,26 +212,29 @@ def run_fetch_cycle() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _health(now: datetime) -> tuple[int, dict]:
+    """Return the /health status code and body: healthy only while the last push is recent."""
+    if _last_write_time is None:
+        return 503, {"status": "not_ready"}
+
+    age_seconds = (now - _last_write_time).total_seconds()
+    body = {
+        "last_write": _last_write_time.isoformat(),
+        "last_write_age_seconds": int(age_seconds),
+    }
+    if age_seconds > MAX_PUSH_AGE:
+        return 503, {"status": "stale", **body}
+    return 200, {"status": "healthy", **body}
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
-            if _last_write_time is not None:
-                self.send_response(200)
-                self.send_header("Content-Type", JSON_CONTENT_TYPE)
-                self.end_headers()
-                self.wfile.write(
-                    json.dumps(
-                        {
-                            "status": "healthy",
-                            "last_write": _last_write_time,
-                        }
-                    ).encode()
-                )
-            else:
-                self.send_response(503)
-                self.send_header("Content-Type", JSON_CONTENT_TYPE)
-                self.end_headers()
-                self.wfile.write(b'{"status": "not_ready"}')
+            code, body = _health(datetime.now(timezone.utc))
+            self.send_response(code)
+            self.send_header("Content-Type", JSON_CONTENT_TYPE)
+            self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
         else:
             self.send_response(404)
             self.end_headers()
