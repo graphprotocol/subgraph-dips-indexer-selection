@@ -581,13 +581,6 @@ class RedpandaProvider:
         Returns a DataFrame indexed by 'indexer' with a 'stake_to_fees' column,
         matching the schema expected by compute_all_scores.
         """
-        if not self.graph_network_url:
-            logger.warning(
-                "GRAPH_NETWORK_SUBGRAPH_URL not set — returning empty stake data. "
-                "stake_to_fees will be NaN for all indexers."
-            )
-            return pd.DataFrame(columns=["stake_to_fees"])
-
         logger.info("Fetching stake data from %s", redact_url(self.graph_network_url))
         try:
             indexers = self._paginate_graphql_indexers()

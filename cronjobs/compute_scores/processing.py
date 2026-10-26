@@ -31,7 +31,12 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from subgraph import SubgraphResponseError, paginate_subgraph_query, retry_subgraph_read
+from subgraph import (
+    SubgraphResponseError,
+    paginate_subgraph_query,
+    retry_subgraph_read,
+    subgraph_url_problem,
+)
 
 if TYPE_CHECKING:
     import aiohttp
@@ -227,15 +232,16 @@ def _query_indexer_urls(network_subgraph_url: str) -> Dict[str, str]:
 
 
 def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[str, str]:
-    """Return {address: url} for indexers with a URL, or {} when no subgraph URL is set.
+    """Return {address: url} for every indexer the network subgraph lists with a URL.
 
     Redpanda only sees indexers the gateway has routed to, so this lookup finds new ones.
-    Raises when the subgraph can't be read or lists no one: without URLs every indexer
-    fails its DIPs probe, selection picks no one and dipper cancels every agreement.
+    Raises when the URL is unset or unusable, the subgraph can't be read or it lists no one:
+    without URLs every indexer fails its DIPs probe, selection picks no one and dipper
+    cancels everything.
     """
-    if not network_subgraph_url:
-        logger.warning("GRAPH_NETWORK_SUBGRAPH_URL not set, cannot discover indexers from subgraph")
-        return {}
+    url_problem = subgraph_url_problem(network_subgraph_url)
+    if url_problem:
+        raise ValueError(f"GRAPH_NETWORK_SUBGRAPH_URL {url_problem}")
 
     all_indexers = _query_indexer_urls(network_subgraph_url)
     logger.info(f"Discovered {len(all_indexers)} indexers from network subgraph")

@@ -23,6 +23,7 @@ from processing import (
     validate_geoip_databases,
 )
 from redpanda import RedpandaProvider
+from subgraph import subgraph_url_problem
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +72,12 @@ def validate_configuration() -> None:
 
     if not IISA_API_URL:
         errors.append("IISA_API_URL is required")
+
+    # Without indexer URLs every indexer fails its DIPs probe, selection picks no one and
+    # dipper cancels every agreement, so refuse to start rather than score without them.
+    url_problem = subgraph_url_problem(GRAPH_NETWORK_SUBGRAPH_URL)
+    if url_problem:
+        errors.append(f"GRAPH_NETWORK_SUBGRAPH_URL {url_problem}")
 
     if errors:
         for error in errors:
