@@ -986,13 +986,24 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
 
 
 def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[float]:
-    """Extract the price for a specific chain from the JSON price map."""
+    """Extract the price for a specific chain from the JSON price map.
+
+    A price that is not a finite number >= 0 counts as no price, so the indexer is excluded on
+    that chain. A NaN or negative price would otherwise be scored as the cheapest and win.
+    """
     try:
         prices = json.loads(dips_min_grt_json) if isinstance(dips_min_grt_json, str) else {}
         val = prices.get(chain_id)
-        return float(val) if val is not None else None
-    except (TypeError, ValueError):
+        if val is None:
+            return None
+        price = float(val)
+    except (TypeError, ValueError, OverflowError):
+        logger.debug("Ignoring unreadable price for chain '%s' in %r", chain_id, dips_min_grt_json)
         return None
+    if isinstance(val, bool) or not math.isfinite(price) or price < 0:
+        logger.debug("Ignoring unusable price %r for chain '%s'", val, chain_id)
+        return None
+    return price
 
 
 def _keep_with_dips_info(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
