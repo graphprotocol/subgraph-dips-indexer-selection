@@ -14,16 +14,19 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Autopilot answers lookups from NodeLocal DNSCache on each node (169.254.20.10), backed by kube-dns.
+    # DNS, port 53 only, for each resolver GKE may hand a pod: NodeLocal DNSCache (Autopilot),
+    # the metadata server's Cloud DNS resolver (Standard with Cloud DNS), or kube-dns itself.
     - to:
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
           podSelector:
             matchLabels:
               k8s-app: kube-dns
-        - ipBlock:
-            cidr: 169.254.20.10/32
       ports:
         - protocol: UDP
           port: 53
