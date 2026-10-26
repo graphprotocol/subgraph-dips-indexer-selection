@@ -746,7 +746,7 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
 
     Values below NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD of the best
     indexer's score get 0; from there to the best they scale linearly to 1
-    (e.g. 98.5% of the best maps to ~0.5).
+    (e.g. 98.5% of the best maps to ~0.5). A missing value scores 0.
     """
     # Find the best uptime/success rate score in the series first
     best = series.max()
@@ -754,16 +754,12 @@ def _normalize_uptime_and_success_rate(series: pd.Series) -> pd.Series:
     # Threshold whereby indexers that have less uptime/success rate than this get no score.
     threshold = best * NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD
 
-    # Linear score between the threshold and the best.
-    normalized = series.apply(
-        lambda x: max(
-            0,
-            min(1, (x - threshold) / (best - threshold)),
-        )
-    )
+    # Linear score between the threshold and the best. clip() keeps NaN as NaN
+    # (a missing value, or 0 / 0 when the best is 0), so it fills to 0 below.
+    normalized = ((series - threshold) / (best - threshold)).clip(0, 1)
 
-    # Reindex and fill NaN's with 0.
-    normalized = normalized.reindex(series.index).fillna(0)
+    # Fill NaN's with 0.
+    normalized = normalized.fillna(0)
 
     return cast(pd.Series, normalized)
 

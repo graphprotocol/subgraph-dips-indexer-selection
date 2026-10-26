@@ -1060,6 +1060,20 @@ class TestNormalizeMetrics:
         assert result.min() == 0
         assert len(result) == len(series)
 
+    def test_normalize_uptime_and_success_rate_scores_missing_value_zero(self):
+        """A missing value scores 0, not full marks, and leaves the others unchanged."""
+        series = pd.Series([100, np.nan, 98.5, 90])
+
+        result = _normalize_uptime_and_success_rate(series)
+
+        assert result.tolist() == pytest.approx([1.0, 0.0, 0.5, 0.0])
+
+    def test_normalize_uptime_and_success_rate_all_zero_scores_zero(self):
+        """When the best is 0 every indexer scores 0, not full marks."""
+        result = _normalize_uptime_and_success_rate(pd.Series([0.0, 0.0]))
+
+        assert result.tolist() == [0.0, 0.0]
+
     def test_empty_dataframe(self, sample_df):
         # Test with an empty DataFrame
         empty_df = pd.DataFrame(columns=sample_df.columns)
