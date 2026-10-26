@@ -948,7 +948,7 @@ def compute_all_scores(
     # minimum (no-op when MIN_GRAPH_NODE_VERSION is unset).
     merged = fetch_and_filter_graph_node_versions(merged, indexer_urls)
 
-    # Transform to indexer_scores schema with pre-normalized values
+    # Transform to indexer_scores schema
     scores_df = transform_to_scores_schema(merged)
     scores_df["scoring_mode"] = "full" if geoip_available else "partial_no_geoip"
 
@@ -964,7 +964,7 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     """
     Transform the merged DataFrame to the indexer_scores output schema.
 
-    Includes pre-normalizing static metrics.
+    Pre-normalizes latency only; the IISA service scales the other metrics itself.
     """
     # Build the output DataFrame
     scores = pd.DataFrame()
