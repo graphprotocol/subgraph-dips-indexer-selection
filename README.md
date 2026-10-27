@@ -100,3 +100,7 @@ From those scores it selects the number of indexers the caller asks for, shaped 
 | `k8s/` | The Kubernetes manifests for the service and the daily job. |
 | `tests/` | The service's tests, run in CI against the exact versions pinned in `uv.lock`, which the service image installs, under the Python in `.python-version` that the image runs. |
 | `tests/cronjob/` | The daily job's tests, run in CI against what its `requirements.txt` resolves to. |
+
+## Running the tests
+
+`uv sync --extra dev` then `pytest` runs the service's tests. The daily job's tests in `tests/cronjob/` also need its own packages, from `uv pip install -r cronjobs/compute_scores/requirements.txt`; without them `pytest` skips that folder and says so at the top of its output.

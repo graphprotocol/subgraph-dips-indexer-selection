@@ -6,6 +6,7 @@ See:
 - https://faker.readthedocs.io/en/master/pytest-fixtures.html
 """
 
+import importlib.util
 import os
 import random
 import string
@@ -42,6 +43,26 @@ settings.register_profile("thorough", parent=settings.get_profile("fast"), max_e
 settings.load_profile(
     os.environ.get("HYPOTHESIS_PROFILE", "ci" if os.environ.get("CI") else "fast")
 )
+
+# The dev extra leaves out the daily job's own packages, so after a plain `uv sync --extra dev`
+# its tests can't import it. Skip them there with a note in the header; CI installs the job's
+# packages for those tests, so on CI a missing one still fails.
+_JOB_PACKAGES = ("airportsdata", "base58", "confluent_kafka", "scipy", "sklearn", "tenacity")
+_MISSING_JOB_PACKAGES = (
+    []
+    if os.environ.get("CI")
+    else [name for name in _JOB_PACKAGES if importlib.util.find_spec(name) is None]
+)
+collect_ignore_glob = ["cronjob/*"] if _MISSING_JOB_PACKAGES else []
+
+
+def pytest_report_header(config: pytest.Config) -> Optional[str]:
+    if not _MISSING_JOB_PACKAGES:
+        return None
+    return (
+        f"skipping tests/cronjob: {', '.join(_MISSING_JOB_PACKAGES)} not installed; install "
+        "cronjobs/compute_scores/requirements.txt to run the daily job's tests"
+    )
 
 
 class CustomFakerProvider(BaseProvider):
