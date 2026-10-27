@@ -1,6 +1,6 @@
 # Data processing
 pandas>=3.1.0,<4.0
-numpy>=1.24,<3.0
+numpy>=2.5.4,<3.0
 pyarrow>=26.0.0,<27.0
 
 # Machine learning (for linear regression)
@@ -37,5 +37,5 @@ packaging>=26.3,<27.0
 # Transitive pins to keep the vulnerability scanner happy.
 idna>=3.20
 urllib3>=2.8.0
-certifi>=2026.10.19
-multidict>=6.9.1
+certifi>=2026.10.23
+multidict>=7.2.0
