@@ -4,7 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-JOBS_PATH = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
+JOBS_PATH = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 
 # Libraries the scoring job needs and the fetcher never touches.
 SCORING_ONLY_MODULES = ("processing", "pandas", "numpy", "scipy", "sklearn", "geoip2")

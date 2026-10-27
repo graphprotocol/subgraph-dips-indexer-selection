@@ -1034,6 +1034,39 @@ class TestScaleSetByPickableIndexers:
         data = processor.data.set_index("indexer")
         assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.0, 0.0])
 
+    def test_unreadable_value_scores_zero_without_moving_the_pickable_scale(self):
+        """D's text scores 0 and blocked A sets nothing, so B and C alone set the scale."""
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B", "C", "D"],
+                "destination_loc": ["loc1", "loc2", "loc3", "loc4"],
+                "org": ["org1", "org2", "org3", "org4"],
+                "stake_to_fees": [100.0, 10.0, 5.0, "abc"],
+            }
+        )
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 1.0, 0.0, 0.0])
+
+    def test_scales_against_readable_values_when_no_pickable_value_reads(self):
+        """C, the only pickable indexer, sent text, so blocked A and B set the scale instead."""
+        history = self._history(stake_to_fees=[100.0, 50.0, "abc"])
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            indexer_denylist=[IndexerId("A"), IndexerId("B")],
+        )
+
+        data = processor.data.set_index("indexer")
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 0.0, 0.0])
+
 
 class TestAssignAction:
     """The assigning log line names the action picked from group size against target."""
@@ -1752,6 +1785,21 @@ class TestDecentralizationBestEffort:
 
         # Assert - Should still select 3 indexers even though decentralization not met
         assert len(processor.current_group) == 3
+
+    def test_lists_and_objects_count_as_orgs_and_locations(self):
+        """A pushed org or location can be any JSON value. A list or object counts as one
+        value like any other, rather than failing every check that compares them.
+        """
+        processor = _selector_with_scores({"A": 0.9, "B": 0.8, "C": 0.7, "D": 0.6}, [])
+        processor.data["org"] = [["o", 1], {"o": 1}, {"o": 1}, "o"]
+        processor.data["destination_loc"] = [{"l": 1}, ["l"], ["l"], None]
+
+        processor.current_group = ["A"]
+        assert processor._meets_decentralization_requirements("B")
+        processor.current_group = ["B"]
+        assert not processor._meets_decentralization_requirements("C")
+        assert processor._meets_decentralization_requirements_indexer_removal(["A", "D"])
+        assert not processor._meets_decentralization_requirements_indexer_removal(["B", "C"])
 
 
 class TestRowWiseWeightedScoreReference:

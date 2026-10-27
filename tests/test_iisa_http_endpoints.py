@@ -388,6 +388,52 @@ def mock_history_df():
     )
 
 
+class TestOpenApiErrorResponses:
+    """The OpenAPI schema lists each error answer a route can give, besides FastAPI's 422."""
+
+    @pytest.mark.parametrize(
+        "method, path, codes",
+        [
+            ("get", "/health", set()),
+            ("post", "/scores", {"400", "401", "503"}),
+            ("get", "/scores", {"401"}),
+            ("get", "/scores/status", {"401"}),
+            ("get", "/scores/weighted", {"401"}),
+            ("get", "/dips-indexers", {"401"}),
+            ("post", "/sync-status", {"400", "401", "503"}),
+            ("post", "/get-score", {"400", "401", "503"}),
+            ("post", "/select-indexers", {"400", "503"}),
+        ],
+    )
+    def test_lists_each_error_answer(self, method, path, codes):
+        from iisa.iisa_http_endpoints import app
+
+        responses = app.openapi()["paths"][path][method]["responses"]
+
+        assert set(responses) - {"200", "422"} == codes
+        for code in codes:
+            assert responses[code]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/ErrorResponse"
+            }
+
+    @pytest.mark.parametrize("body", [b"\xff\xfe\xfd", b"caf\xe9"], ids=["not-utf8", "latin1-text"])
+    def test_unreadable_body_answer_matches_the_listed_error_shape(self, body):
+        """FastAPI answers a body it cannot decode with its own 400, which the schema lists."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/sync-status", content=body, headers={"Content-Type": "application/json"}
+        )
+
+        assert response.status_code == 400
+        assert set(response.json()) == {"detail"}
+        assert isinstance(response.json()["detail"], str)
+
+
 class TestHealthEndpoint:
     """Tests for GET /health endpoint."""
 
@@ -581,6 +627,10 @@ class TestPushScoresEndpoint:
 
         response = client.post("/scores", json=[])
         assert response.status_code == 422
+        # The same error list FastAPI gives any invalid body, as the OpenAPI schema documents.
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert error["type"] == "too_short"
 
     def test_push_scores_rejects_missing_token_when_required(self, monkeypatch):
         """IISA_PUSH_TOKEN set + no header → 401."""
@@ -615,6 +665,24 @@ class TestPushScoresEndpoint:
         )
         assert response.status_code == 401
         assert "Invalid" in response.json()["detail"]
+
+    @pytest.mark.parametrize("header", [b"Bearer \xe9", b"Bearer caf\xc3\xa9", b"bearer \xff\xfe"])
+    def test_push_scores_rejects_non_ascii_token(self, monkeypatch, header):
+        """A token with non-ASCII characters is a 401, not a 500 from the constant-time compare."""
+        monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
+
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post(
+            "/scores", json=self._sample_payload(), headers={"Authorization": header}
+        )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid bearer token"
 
     @patch("iisa.iisa_http_endpoints.DataManager")
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
@@ -788,7 +856,9 @@ class TestPushScoresEndpoint:
 
         # Assert
         assert response.status_code == 422
-        assert "uptime_score" in response.json()["detail"]
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert "uptime_score" in error["msg"]
         assert not scores_path.exists()
 
     def test_push_scores_missing_indexer_rejected(self, tmp_path, monkeypatch):
@@ -811,8 +881,131 @@ class TestPushScoresEndpoint:
 
         # Assert
         assert response.status_code == 422
-        assert "indexer" in response.json()["detail"]
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert "indexer" in error["msg"]
         assert not scores_path.exists()
+
+    def test_push_scores_records_without_fields_rejected(self, tmp_path, monkeypatch):
+        """Records holding no fields at all are a 422 for the missing columns, not a 500."""
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = client.post("/scores", json=[{}])
+
+        assert response.status_code == 422
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body"]
+        assert "indexer" in error["msg"]
+        assert not scores_path.exists()
+
+    @pytest.mark.parametrize("indexer", [5, None, True, {"id": "0xDEF"}, ["0xDEF"]])
+    def test_push_scores_indexer_not_text_rejected(self, indexer, tmp_path, monkeypatch):
+        """An indexer that is not text is a 422 naming its record, since selection could
+        never return it, rather than an accepted push that breaks every later selection.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = self._sample_payload() + self._sample_payload()
+        payload[1]["indexer"] = indexer
+
+        response = client.post("/scores", json=payload)
+
+        assert response.status_code == 422
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body", 1, "indexer"]
+        assert error["type"] == "string_type"
+        assert error["input"] == indexer
+        assert not scores_path.exists()
+
+    @pytest.mark.parametrize("indexer", [5, 2.5, True])
+    def test_push_scores_every_indexer_a_number_rejected(self, indexer, tmp_path, monkeypatch):
+        """When every indexer is a number, pandas holds them as its own number type, which
+        the 422 must still echo as plain JSON rather than fail to write as a 500.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = [{**record, "indexer": indexer} for record in self._sample_payload() * 2]
+
+        response = client.post("/scores", json=payload)
+
+        assert response.status_code == 422
+        assert [error["input"] for error in response.json()["detail"]] == [indexer, indexer]
+
+    @pytest.mark.parametrize("uptime", [{}, {"a": 1}, [1], "x"])
+    def test_push_with_unreadable_uptime_accepted(self, uptime, tmp_path, monkeypatch):
+        """An uptime that is not a number scores 0, like any unreadable metric, rather than
+        failing the push with a 500 that the score job would retry for minutes.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = self._sample_payload()
+        payload[0]["uptime_score"] = uptime
+
+        response = client.post("/scores", json=payload)
+
+        assert response.status_code == 200
+        weighted = client.get("/scores/weighted").json()["scores"]
+        assert weighted[0]["components"]["uptime"] == 0.0
+
+    @pytest.mark.parametrize("dropped", [["org"], ["dst_lat"], ["dst_lon", "org"]])
+    def test_push_without_org_or_location_can_be_served(self, dropped, tmp_path, monkeypatch):
+        """A push lacking the org or location columns still serves a selection of 2, with
+        every indexer counted as 1 unknown org or location, rather than answering 500.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        payload = []
+        for indexer in ("0xabc", "0xdef"):
+            record = {
+                **self._sample_payload()[0],
+                "indexer": indexer,
+                "org": f"org of {indexer}",
+                "dst_lat": 52.4,
+                "dst_lon": 4.9,
+                "dips_info_available": True,
+                "dips_min_grt_per_30_days": '{"arbitrum-one": "1"}',
+                "dips_supported_networks": '["arbitrum-one"]',
+            }
+            for column in dropped:
+                del record[column]
+            payload.append(record)
+        assert client.post("/scores", json=payload).status_code == 200
+
+        response = client.post(
+            "/select-indexers",
+            json={"deployment_id": "Qm", "num_candidates": 2, "chain_id": "arbitrum-one"},
+        )
+
+        assert response.status_code == 200
+        assert sorted(i["id"] for i in response.json()["indexers"]) == ["0xabc", "0xdef"]
 
     def test_push_scores_full_payload_accepted_end_to_end(self, tmp_path, monkeypatch):
         """A complete payload passes validation, writes disk, and returns the row count."""
@@ -2050,6 +2243,23 @@ class TestPushSyncStatusEndpoint:
         assert response.status_code == 200
         assert response.json()["indexers"] == 0
 
+    def test_push_sync_status_skips_entries_that_are_not_objects(self, tmp_path):
+        """An entry that is a list or null is skipped rather than failing the push with a 500."""
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings, app
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        settings = Settings()
+        settings.sync_status_file_path = str(tmp_path / "sync_status.json")
+        iisa_http_endpoints._state.initialize(settings)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        payload = {**self._sample_payload(), "0xBBB": [], "0xCCC": None}
+        response = client.post("/sync-status", json=payload)
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "success", "indexers": 1}
+
     def test_push_sync_status_rejects_wrong_token(self, monkeypatch):
         monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
         from iisa import iisa_http_endpoints
@@ -3255,6 +3465,93 @@ class TestSelectIndexersEndToEndPricing:
         assert response.status_code == 200
         indexers = response.json()["indexers"]
         assert len(indexers) <= 2, f"requested 2 candidates but got {len(indexers)}"
+
+
+class TestSelectIndexersGroupMembers:
+    """Indexers already in the group: dipper cancels the agreement of any member left out of
+    the answer, so a member goes only when its own data shows it must.
+    """
+
+    _row = staticmethod(TestSelectIndexersEndToEndPricing._row)
+
+    @staticmethod
+    def _select(rows, **request):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import app
+
+        iisa_http_endpoints._state._history = pd.DataFrame(rows)
+        iisa_http_endpoints._state._initialized = True
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers",
+            json={"deployment_id": "QmGroupTest", "chain_id": "arb", **request},
+        )
+        assert response.status_code == 200, response.text
+        return [indexer["id"] for indexer in response.json()["indexers"]]
+
+    def test_drops_a_blocklisted_member(self):
+        rows = [self._row("0xa", "arb", 100.0), self._row("0xb", "arb", 100.0, "EU", "org2")]
+        selected = self._select(
+            rows, num_candidates=1, existing_indexers=["0xa"], blocklist=["0xa"]
+        )
+        assert selected == ["0xb"]
+
+    @pytest.mark.parametrize(
+        ("member", "request_caps"),
+        [
+            (
+                {"dips_min_grt_per_30_days": json.dumps({"arb": 5000.0})},
+                {"max_grt_per_30_days": 400},
+            ),
+            ({"dips_min_grt_per_30_days": json.dumps({"arb": "abc"})}, {}),
+            ({"dips_supported_networks": json.dumps(["other"])}, {}),
+            ({"dips_min_grt_per_billion_entities_per_30_days": -1}, {}),
+            (
+                {"dips_min_grt_per_billion_entities_per_30_days": 9000.0},
+                {"max_grt_per_billion_entities_per_30_days": 2000},
+            ),
+        ],
+        ids=["over-base-cap", "invalid-base", "chain-dropped", "invalid-entity", "over-entity-cap"],
+    )
+    def test_drops_a_member_whose_own_prices_fail_the_checks(self, member, request_caps):
+        rows = [
+            {**self._row("0xbad", "arb", 100.0), **member},
+            self._row("0xgood", "arb", 100.0, "EU", "org2"),
+        ]
+        selected = self._select(rows, num_candidates=1, existing_indexers=["0xbad"], **request_caps)
+        assert selected == ["0xgood"]
+
+    def test_keeps_a_member_with_no_price_data(self):
+        # A failed /dips/info fetch and a missing score row look the same as no DIPs at all,
+        # so neither is reason enough to cancel a working agreement.
+        rows = [
+            {**self._row("0xquiet", "arb", 100.0), "dips_info_available": False},
+            self._row("0xgood", "arb", 100.0, "EU", "org2"),
+        ]
+        selected = self._select(rows, num_candidates=2, existing_indexers=["0xquiet", "0xunscored"])
+        assert sorted(selected) == ["0xquiet", "0xunscored"]
+
+    def test_keeps_members_with_no_price_data_when_no_candidate_is_left(self):
+        # The day the score job reaches no indexer's /dips/info, every row lacks DIPs info.
+        rows = [
+            {**self._row(address, "arb", 100.0), "dips_info_available": False}
+            for address in ("0xa", "0xb", "0xc")
+        ]
+        selected = self._select(rows, num_candidates=2, existing_indexers=["0xa", "0xb"])
+        assert sorted(selected) == ["0xa", "0xb"]
+
+    def test_drops_failing_members_when_no_candidate_is_left(self):
+        rows = [
+            {**self._row("0xa", "arb", 100.0), "dips_info_available": False},
+            self._row("0xb", "arb", 5000.0, "EU", "org2"),
+        ]
+        selected = self._select(
+            rows,
+            num_candidates=2,
+            existing_indexers=["0xa", "0xb"],
+            max_grt_per_30_days=400,
+        )
+        assert selected == ["0xa"]
 
 
 class TestPricedChains:

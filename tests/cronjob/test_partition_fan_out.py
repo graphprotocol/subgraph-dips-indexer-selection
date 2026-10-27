@@ -9,7 +9,7 @@ from unittest.mock import patch
 from confluent_kafka import TopicPartition
 
 # Make the cronjob package importable.
-jobs_path = Path(__file__).parent.parent / "cronjobs" / "compute_scores"
+jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 import redpanda  # noqa: E402
