@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.10.1](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.10.0...v2.10.1) (2026-10-27)
+
+
+### Changed
+
+* **deps:** bump astral-sh/setup-uv ([#378](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/378)) ([519cc98](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/519cc9864b92bf221c0b27d1a9aa223b5e3dcfca))
+* **deps:** bump the service-python group with 4 updates ([#380](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/380)) ([83263fe](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/83263feb198efe51e8e096a6d70dbfabb2b27484))
+* **k8s:** update cronjob image to sha-500224b ([#376](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/376)) ([66282d3](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/66282d361c598aba6d7e2357e666c4473897a475))
+
 ## [2.10.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.9.8...v2.10.0) (2026-10-27)
 
 
