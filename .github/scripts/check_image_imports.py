@@ -1,9 +1,9 @@
-"""Fail when the daily job imports a package that its requirements.txt does not install.
+"""Fail when code imports a package that its image does not install.
 
-CI runs this with only requirements.txt installed, the same install as the job's image, before
-the test tools add packages the image lacks. It reads every import in the job's code without
-running it, including imports inside functions, and skips `if TYPE_CHECKING:` blocks because
-those never run. Usage: python -I check_cronjob_imports.py cronjobs/compute_scores
+CI runs this with only the image's packages installed, before the test tools add packages the
+image lacks. It reads every import in the folder's code without running it, including imports
+inside functions, and skips `if TYPE_CHECKING:` blocks because those never run.
+Usage: python -I check_image_imports.py <folder>, such as src/iisa or cronjobs/compute_scores
 """
 
 import ast
@@ -45,9 +45,7 @@ def main(job_dir: Path) -> int:
             if importlib.util.find_spec(name) is None:
                 missing.setdefault(name, []).append(path.name)
     for name, files in missing.items():
-        print(
-            f"::error::{', '.join(files)} imports {name}, which requirements.txt does not install"
-        )
+        print(f"::error::{', '.join(files)} imports {name}, which the image does not install")
     print(f"Checked the imports of {len(sources)} files in {job_dir}: {len(missing)} missing")
     return 1 if missing else 0
 

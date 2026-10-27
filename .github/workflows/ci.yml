@@ -43,6 +43,13 @@ jobs:
       - name: Check uv.lock is up to date
         run: uv lock --check
 
+      # The service image installs uv.lock without the dev extra, so check, before that extra
+      # arrives, that the service imports nothing the image lacks.
+      - name: Check the service imports only what its image installs
+        run: |
+          uv sync --locked --no-install-project --no-dev
+          python -I .github/scripts/check_image_imports.py src/iisa
+
       - name: Install dependencies
         run: uv sync --locked --extra dev
 
@@ -102,7 +109,7 @@ jobs:
       # The test tools add packages the image lacks (pydantic and pyyaml among them), so an
       # import only they satisfy would pass the tests and then crash the job in its image.
       - name: Check the cronjob imports only what its requirements install
-        run: python -I .github/scripts/check_cronjob_imports.py cronjobs/compute_scores
+        run: python -I .github/scripts/check_image_imports.py cronjobs/compute_scores
 
       # The dev extra brings pytest, and the iisa package that the shared conftest imports.
       - name: Install test tools
@@ -117,22 +124,3 @@ jobs:
 
       - name: Test
         run: pytest tests/cronjob --tb=short -q
-
-  service-image-tests:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v7
-
-      # The service image installs uv.lock with the Python in .python-version, so its tests run on
-      # exactly those versions.
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: "0.12.24"
-          activate-environment: true
-
-      - name: Install dependencies
-        run: uv sync --locked --extra dev
-
-      - name: Test
-        run: pytest --tb=short -q --ignore=tests/cronjob
