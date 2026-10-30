@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.10.2](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.10.1...v2.10.2) (2026-10-30)
+
+
+### Fixed
+
+* **k8s:** stop the old IISA pod before starting its replacement ([#381](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/381)) ([dc691a5](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/dc691a50d4ade8f64460a7ede6537db16669dc84))
+
 ## [2.10.1](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.10.0...v2.10.1) (2026-10-27)
 
 
