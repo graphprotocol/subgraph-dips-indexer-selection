@@ -51,6 +51,10 @@ generous headroom:
 - Readiness probe: 90s initial delay
 - Liveness probe: 120s initial delay
 
+A rollout stops the old service pod before starting the new one, because the cache
+volume can attach to only 1 node at a time. The service stops answering until the new
+pod passes its readiness probe, so each rollout leaves a gap of at least 90 seconds.
+
 The sync-status fetcher reports healthy only after its first push, which probes every
 indexer, so its startup probe allows 15 minutes. It turns unhealthy again once 2 hourly
 pushes in a row fail, and the liveness probe then restarts it. A restart fixes a cause
