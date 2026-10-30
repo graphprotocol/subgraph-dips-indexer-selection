@@ -7,6 +7,10 @@ metadata:
     app: iisa
 spec:
   replicas: 1
+  # The scores cache volume attaches to 1 node at a time, so a rolling update whose new pod
+  # lands on another node waits on the old pod forever. Stop the old pod first instead.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: iisa
