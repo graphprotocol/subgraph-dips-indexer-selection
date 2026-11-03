@@ -48,6 +48,7 @@ dev = [
     "anyio>=4.14.2",
     "pygments>=2.20.0",
     "python-dotenv>=1.2.2",
+    "graphql-core>=3.3.1",
 ]
 
 [build-system]
