@@ -27,8 +27,8 @@ jobs:
           # No python-version: uv takes it from .python-version, as the setup-python steps do.
           activate-environment: true
 
-      # Dependabot bumps the images' Python on its own, so fail when either image stops running
-      # the version CI tests on, rather than letting the 2 drift apart.
+      # Fail when either image stops running the Python CI tests on, so a hand edit to a Dockerfile
+      # or to .python-version can't let the 2 drift apart.
       - name: Check the images run the Python CI tests on
         run: |
           python_version="$(cat .python-version)"

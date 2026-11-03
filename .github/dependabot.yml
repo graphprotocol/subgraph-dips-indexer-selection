@@ -42,6 +42,11 @@ updates:
       - /cronjobs/compute_scores
     schedule:
       interval: weekly
+    # The images' Python must match .python-version, which CI tests on, and CI fails when they
+    # differ. Moving to a new Python means changing both together and testing on it, by hand.
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       docker-images:
         patterns: ["*"]
