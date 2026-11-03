@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.10.2](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.10.1...v2.10.2) (2026-11-03)
+
+
+### Fixed
+
+* **cronjob:** let the GeoIP diagnostic type-check with pandas-stubs 3.1 ([#392](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/392)) ([6bf8bc8](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/6bf8bc839b218987016d16fef7de00a5547b741b))
+* **deps:** clear the CI failures blocking Dependabot updates ([#388](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/388)) ([f012e25](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/f012e25b91321d32a5558101136b73ed94dd2176))
+* **k8s:** stop the old IISA pod before starting its replacement ([#381](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/381)) ([dc691a5](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/dc691a50d4ade8f64460a7ede6537db16669dc84))
+
+
+### Changed
+
+* **deps:** bump astral-sh/setup-uv ([#387](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/387)) ([94950e4](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/94950e4e6a67b94a67f502e4f004b1936c632d08))
+* **deps:** bump the cronjob-python group across 1 directory with 5 updates ([#389](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/389)) ([e36f10f](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/e36f10f7a426312548700788167b46d4a93aaecd))
+* **deps:** bump the service-python group across 1 directory with 12 updates ([#390](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/390)) ([5383607](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/5383607af6188082f7be8ca6c12ad6f03b9bcffd))
+* **k8s:** update cronjob image to sha-6bf8bc8 ([#393](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/393)) ([591f12a](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/591f12af312fb55a2903ec92baaff3c52a7c0be2))
+
 ## [2.10.1](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.10.0...v2.10.1) (2026-10-27)
 
 
