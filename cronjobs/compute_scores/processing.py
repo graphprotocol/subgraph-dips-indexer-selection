@@ -738,9 +738,8 @@ def diagnose_geoip_failure(combined_queries: pd.DataFrame) -> str:
             public_count += 1
 
     sample_rows = "\n".join(
-        f"    {str(row.indexer)[:10]}...  ->  "
-        f"{str(row.ip_addr) if not pd.isna(row.ip_addr) else '(no IP resolved)'}"
-        for row in sample.itertuples(index=False)
+        f"    {str(indexer)[:10]}...  ->  {str(ip) if not pd.isna(ip) else '(no IP resolved)'}"
+        for indexer, ip in zip(sample["indexer"], sample["ip_addr"], strict=True)
     )
 
     if private_count >= max(null_count, public_count):
