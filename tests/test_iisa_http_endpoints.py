@@ -401,6 +401,8 @@ class TestOpenApiErrorResponses:
             ("get", "/scores/weighted", {"401"}),
             ("get", "/dips-indexers", {"401"}),
             ("post", "/sync-status", {"400", "401", "503"}),
+            ("post", "/freshness", {"400", "401", "503"}),
+            ("get", "/freshness", {"401"}),
             ("post", "/get-score", {"400", "401", "503"}),
             ("post", "/select-indexers", {"400", "503"}),
         ],
@@ -1202,10 +1204,9 @@ class TestScoresWeightedEndpoint:
         entries_by_id = {e["indexer"]: e for e in body["scores"]}
         assert set(entries_by_id) == {"0xabc", "0xxyz", "0x123"}
 
-        # The network-wide score compares every indexer and leaves prices out, so it's the
-        # weighted average of latency, stake_to_fees, uptime and success rate alone. Latency and
-        # stake_to_fees arrive pre-scaled and are kept; 98.5% uptime and success sit halfway
-        # between the 97%-of-best cutoff and the best.
+        # The network-wide score leaves prices out: it averages latency, stake_to_fees, uptime and
+        # success rate. Latency and stake_to_fees arrive pre-scaled and are kept; 98.5% uptime and
+        # success sit halfway between the 97%-of-best cutoff and the best.
         abc = entries_by_id["0xabc"]
         assert abc["components"] == pytest.approx(
             {"latency": 0.8, "stake_to_fees": 0.5, "uptime": 0.5, "success_rate": 0.5}

@@ -91,6 +91,12 @@ When asked to fill a deployment, the service blends each indexer's measurements 
 
 From those scores it selects the number of indexers the caller asks for, shaped by a handful of constraints. It stays within the price ceiling the caller specifies and skips indexers that do not serve the requested chain. When more than one indexer is needed it tries to spread them across distinct operators and locations, falling back to the best available when no combination satisfies that. When it knows which indexers are already synced to the deployment, it favours them, so queries can be served the moment an agreement is accepted. It leaves a working incumbent in place, stepping in only once the group is already at its target size and an incumbent has dropped well below an acceptable score while a challenger beats it by a clear margin — so the set does not churn on small fluctuations. And it never picks an indexer the caller has blocked. The exact thresholds behind these rules live alongside the weights in `src/iisa/indexer_selection.py`.
 
+### Freshness
+
+An indexer can keep answering queries while it has stopped following a chain, so none of the scores above notice it serving stale data. To catch that, a prober checks once a minute whether each indexer is serving up-to-date data on each chain it offers DIPs on, and sends that minute's outcomes to `POST /freshness`. The service keeps them in `freshness.json` on its volume, and `GET /freshness` reports, for each indexer on each chain, its latest outcome, how it did over the last 10 minutes and its passed and counted checks over the last 28 days.
+
+From the last 10 minutes the service works out a stale mark. An indexer is marked on a chain when it passed fewer than half of the minutes that counted. A minute the service never received, or a check voided by a fault on IISA's or the gateway's side, doesn't count; a minute the service received without an outcome for the indexer counts as not passed. When fewer than 5 minutes counted, the mark stays as it was. An indexer seen for the first time starts marked, so it has to pass checks before the mark clears. For now the mark is only recorded and reported; selection doesn't use it.
+
 ## Repository layout
 
 | Path | What lives there |

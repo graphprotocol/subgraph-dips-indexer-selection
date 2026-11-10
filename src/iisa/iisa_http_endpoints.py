@@ -11,6 +11,8 @@ Endpoints:
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (bearer-auth)
 - GET /dips-indexers - Indexers selection would pick for a required ?chain (bearer-auth)
 - POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
+- POST /freshness - Push 1 minute of freshness check outcomes from the prober (bearer-auth)
+- GET /freshness - Each indexer's stale mark and freshness counts by chain (bearer-auth)
 - POST /get-score - Return weighted score and components for one indexer (bearer-auth)
 - POST /select-indexers - Select optimal indexers for a deployment
 """
@@ -23,18 +25,19 @@ import numbers
 import os
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache, partial
-from typing import Annotated, Any, NamedTuple, Optional, cast
+from typing import Annotated, Any, Literal, NamedTuple, Optional, Self, cast
 
 import pandas as pd
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .freshness import Check, FreshnessStore, load_state, minute_index, minute_text
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
 from .score_loader import (
     STALE_SCORES_CRITICAL_HOURS,
@@ -73,6 +76,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
+    freshness_file_path: str = "/app/scores/freshness.json"
     # Bearer token required on every endpoint except /health and /select-indexers.
     # When unset, those endpoints accept unauthenticated requests and a WARNING
     # is logged at startup — local dev convenience only.
@@ -273,6 +277,118 @@ class SyncStatusAcceptedResponse(BaseModel):
     indexers: int
 
 
+# A minute this far ahead of the service's clock is refused: once applied, every real minute
+# before it would look already applied and be ignored.
+_FRESHNESS_MINUTE_LEEWAY = timedelta(minutes=5)
+
+
+def _whole_utc_minute(value: Any) -> datetime:
+    """Read a pushed minute: ISO 8601 text with a time zone, on a whole minute, and not more
+    than _FRESHNESS_MINUTE_LEEWAY ahead of this service's clock. Returned in UTC.
+    """
+    if not isinstance(value, str):
+        raise ValueError("minute must be ISO 8601 text")
+    try:
+        moment = datetime.fromisoformat(value)
+        utc = moment.astimezone(timezone.utc) if moment.tzinfo is not None else None
+    except (ValueError, OverflowError) as e:
+        raise ValueError(f"minute is not a usable ISO 8601 time: {e}") from e
+    if utc is None:
+        raise ValueError("minute must carry a time zone, such as Z")
+    if utc.second or utc.microsecond:
+        raise ValueError("minute must fall on a whole minute")
+    if utc > datetime.now(timezone.utc) + _FRESHNESS_MINUTE_LEEWAY:
+        raise ValueError("minute is ahead of the service's clock")
+    return utc
+
+
+class FreshnessOutcome(BaseModel):
+    """1 indexer's outcome on 1 chain in a freshness push. Numbers sent as text are refused."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    indexer: Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{40}$"), AfterValidator(str.lower)]
+    chain: str = Field(min_length=1, max_length=64)
+    outcome: Literal["pass", "fail", "no_evidence", "void"]
+    reason: Optional[str] = Field(default=None, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    detail: Optional[str] = Field(default=None, max_length=300)
+    deployment: Optional[str] = Field(default=None, max_length=64)
+    age_seconds: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+class FreshnessPush(BaseModel):
+    """Body of POST /freshness: every outcome for the checks sent in 1 minute."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    minute: Annotated[datetime, BeforeValidator(_whole_utc_minute)]
+    outcomes: list[FreshnessOutcome] = Field(max_length=50_000)
+
+    @model_validator(mode="after")
+    def _one_outcome_per_pair(self) -> Self:
+        seen: set[tuple[str, str]] = set()
+        repeated: set[tuple[str, str]] = set()
+        for outcome in self.outcomes:
+            pair = (outcome.indexer, outcome.chain)
+            (repeated if pair in seen else seen).add(pair)
+        if repeated:
+            raise ValueError(
+                f"{len(repeated)} (indexer, chain) pairs appear more than once in outcomes, "
+                f"such as {sorted(repeated)[0]}"
+            )
+        return self
+
+
+class FreshnessAcceptedResponse(BaseModel):
+    """Response to POST /freshness. applied is false for a minute at or before the last one
+    applied, which changes nothing.
+    """
+
+    status: str
+    minute: str
+    applied: bool
+    pairs: int
+
+
+class FreshnessLastCheck(BaseModel):
+    """The latest outcome recorded for an indexer on a chain."""
+
+    minute: str
+    outcome: str
+    reason: Optional[str] = None
+    detail: Optional[str] = None
+    deployment: Optional[str] = None
+    age_seconds: Optional[float] = None
+
+
+class FreshnessPair(BaseModel):
+    """An indexer's freshness on 1 chain. judged is false when fewer than 5 of the last 10
+    minutes counted, and marked is then the mark carried over.
+    """
+
+    marked: bool
+    judged: bool
+    window_passed: int
+    window_counted: int
+    last: FreshnessLastCheck
+    passed_28d: int
+    counted_28d: int
+    share_28d: Optional[float] = None
+
+
+class FreshnessChain(BaseModel):
+    """Freshness on 1 chain, by indexer."""
+
+    indexers: dict[str, FreshnessPair] = {}
+
+
+class FreshnessResponse(BaseModel):
+    """Response for GET /freshness. last_minute is null until the first push."""
+
+    last_minute: Optional[str] = None
+    chains: dict[str, FreshnessChain] = {}
+
+
 class ErrorResponse(BaseModel):
     """Body of each error answer other than a 422: what went wrong, in words."""
 
@@ -313,6 +429,7 @@ class IISAState:
         self.data_manager: Optional[DataManager] = None
         self._history: Optional[pd.DataFrame] = None
         self._sync_status: Optional["SyncStatusData"] = None
+        self.freshness = FreshnessStore()
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -431,6 +548,21 @@ class IISAState:
 
         self._sync_status = data
         return data.total_indexers
+
+    def refresh_freshness(self) -> bool:
+        """Load the saved freshness state. Returns True when it holds at least 1 push."""
+        if self.settings is None:
+            return False
+        self.freshness = FreshnessStore(load_state(self.settings.freshness_file_path))
+        return self.freshness.last_minute is not None
+
+    def apply_freshness(self, push: FreshnessPush) -> bool:
+        """Apply a freshness push and save the state. False when the minute was ignored."""
+        if self.settings is None:
+            raise RuntimeError("Settings not initialized")
+        checks = [Check(**outcome.model_dump()) for outcome in push.outcomes]
+        save = partial(_atomic_write_json, self.settings.freshness_file_path)
+        return self.freshness.apply(minute_index(push.minute), checks, save)
 
     @property
     def sync_status(self):
@@ -595,6 +727,11 @@ async def lifespan(_app: FastAPI):
         logger.info("Recovered cached sync status on startup")
     else:
         logger.info("No cached sync status on startup (optional)")
+
+    if _state.refresh_freshness():
+        logger.info("Recovered freshness state on startup")
+    else:
+        logger.info("No freshness state on startup; marks start again from the first push")
 
     logger.info("IISA service ready")
 
@@ -986,6 +1123,51 @@ def push_sync_status(
 
     logger.info("Accepted pushed sync status: %d indexers", indexer_count)
     return SyncStatusAcceptedResponse(status="success", indexers=indexer_count)
+
+
+@app.post(
+    "/freshness",
+    response_model=FreshnessAcceptedResponse,
+    responses=_documented_errors(400, 401, 503),
+)
+def push_freshness(
+    push: FreshnessPush,
+    authorization: Optional[str] = Header(None),
+) -> FreshnessAcceptedResponse:
+    """Accept 1 minute of freshness outcomes from the prober and recompute every stale mark.
+
+    A minute at or before the last one applied is answered with applied false and changes
+    nothing, so a retried push can't count twice. Sync def so the file write runs on the
+    threadpool.
+    """
+    _require_push_token(authorization)
+
+    if _state.settings is None:
+        raise HTTPException(status_code=503, detail="IISA service not initialized")
+
+    minute = minute_text(minute_index(push.minute))
+    try:
+        applied = _state.apply_freshness(push)
+    except Exception:
+        # A failed save leaves the minute applied in memory; the next saved push writes it out.
+        logger.exception("Failed to apply or save pushed freshness for minute %s", minute)
+        raise HTTPException(status_code=500, detail="Failed to apply or save freshness")
+
+    if applied:
+        logger.info("Applied freshness for minute %s: %d pairs", minute, len(push.outcomes))
+    else:
+        logger.info("Ignored freshness for minute %s: at or before the last applied", minute)
+    pairs = len(push.outcomes) if applied else 0
+    return FreshnessAcceptedResponse(status="success", minute=minute, applied=applied, pairs=pairs)
+
+
+@app.get("/freshness", response_model=FreshnessResponse, responses=_documented_errors(401))
+def freshness_report(
+    authorization: Optional[str] = Header(None),
+) -> FreshnessResponse:
+    """Each indexer's stale mark, last 10 minutes, latest outcome and 28-day counts, by chain."""
+    _require_push_token(authorization)
+    return FreshnessResponse.model_validate(_state.freshness.snapshot())
 
 
 @app.post("/get-score", response_model=ScoreResponse, responses=_documented_errors(400, 401, 503))
