@@ -258,6 +258,9 @@ def _bad_indexer_outcome(message: str) -> tuple[str, str]:
         return VOID, PAYMENT_REFUSED
     if error.startswith("Timeout"):
         return FAIL, INDEXER_TIMEOUT
+    if error.startswith("Unavailable(internal error"):
+        # The gateway's own inconsistency, which its code logs as something that shouldn't happen.
+        return VOID, GATEWAY_ERROR
     if error.startswith("Unavailable("):
         return FAIL, INDEXER_UNAVAILABLE
     return FAIL, INDEXER_ERROR

@@ -184,13 +184,23 @@ def test_indexer_timeout_fails():
 
 
 @pytest.mark.parametrize(
-    "error",
-    ["Unavailable(blocked)", "Unavailable(missing block)", "Unavailable(internal error: x)"],
+    "error", ["Unavailable(blocked)", "Unavailable(missing block)", "Unavailable(not supported)"]
 )
 def test_indexer_unavailable_fails(error):
     judgement = _judge(_bad_indexer(error), attested=False)
 
     assert (judgement.outcome, judgement.reason) == (FAIL, "indexer_unavailable")
+
+
+@pytest.mark.parametrize(
+    "error", ["Unavailable(internal error: indexer not found)", "Unavailable(internal error)"]
+)
+def test_unavailable_for_the_gateways_own_internal_error_is_void(error):
+    """The gateway's own code calls this case one that should not happen; it isn't the
+    indexer's doing."""
+    judgement = _judge(_bad_indexer(error), attested=False)
+
+    assert (judgement.outcome, judgement.reason) == (VOID, "gateway_error")
 
 
 @pytest.mark.parametrize(
