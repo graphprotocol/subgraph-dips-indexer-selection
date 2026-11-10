@@ -156,10 +156,10 @@ DIPS_INFO_MAX_RETRIES = int(os.environ.get("DIPS_INFO_MAX_RETRIES", "5"))
 DIPS_INFO_RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MULTIPLIER", "1"))
 DIPS_INFO_RETRY_BACKOFF_MAX = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MAX", "5"))
 # Byte limit on a /dips/info reply, so an indexer cannot stream a huge body and run the job out of
-# memory. Parsing a body made of tiny elements can take over 20 times its size in memory, so the
-# limit sits close to what a real reply needs: about 55 bytes for each network an indexer prices,
-# so 64 KiB fits over 1,000 networks. Dipper uses the same limit, so the 2 agree on whose prices
-# can be read.
+# memory. Parsing a hostile body made of tiny elements can take up to about 45 times its size, so
+# the limit sits close to what a real reply needs: about 55 bytes for each network an indexer
+# prices, so 64 KiB fits over 1,000 networks. Dipper uses the same limit, so the 2 agree on whose
+# prices can be read.
 DIPS_INFO_MAX_RESPONSE_BYTES = int(os.environ.get("DIPS_INFO_MAX_RESPONSE_BYTES", str(64 * 1024)))
 
 # Graph-node version fetch settings. Mirror the dips-info constants so a slow

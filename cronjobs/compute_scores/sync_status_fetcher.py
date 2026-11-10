@@ -43,9 +43,12 @@ RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MULTIPL
 RETRY_BACKOFF_MAX = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MAX", "5"))
 HTTP_PORT = int(os.environ.get("SYNC_STATUS_HTTP_PORT", "9091"))
 # Byte limit on 1 indexer's /status reply, so a huge or never-ending reply cannot run the fetcher
-# out of memory. Parsing a body made of tiny elements can take over 20 times its size in memory,
-# so the limit sits close to what a real reply needs: it lists every deployment the indexer has,
-# about 90 bytes each, so 8 MiB fits about 90,000 deployments.
+# out of memory. A real reply lists every deployment the indexer has, about 90 bytes each, so 8 MiB
+# fits about 90,000 deployments. The fetcher's memory must hold SYNC_STATUS_MAX_CONCURRENCY replies
+# being read at once, each up to this limit, plus 1 reply being parsed, which takes about 4 times
+# its size for a real reply and up to about 45 times for a hostile one made of tiny elements. At
+# the defaults that is about 400 MiB plus 360 MiB. If the pod has less memory to spare than that,
+# lower this setting.
 MAX_RESPONSE_BYTES = int(os.environ.get("SYNC_STATUS_MAX_RESPONSE_BYTES", str(8 * 1024 * 1024)))
 # Unhealthy once 2 cycles in a row fail to push. The extra half interval leaves room for the
 # cycles' own run time, so 1 failed cycle followed by a slow good one stays healthy.
