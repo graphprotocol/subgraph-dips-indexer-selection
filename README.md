@@ -87,7 +87,7 @@ When asked to fill a deployment, the service blends each indexer's measurements 
 | Success rate | higher | 0.05 |
 | Price (per billion entities) | lower | 0.05 |
 
-*Better* is the direction that earns a higher score: latency and price are inverted during scoring, so a lower raw value scores higher. These are the current default weights — the source of truth is `DEFAULT_WEIGHTS` in `src/iisa/indexer_selection.py`, and a caller can override them per request.
+*Better* is the direction that earns a higher score: latency and price are inverted during scoring, so a lower raw value scores higher. These are the weights selection always uses: the source of truth is `DEFAULT_WEIGHTS` in `src/iisa/indexer_selection.py`, and a selection request has no way to change them.
 
 From those scores it selects the number of indexers the caller asks for, shaped by a handful of constraints. It stays within the price ceiling the caller specifies and skips indexers that do not serve the requested chain. When more than one indexer is needed it tries to spread them across distinct operators and locations, falling back to the best available when no combination satisfies that. When it knows which indexers are already synced to the deployment, it favours them, so queries can be served the moment an agreement is accepted. It leaves a working incumbent in place, stepping in only once the group is already at its target size and an incumbent has dropped well below an acceptable score while a challenger beats it by a clear margin — so the set does not churn on small fluctuations. And it never picks an indexer the caller has blocked. The exact thresholds behind these rules live alongside the weights in `src/iisa/indexer_selection.py`.
 
