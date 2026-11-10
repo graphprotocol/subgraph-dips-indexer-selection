@@ -42,10 +42,11 @@ MAX_RETRIES = int(os.environ.get("SYNC_STATUS_MAX_RETRIES", "5"))
 RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MULTIPLIER", "1"))
 RETRY_BACKOFF_MAX = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MAX", "5"))
 HTTP_PORT = int(os.environ.get("SYNC_STATUS_HTTP_PORT", "9091"))
-# Byte limit on 1 indexer's /status reply. It lists every deployment the indexer has, about 100
-# bytes each, and large indexers have several thousand, so the limit leaves plenty of room while
-# stopping a huge or never-ending reply from running the fetcher out of memory.
-MAX_RESPONSE_BYTES = int(os.environ.get("SYNC_STATUS_MAX_RESPONSE_BYTES", str(16 * 1024 * 1024)))
+# Byte limit on 1 indexer's /status reply, so a huge or never-ending reply cannot run the fetcher
+# out of memory. Parsing a body made of tiny elements can take over 20 times its size in memory,
+# so the limit sits close to what a real reply needs: it lists every deployment the indexer has,
+# about 90 bytes each, so 8 MiB fits about 90,000 deployments.
+MAX_RESPONSE_BYTES = int(os.environ.get("SYNC_STATUS_MAX_RESPONSE_BYTES", str(8 * 1024 * 1024)))
 # Unhealthy once 2 cycles in a row fail to push. The extra half interval leaves room for the
 # cycles' own run time, so 1 failed cycle followed by a slow good one stays healthy.
 MAX_PUSH_AGE = int(os.environ.get("SYNC_STATUS_MAX_PUSH_AGE", str(FETCH_INTERVAL * 5 // 2)))

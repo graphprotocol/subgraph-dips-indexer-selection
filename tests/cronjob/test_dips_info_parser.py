@@ -346,7 +346,8 @@ def _fetch_record_from_server(raw: bytes, content_type: str):
         pytest.param(b"<html>bad gateway</html>", "application/json", id="not-json"),
         pytest.param(b"\xff\xfe", "application/json", id="not-utf8"),
         pytest.param(b"1" * 5_000, "application/json", id="integer-too-long-to-read"),
-        pytest.param(b"[" * 100_000 + b"]" * 100_000, "application/json", id="nested-too-deep"),
+        # 40 KB, under the size limit, so it is the nesting that makes it unreadable.
+        pytest.param(b"[" * 20_000 + b"]" * 20_000, "application/json", id="nested-too-deep"),
     ],
 )
 def test_body_that_is_not_a_json_object_makes_dips_info_unusable(raw, content_type, caplog):
@@ -461,12 +462,12 @@ def test_reply_that_never_ends_is_cut_off_rather_than_read_until_the_timeout(mon
 # --- Keeping what an indexer sends from flooding or forging CronJob log lines ---------------
 #
 # The warnings for a dropped price quote the chain name and value the indexer sent. A line break
-# in either would start a fake log line, and a value of up to the 1 MiB reply limit would be
+# in either would start a fake log line, and a value of up to the 64 KiB reply limit would be
 # logged in full on every run, so both are quoted with escapes and cut to a fixed length.
 
-HUGE_TEXT = "9" * 1_000_000 + "x"
-# About 500 KB, so the reply stays under the limit and reaches the price checks.
-HUGE_OBJECT = {f"key{i}": {"nested": ["v" * 1_000] * 100} for i in range(5)}
+# About 50 KB each, so the reply stays under the limit and reaches the price checks.
+HUGE_TEXT = "9" * 50_000 + "x"
+HUGE_OBJECT = {f"key{i}": {"nested": ["v" * 1_000] * 10} for i in range(5)}
 
 
 def test_line_break_in_a_chain_name_cannot_start_a_fake_log_line(caplog):
