@@ -23,7 +23,7 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
-from escaping import error_for_log
+from escaping import error_for_log, url_for_log
 from escaping import for_log as _for_log
 from numpy.linalg import pinv
 from scipy.stats import t
@@ -365,7 +365,7 @@ async def _fetch_single_dips_info_async(
         return _dips_info_record(indexer, data)
 
     logger.debug(
-        f"Failed to fetch /dips/info from {_for_log(url)} for indexer {indexer}: "
+        f"Failed to fetch /dips/info from {url_for_log(url)} for indexer {indexer}: "
         f"{error_for_log(last_error)}"
     )
     return _unavailable_dips_info(indexer)
@@ -510,7 +510,7 @@ async def _fetch_single_graph_node_version_async(
             await asyncio.sleep(delay)
 
     logger.debug(
-        f"Failed to fetch graph-node version from {_for_log(url)} for indexer {indexer}: "
+        f"Failed to fetch graph-node version from {url_for_log(url)} for indexer {indexer}: "
         f"{error_for_log(last_error)}"
     )
     return {"indexer": indexer, "graph_node_version": None, "graph_node_commit": None}
@@ -1164,7 +1164,7 @@ def resolve_url_geoip(url: str) -> dict:
         return lookup_geoip(ip_addr)
 
     except Exception as e:
-        logger.warning(f"GeoIP resolution failed for {_for_log(url)}: {error_for_log(e)}")
+        logger.warning(f"GeoIP resolution failed for {url_for_log(url)}: {error_for_log(e)}")
         return _empty_geoip_result()
 
 

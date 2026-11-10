@@ -12,6 +12,10 @@ _LOG_REPR = reprlib.Repr()
 _LOG_REPR.maxlevel = 2
 _LOG_REPR.maxstring = _LOG_REPR.maxlong = _LOG_REPR.maxother = 60
 _MAX_LOGGED_CHARS = 200
+# URLs keep up to 200 characters, as an ordinary indexer URL can pass 60 and a cut inside the
+# host name makes the indexer hard to find.
+_URL_REPR = reprlib.Repr()
+_URL_REPR.maxstring = _MAX_LOGGED_CHARS
 # Errors get more room: a certificate error runs to about 300 characters and names the reason,
 # such as an expired certificate or the wrong host name, at the very end.
 _MAX_LOGGED_ERROR_CHARS = 500
@@ -22,6 +26,12 @@ def for_log(value: object) -> str:
     fake log line, and cut short, so a huge value cannot flood the log on every run.
     """
     text = _LOG_REPR.repr(value)
+    return text if len(text) <= _MAX_LOGGED_CHARS else text[:_MAX_LOGGED_CHARS] + "..."
+
+
+def url_for_log(url: object) -> str:
+    """Quote an indexer's URL for a log line like `for_log`, keeping up to 200 characters of it."""
+    text = _URL_REPR.repr(url)
     return text if len(text) <= _MAX_LOGGED_CHARS else text[:_MAX_LOGGED_CHARS] + "..."
 
 

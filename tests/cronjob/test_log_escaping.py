@@ -147,6 +147,55 @@ def test_geoip_failure_keeps_the_url_on_1_line(caplog):
     _assert_on_1_line(caplog, "processing", logging.WARNING)
 
 
+# --- Showing a long but ordinary URL whole --------------------------------------------------
+#
+# Indexer URLs of 60 to 80 characters are common. Cut to 60 with the middle left out, the cut
+# often fell inside the host name, which made a failing indexer harder to find.
+
+LONG_PATH = "indexer-arbitrum-one/some-operator-company/"
+
+
+def test_fetcher_warning_shows_a_long_url_whole(caplog, monkeypatch):
+    monkeypatch.setattr(sync_status_fetcher, "MAX_RETRIES", 1)
+    urls = []
+
+    async def handler(request):
+        return web.Response(status=503)
+
+    async def run(session, base_url):
+        urls.append(base_url + LONG_PATH)
+        return await sync_status_fetcher._fetch_single_status(
+            session, "0xLong", urls[0], asyncio.Semaphore(1)
+        )
+
+    with caplog.at_level(logging.WARNING, logger="sync_status_fetcher"):
+        asyncio.run(_with_server(handler, run))
+
+    assert len(urls[0]) > 60
+    warning = next(r.getMessage() for r in caplog.records if r.name == "sync_status_fetcher")
+    assert repr(urls[0]) in warning, warning
+
+
+def test_dips_info_failure_shows_a_long_url_whole(caplog, monkeypatch):
+    monkeypatch.setattr(processing, "DIPS_INFO_MAX_RETRIES", 1)
+    urls = []
+
+    async def handler(request):
+        return web.Response(status=503)
+
+    async def run(session, base_url):
+        urls.append(base_url + LONG_PATH)
+        return await processing._fetch_single_dips_info_async(
+            session, "0xLong", urls[0], asyncio.Semaphore(1)
+        )
+
+    with caplog.at_level(logging.DEBUG, logger="processing"):
+        asyncio.run(_with_server(handler, run))
+
+    message = next(r.getMessage() for r in caplog.records if "Failed to fetch" in r.getMessage())
+    assert repr(urls[0]) in message, message
+
+
 # --- The quoting itself ---------------------------------------------------------------------
 
 
@@ -199,8 +248,9 @@ LINE_BREAKING_CHARACTERS = [
 
 
 @pytest.mark.parametrize("character", LINE_BREAKING_CHARACTERS)
-def test_both_helpers_give_1_line_of_printable_ascii(character):
-    from escaping import error_for_log, for_log
+def test_every_helper_gives_1_line_of_printable_ascii(character):
+    from escaping import error_for_log, for_log, url_for_log
 
-    for text in (for_log("a" + character + "b"), error_for_log(ValueError("a" + character + "b"))):
+    value = "a" + character + "b"
+    for text in (for_log(value), url_for_log(value), error_for_log(ValueError(value))):
         assert text.isascii() and text.isprintable(), repr(text)
