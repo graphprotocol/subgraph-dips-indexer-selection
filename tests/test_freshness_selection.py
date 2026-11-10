@@ -2,6 +2,7 @@
 
 import logging
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import patch
@@ -172,6 +173,36 @@ def test_other_chains_are_unaffected(state, monkeypatch):
     _judge(state, {(BEST, CHAIN): "fail", (BEST, OTHER_CHAIN): "fail"})
 
     assert _select(chain=OTHER_CHAIN) == [BEST]
+
+
+def test_select_indexers_over_http_leaves_out_the_marked_candidate(state, monkeypatch):
+    _enforce(monkeypatch, CHAIN)
+    _judge(state, {(BEST, CHAIN): "fail", (GOOD, CHAIN): "pass", (FAIR, CHAIN): "pass"})
+
+    response = TestClient(app).post(
+        "/select-indexers",
+        json={"deployment_id": DEPLOYMENT, "chain_id": CHAIN, "num_candidates": 1},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [indexer["id"] for indexer in response.json()["indexers"]] == [GOOD]
+
+
+def test_selection_does_not_wait_for_a_push_being_applied(state, monkeypatch):
+    """A push holds the freshness lock while it records and saves, which can take seconds.
+    Selection runs on the event loop, so it must read the marks without that lock.
+    """
+    _enforce(monkeypatch, CHAIN)
+    _judge(state, {(BEST, CHAIN): "fail", (GOOD, CHAIN): "pass", (FAIR, CHAIN): "pass"})
+    pool = ThreadPoolExecutor(max_workers=1)
+
+    with state.freshness._lock:
+        selection = pool.submit(_select)
+        finished, _ = wait([selection], timeout=5)
+    pool.shutdown()
+
+    assert finished, "selection waited for the lock a push holds"
+    assert selection.result() == [GOOD]
 
 
 def test_dips_indexers_still_lists_marked_indexers(state, monkeypatch):

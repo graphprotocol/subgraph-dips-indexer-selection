@@ -323,6 +323,7 @@ class TestSavedFile:
 
         assert reloaded.snapshot() == store.snapshot()
         assert reloaded.last_minute == START + 5
+        assert reloaded.stale_indexers(CHAIN, [INDEXER, OTHER]) == {OTHER}
         # The reloaded store keeps judging from where the saved one stopped.
         reloaded.apply(START + 6, [_check("pass")], _no_save)
         store.apply(START + 6, [_check("pass")], _no_save)

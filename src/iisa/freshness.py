@@ -9,7 +9,7 @@ is a UTC day.
 
 import logging
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -211,18 +211,39 @@ def _report(pair: PairState, received: set[int], last_minute: int) -> dict[str, 
     }
 
 
+@dataclass(frozen=True)
+class _Marks:
+    """The last minute applied and, by chain, the indexers not marked there. Rebuilt after
+    each push and swapped in with 1 assignment, so selection reads it without the lock.
+    """
+
+    last_minute: Optional[int]
+    unmarked: Mapping[str, frozenset[str]]
+
+
+def _marks_of(state: FreshnessState) -> _Marks:
+    unmarked = {
+        chain: frozenset(indexer for indexer, pair in pairs.items() if not pair.marked)
+        for chain, pairs in state.chains.items()
+    }
+    return _Marks(state.last_minute, unmarked)
+
+
 class FreshnessStore:
-    """The freshness state behind a lock, since pushes and reads run on different threads."""
+    """The freshness state behind a lock, since pushes and reads run on different threads.
+    Selection reads only the marks swapped in after each push, so it never waits for a push
+    to be recorded and saved.
+    """
 
     def __init__(self, state: Optional[FreshnessState] = None) -> None:
         self._state = state if state is not None else FreshnessState()
         self._lock = threading.Lock()
+        self._marks = _marks_of(self._state)
 
     @property
     def last_minute(self) -> Optional[int]:
         """The last minute applied, or None before the first push."""
-        with self._lock:
-            return self._state.last_minute
+        return self._marks.last_minute
 
     def apply(
         self, minute: int, checks: Sequence[Check], save: Callable[[dict[str, Any]], None]
@@ -243,6 +264,7 @@ class FreshnessStore:
             state.received.add(minute)
             _prune(state, minute)
             _update_marks(state, minute)
+            self._marks = _marks_of(state)
             save(state.model_dump(mode="json"))
             return True
 
@@ -250,9 +272,8 @@ class FreshnessStore:
         """The ``indexers`` that are marked on ``chain`` or have no record there, since an
         indexer starts marked until it passes checks.
         """
-        with self._lock:
-            pairs = self._state.chains.get(chain, {})
-            return {ix for ix in indexers if (pair := pairs.get(ix.lower())) is None or pair.marked}
+        unmarked = self._marks.unmarked.get(chain, frozenset())
+        return {indexer for indexer in indexers if indexer.lower() not in unmarked}
 
     def snapshot(self, enforced: frozenset[str] = frozenset()) -> dict[str, Any]:
         """Every pair's mark, window, latest outcome and 28-day counts, by chain, with whether
