@@ -239,11 +239,26 @@ class _ErrorWithNonText(Exception):
 
 
 @pytest.mark.parametrize("error", [_ErrorWithBrokenText(), _ErrorWithNonText()])
-def test_error_whose_text_cannot_be_read_is_named_alone(error):
+def test_error_whose_text_cannot_be_read_says_so(error):
     # This runs while handling an error. Raising here would fail the fetch for every indexer.
     from escaping import error_for_log
 
-    assert error_for_log(error) == type(error).__name__
+    text = error_for_log(error)
+
+    # The line says the text was lost, so a reader knows the error had more to say.
+    assert text == f"{type(error).__name__} (its text could not be read)"
+    assert text.isascii() and text.isprintable()
+
+
+def test_unreadable_error_with_a_line_break_in_its_name_stays_on_1_line():
+    from escaping import error_for_log
+
+    renamed = type("Broken\nINFO - fake", (_ErrorWithBrokenText,), {})
+
+    text = error_for_log(renamed())
+
+    assert text.isascii() and text.isprintable(), repr(text)
+    assert text.endswith("(its text could not be read)")
 
 
 def test_missing_error_is_said_plainly():

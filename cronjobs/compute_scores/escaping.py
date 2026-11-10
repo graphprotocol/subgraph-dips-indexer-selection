@@ -46,8 +46,10 @@ def error_for_log(error: Optional[BaseException]) -> str:
         text = f"{type(error).__name__}: {error}".encode("unicode_escape").decode("ascii")
     except Exception:
         # The error's own text could not be read. This runs while another error is being
-        # handled, so raising here would replace it; the log line keeps the error's name alone.
-        return type(error).__name__
+        # handled, so raising here would replace it. The log line names the error and says its
+        # text was lost, so the gap is visible.
+        name = type(error).__name__.encode("unicode_escape").decode("ascii")
+        return f"{name} (its text could not be read)"
     if len(text) <= _MAX_LOGGED_ERROR_CHARS:
         return text
     return text[:_MAX_LOGGED_ERROR_CHARS] + "..."
