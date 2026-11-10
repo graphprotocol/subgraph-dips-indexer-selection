@@ -12,7 +12,6 @@ import json
 import logging
 import math
 import os
-import reprlib
 import socket
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -24,6 +23,8 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
+from escaping import error_for_log
+from escaping import for_log as _for_log
 from numpy.linalg import pinv
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
@@ -217,20 +218,6 @@ def _extract_dips_prices(data: dict) -> tuple:
     return min_prices, min_entity_price
 
 
-_LOG_REPR = reprlib.Repr()
-_LOG_REPR.maxlevel = 2
-_LOG_REPR.maxstring = _LOG_REPR.maxlong = _LOG_REPR.maxother = 60
-_MAX_LOGGED_CHARS = 200
-
-
-def _for_log(value: object) -> str:
-    """Quote a value an indexer sent for a log line: escaped, so a line break in it cannot start a
-    fake log line, and cut short, so a huge value cannot flood the log on every run.
-    """
-    text = _LOG_REPR.repr(value)
-    return text if len(text) <= _MAX_LOGGED_CHARS else text[:_MAX_LOGGED_CHARS] + "..."
-
-
 def _parse_price(value: object) -> Optional[float]:
     """An advertised price (JSON number or text) as a float if finite and >= 0, else None.
 
@@ -369,7 +356,10 @@ async def _fetch_single_dips_info_async(
             return _unavailable_dips_info(indexer)
         return _dips_info_record(indexer, data)
 
-    logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {last_error}")
+    logger.debug(
+        f"Failed to fetch /dips/info from {_for_log(url)} for indexer {indexer}: "
+        f"{error_for_log(last_error)}"
+    )
     return _unavailable_dips_info(indexer)
 
 
@@ -512,7 +502,8 @@ async def _fetch_single_graph_node_version_async(
             await asyncio.sleep(delay)
 
     logger.debug(
-        f"Failed to fetch graph-node version from {url} for indexer {indexer}: {last_error}"
+        f"Failed to fetch graph-node version from {_for_log(url)} for indexer {indexer}: "
+        f"{error_for_log(last_error)}"
     )
     return {"indexer": indexer, "graph_node_version": None, "graph_node_commit": None}
 
@@ -692,7 +683,7 @@ def filter_by_min_graph_node_version(
     for row in dropped.itertuples(index=False):
         logger.debug(
             "Excluding indexer below graph-node minimum: "
-            f"indexer={row.indexer} reported={row.graph_node_version} "
+            f"indexer={row.indexer} reported={_for_log(row.graph_node_version)} "
             f"minimum={min_version} strict={strict}"
         )
 
@@ -1165,7 +1156,7 @@ def resolve_url_geoip(url: str) -> dict:
         return lookup_geoip(ip_addr)
 
     except Exception as e:
-        logger.warning(f"GeoIP resolution failed for {url}: {e}")
+        logger.warning(f"GeoIP resolution failed for {_for_log(url)}: {error_for_log(e)}")
         return _empty_geoip_result()
 
 
