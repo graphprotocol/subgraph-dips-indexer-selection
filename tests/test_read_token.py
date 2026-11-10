@@ -9,6 +9,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from iisa import iisa_http_endpoints, score_loader
@@ -150,6 +151,60 @@ def test_without_a_read_token_the_push_token_does_everything(tokens, method, pat
 def test_without_any_token_nothing_is_checked(tokens, method, path, body):
     # Local development only; the service warns about it at startup.
     tokens()
+
+    assert _call(method, path, body, None).status_code == 200
+
+
+# --- An empty read token, and only a read token -------------------------------------------
+
+
+def _call_with_header(method, path, body, authorization: bytes):
+    client = TestClient(app, raise_server_exceptions=False)
+    return client.request(method, path, json=body, headers={"Authorization": authorization})
+
+
+# Bearer tokens that are empty once stripped, so each would match a configured token that is empty.
+EMPTY_BEARERS = [
+    pytest.param(b"Bearer ", id="empty"),
+    pytest.param(b"Bearer    ", id="spaces"),
+]
+
+
+@pytest.mark.parametrize("authorization", EMPTY_BEARERS)
+@pytest.mark.parametrize(("method", "path", "body"), READS + WRITES)
+def test_an_empty_read_token_counts_as_unset(tokens, method, path, body, authorization):
+    # A secret with an empty value sets the variable to "", which must not let an empty bearer in.
+    tokens(push=PUSH_TOKEN, read="")
+
+    assert _call_with_header(method, path, body, authorization).status_code == 401
+    assert _call(method, path, body, PUSH_TOKEN).status_code == 200
+
+
+@pytest.mark.parametrize("check", ["_require_read_token", "_require_push_token"])
+def test_a_bearer_of_only_a_non_breaking_space_is_refused(tokens, check):
+    # 0xA0 is a non-breaking space, which Python's strip removes too. The test client cannot send a
+    # lone 0xA0 byte, so this hands each check the header as the server does: bytes read as Latin-1.
+    tokens(push=PUSH_TOKEN, read="")
+
+    with pytest.raises(HTTPException) as refused:
+        getattr(iisa_http_endpoints, check)(b"Bearer \xa0".decode("latin-1"))
+
+    assert refused.value.status_code == 401
+
+
+@pytest.mark.parametrize(("method", "path", "body"), READS)
+def test_with_only_a_read_token_the_reads_need_it(tokens, method, path, body):
+    tokens(read=READ_TOKEN)
+
+    assert _call(method, path, body, READ_TOKEN).status_code == 200
+    assert _call(method, path, body, None).status_code == 401
+    assert _call(method, path, body, "not-the-read-token").status_code == 401
+
+
+@pytest.mark.parametrize(("method", "path", "body"), WRITES)
+def test_with_only_a_read_token_the_pushes_stay_open(tokens, method, path, body):
+    # As with no token at all, for local development; the service warns about it at startup.
+    tokens(read=READ_TOKEN)
 
     assert _call(method, path, body, None).status_code == 200
 
