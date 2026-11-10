@@ -177,27 +177,8 @@ class IndexerSelector:
         """
         Process data by normalizing metrics and calculating weighted scores.
         """
-        # Add dipper's expected fees from accepted agreements to the query fees
-        # before normalisation, so stake_to_fees can tell indexers apart even
-        # before on-chain payment claims appear.
         if self.optimistic_dips_fees and "total_query_fees" in self.data.columns:
-            dips_adjustment = self.data["indexer"].map(self.optimistic_dips_fees).fillna(0.0)
-            effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
-
-            if "last_known_slashable_stake" in self.data.columns:
-                self.data["stake_to_fees"] = self.data[
-                    "last_known_slashable_stake"
-                ] / effective_fees.replace(0.0, float("nan"))
-                # Drop pre-normalised column so _normalize_metrics recomputes it
-                self.data = self.data.drop(columns=["norm_stake_to_fees"], errors="ignore")
-
-            adjusted_count = (dips_adjustment > 0).sum()
-            logger.info(
-                "deployment=%s applied optimistic DIPs fees to %d/%d indexers",
-                self.deployment_id,
-                adjusted_count,
-                len(self.data),
-            )
+            self._apply_optimistic_dips_fees(self.optimistic_dips_fees)
 
         # Get the current group of indexers for the subgraph using '_get_current_group'
         self.current_group = self._get_current_group()
@@ -225,6 +206,41 @@ class IndexerSelector:
 
         # Call _assign_indexers_to_subgraph to assign/replace/remove an indexer on the subgraph.
         self._assign_indexers_to_subgraph()
+
+    def _apply_optimistic_dips_fees(self, fees: dict[str, float]) -> None:
+        """Add dipper's expected fees from accepted agreements to the query fees and recompute
+        stake_to_fees, so it can tell indexers apart before on-chain payment claims appear.
+
+        With no slashable stake anywhere there is nothing to divide the fees into: each indexer
+        holding fees would get a ratio of 0 and every other one the best score, so the scores
+        the snapshot carries are kept. The score job's fallback sends stake and query fees of 0
+        with a neutral 0.5, and its full run sends both as 0 when it cannot read stake.
+        """
+        dips_adjustment = self.data["indexer"].map(fees).fillna(0.0)
+        adjusted_count = (dips_adjustment > 0).sum()
+
+        if not _carries_stake(self.data):
+            logger.info(
+                "deployment=%s left optimistic DIPs fees for %d/%d indexers out of "
+                "stake_to_fees: no indexer has slashable stake to weigh them against",
+                self.deployment_id,
+                adjusted_count,
+                len(self.data),
+            )
+            return
+
+        effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
+        self.data["stake_to_fees"] = self.data[
+            "last_known_slashable_stake"
+        ] / effective_fees.replace(0.0, float("nan"))
+        # Drop pre-normalised column so _normalize_metrics recomputes it
+        self.data = self.data.drop(columns=["norm_stake_to_fees"], errors="ignore")
+        logger.info(
+            "deployment=%s applied optimistic DIPs fees to %d/%d indexers",
+            self.deployment_id,
+            adjusted_count,
+            len(self.data),
+        )
 
     def _get_current_group(self):
         """
@@ -650,6 +666,14 @@ class IndexerSelector:
             group_has_synced,
         )
         return [("synced", synced), ("unsynced", unsynced)]
+
+
+def _carries_stake(data: pd.DataFrame) -> bool:
+    """Whether any indexer has slashable stake above 0 to divide its fees into."""
+    if "last_known_slashable_stake" not in data.columns:
+        return False
+    stake, _ = read_metric(data, "last_known_slashable_stake")
+    return bool((stake > 0).any())
 
 
 # Norm columns the CronJob ships already normalised and the selector keeps: latency, and
