@@ -79,7 +79,10 @@ def test_fetcher_failed_fetch_warning_keeps_the_url_on_1_line(caplog, monkeypatc
     _assert_on_1_line(caplog, "sync_status_fetcher", logging.WARNING)
 
 
-def test_fetcher_warning_keeps_an_error_repeating_the_url_on_1_line(caplog):
+def test_fetcher_warning_keeps_an_error_repeating_the_url_on_1_line(caplog, monkeypatch):
+    # 1 attempt, as in the other tests, so the test never waits between retries.
+    monkeypatch.setattr(sync_status_fetcher, "MAX_RETRIES", 1)
+
     async def run():
         async with aiohttp.ClientSession() as session:
             return await sync_status_fetcher._fetch_single_status(
