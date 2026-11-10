@@ -89,10 +89,32 @@ def test_the_bar_itself_still_passes(age, outcome):
     assert judgement.outcome == outcome
 
 
-def test_a_block_from_the_future_counts_as_0_seconds_old():
-    judgement = _judge(_answer({"number": 5, "timestamp": int(NOW) + 30}), attested=True)
+@pytest.mark.parametrize("ahead", [30, 60])
+def test_a_block_up_to_60_seconds_in_the_future_counts_as_0_seconds_old(ahead):
+    judgement = _judge(_answer({"number": 5, "timestamp": int(NOW) + ahead}), attested=True)
 
     assert (judgement.outcome, judgement.age_seconds) == (PASS, 0.0)
+
+
+def test_a_block_dated_further_in_the_future_fails_as_indexer_error():
+    judgement = _judge(_answer({"number": 5, "timestamp": int(NOW) + 61}), attested=True)
+
+    assert (judgement.outcome, judgement.reason) == (FAIL, "indexer_error")
+    assert "in the future" in judgement.detail
+    assert judgement.age_seconds is None
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [10**400, 2**63, 253_402_300_800, -1, 1_794_345_600.5],
+    ids=["huge", "2^63", "after-9999", "negative", "fractional"],
+)
+def test_a_timestamp_that_isnt_a_unix_time_in_seconds_fails_without_an_exception(timestamp):
+    """A number too big for a float once broke the check with an exception, voiding it."""
+    judgement = _judge(_answer({"number": 5, "timestamp": timestamp}), attested=True)
+
+    assert (judgement.outcome, judgement.reason) == (FAIL, "indexer_error")
+    assert judgement.age_seconds is None
 
 
 def test_signed_block_without_a_timestamp_fails_as_no_timestamp():

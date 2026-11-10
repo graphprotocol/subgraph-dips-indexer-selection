@@ -9,7 +9,6 @@ are the ones the service's POST /freshness accepts.
 from __future__ import annotations
 
 import json
-import math
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -39,6 +38,11 @@ NOT_SENT = "not_sent"
 ATTESTATION_HEADER = "graph-attestation"
 
 DETAIL_LIMIT = 300
+# A block dated up to this long after its answer arrived counts as 0 seconds old, allowing for
+# clocks that disagree a little; any later and the timestamp can't be trusted.
+FUTURE_TOLERANCE_SECONDS = 60
+# The last second a timestamp can name and still be a date (9999-12-31T23:59:59Z).
+_MAX_BLOCK_TIMESTAMP = 253_402_300_799
 CHAIN_NAME_LIMIT = 64
 # POST /freshness accepts at most this many outcomes in 1 minute.
 MAX_PAIRS = 50_000
@@ -186,8 +190,12 @@ def _first_error_message(parsed: object) -> Optional[str]:
     return message if isinstance(message, str) else None
 
 
-def _is_finite_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+def _is_unix_seconds(value: object) -> TypeGuard[int]:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= _MAX_BLOCK_TIMESTAMP
+    )
 
 
 def judge_indexer_answer(body: bytes, arrived_at: float, bar_seconds: float) -> Judgement:
@@ -203,10 +211,15 @@ def judge_indexer_answer(body: bytes, arrived_at: float, bar_seconds: float) -> 
         # graph-node leaves the timestamp out once the block has left its block store, which
         # only happens when the subgraph is far behind.
         return Judgement(FAIL, NO_TIMESTAMP, attested=True)
-    if not _is_finite_number(timestamp):
-        return Judgement(FAIL, INDEXER_ERROR, "block timestamp is not a number", attested=True)
+    if not _is_unix_seconds(timestamp):
+        detail = "block timestamp is not a unix time in seconds"
+        return Judgement(FAIL, INDEXER_ERROR, detail, attested=True)
+    ahead = timestamp - arrived_at
+    if ahead > FUTURE_TOLERANCE_SECONDS:
+        detail = f"block is dated {ahead:.0f}s in the future"
+        return Judgement(FAIL, INDEXER_ERROR, detail, attested=True)
 
-    age = round(max(0.0, arrived_at - float(timestamp)), 3)
+    age = round(max(0.0, arrived_at - timestamp), 3)
     if age <= bar_seconds:
         return Judgement(PASS, age_seconds=age, attested=True)
     return Judgement(FAIL, STALE, age_seconds=age, attested=True)
