@@ -31,8 +31,16 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .freshness import Check, FreshnessStore, load_state, minute_index, minute_text
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
@@ -74,6 +82,9 @@ class Settings(BaseSettings):
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
     freshness_file_path: str = "/app/scores/freshness.json"
+    # Chains, comma-separated, on which an indexer marked stale isn't picked for new
+    # agreements. Elsewhere the mark is only recorded and reported.
+    freshness_enforced_chains: Annotated[frozenset[str], NoDecode] = frozenset()
     # Bearer token required on every endpoint except /health and /select-indexers.
     # When unset, those endpoints accept unauthenticated requests and a WARNING
     # is logged at startup — local dev convenience only.
@@ -82,6 +93,13 @@ class Settings(BaseSettings):
     # misconfigured Secret is caught at rollout rather than leaving production
     # iisa accepting unauthenticated pushes. Default off for compose/local dev.
     require_push_token: bool = False
+
+    @field_validator("freshness_enforced_chains", mode="before")
+    @classmethod
+    def _split_chains(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return frozenset(chain.strip() for chain in value.split(",") if chain.strip())
+        return value
 
 
 @lru_cache
@@ -374,8 +392,11 @@ class FreshnessPair(BaseModel):
 
 
 class FreshnessChain(BaseModel):
-    """Freshness on 1 chain, by indexer."""
+    """Freshness on 1 chain, by indexer. On an enforced chain a marked indexer isn't picked
+    for new agreements.
+    """
 
+    enforced: bool = False
     indexers: dict[str, FreshnessPair] = {}
 
 
@@ -1164,7 +1185,8 @@ def freshness_report(
 ) -> FreshnessResponse:
     """Each indexer's stale mark, last 10 minutes, latest outcome and 28-day counts, by chain."""
     _require_push_token(authorization)
-    return FreshnessResponse.model_validate(_state.freshness.snapshot())
+    enforced = get_settings().freshness_enforced_chains
+    return FreshnessResponse.model_validate(_state.freshness.snapshot(enforced))
 
 
 @app.post("/get-score", response_model=ScoreResponse, responses=_documented_errors(400, 401, 503))
@@ -1737,6 +1759,48 @@ def _without_failing_members(history: pd.DataFrame, request: SelectionRequest) -
     return request.model_copy(update={"existing_indexers": kept})
 
 
+def _stale_candidates(request: SelectionRequest, candidates: pd.DataFrame) -> list[str]:
+    """Candidates marked stale on the request's chain, or with no freshness record there, when
+    that chain is enforced. Group members are never listed: a stale member keeps its place and
+    still counts towards each metric's scale, as members do on a chain that isn't enforced.
+    """
+    if request.chain_id not in get_settings().freshness_enforced_chains:
+        return []
+    if _state.freshness.last_minute is None:
+        logger.warning(
+            "deployment=%s chain=%s enforces freshness but no freshness push has been applied, "
+            "so no indexer can be picked there until checks arrive",
+            request.deployment_id,
+            request.chain_id,
+        )
+    members = {member.lower() for member in request.existing_indexers or []}
+    ids = [ix for ix in candidates.get("indexer", pd.Series(dtype=object)) if isinstance(ix, str)]
+    pickable = [ix for ix in ids if ix.lower() not in members]
+    stale = sorted(_state.freshness.stale_indexers(request.chain_id, pickable))
+    logger.info(
+        "deployment=%s chain=%s left out %d of %d candidates as stale",
+        request.deployment_id,
+        request.chain_id,
+        len(stale),
+        len(pickable),
+    )
+    return stale
+
+
+def _without_stale_candidates(
+    request: SelectionRequest, candidates: pd.DataFrame
+) -> SelectionRequest:
+    """The request with its stale candidates added to the indexers that declined its
+    deployment, which keeps them from being picked and from setting each metric's scale.
+    """
+    stale = _stale_candidates(request, candidates)
+    if not stale:
+        return request
+    declined = dict(request.declined_indexers or {})
+    declined[request.deployment_id] = [*declined.get(request.deployment_id, []), *stale]
+    return request.model_copy(update={"declined_indexers": declined})
+
+
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """Run IndexerSelector and return a SelectionResponse for the deployment.
 
@@ -1762,6 +1826,7 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
     # Enrich with chain-specific price columns for normalization
     enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
+    request = _without_stale_candidates(request, enriched_history)
     synced_indexers = _synced_indexers_for(request.deployment_id)
     processor = _build_selector(request, enriched_history, synced_indexers)
     _log_selection_reasoning(processor, request.deployment_id)

@@ -9,7 +9,7 @@ is a UTC day.
 
 import logging
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -241,23 +241,35 @@ class FreshnessStore:
             save(state.model_dump(mode="json"))
             return True
 
-    def snapshot(self) -> dict[str, Any]:
-        """Every pair's mark, window, latest outcome and 28-day counts, by chain."""
+    def stale_indexers(self, chain: str, indexers: Iterable[str]) -> set[str]:
+        """The ``indexers`` that are marked on ``chain`` or have no record there, since an
+        indexer starts marked until it passes checks.
+        """
+        with self._lock:
+            pairs = self._state.chains.get(chain, {})
+            return {ix for ix in indexers if (pair := pairs.get(ix.lower())) is None or pair.marked}
+
+    def snapshot(self, enforced: frozenset[str] = frozenset()) -> dict[str, Any]:
+        """Every pair's mark, window, latest outcome and 28-day counts, by chain, with whether
+        each chain is in ``enforced``. An enforced chain is listed even with no indexers.
+        """
         with self._lock:
             state = self._state
-            if state.last_minute is None:
-                return {"last_minute": None, "chains": {}}
             last_minute = state.last_minute
-            chains = {
-                chain: {
-                    "indexers": {
+            reports: dict[str, dict[str, Any]] = {chain: {} for chain in sorted(enforced)}
+            if last_minute is not None:
+                for chain, pairs in state.chains.items():
+                    reports[chain] = {
                         indexer: _report(pair, state.received, last_minute)
                         for indexer, pair in pairs.items()
                     }
-                }
-                for chain, pairs in state.chains.items()
+            return {
+                "last_minute": minute_text(last_minute) if last_minute is not None else None,
+                "chains": {
+                    chain: {"enforced": chain in enforced, "indexers": indexers}
+                    for chain, indexers in reports.items()
+                },
             }
-            return {"last_minute": minute_text(last_minute), "chains": chains}
 
 
 def load_state(path: str) -> FreshnessState:

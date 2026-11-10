@@ -134,14 +134,16 @@ _seeded: dict[str, Any] = {}
 
 def _seed_state() -> None:
     """Replace the app's state with a fresh one holding the seeded scores, sync status and
-    freshness, the last pushed a few minutes ago so that a later minute can still be pushed.
+    5 minutes of freshness, enough to judge each indexer checked. The last minute is a few
+    minutes ago, so a later minute can still be pushed.
     """
     state = IISAState()
     state.initialize(Settings())
     state.load_scores_from_records(copy.deepcopy(SCORE_RECORDS))
     state.load_sync_status_from_dict(_sync_status_payload())
     freshness_minute = minute_index(datetime.now(timezone.utc)) - 3
-    state.apply_freshness(_freshness_push(freshness_minute))
+    for minute in range(freshness_minute - 4, freshness_minute + 1):
+        state.apply_freshness(_freshness_push(minute))
     iisa_http_endpoints._state = state
     _seeded.update(
         state=state,
@@ -169,8 +171,8 @@ def _start_from_seeded_state() -> None:
 
 @pytest.fixture(scope="module")
 def app_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
-    """The push token and cache paths the app reads, set for the whole module, with the cache
-    files in a temporary folder. Puts the app's state back afterwards.
+    """The push token, cache paths and freshness-enforced chain the app reads, set for the
+    whole module, with the cache files in a temporary folder. Puts the app's state back after.
     """
     cache_dir = tmp_path_factory.mktemp("iisa-cache")
     with pytest.MonkeyPatch.context() as mp:
@@ -178,6 +180,7 @@ def app_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
         mp.delenv("IISA_REQUIRE_PUSH_TOKEN", raising=False)
         mp.setenv("IISA_SYNC_STATUS_FILE_PATH", str(cache_dir / "sync_status.json"))
         mp.setenv("IISA_FRESHNESS_FILE_PATH", str(cache_dir / "freshness.json"))
+        mp.setenv("IISA_FRESHNESS_ENFORCED_CHAINS", CHAIN)
         mp.setattr(score_loader, "SCORES_FILE_PATH", str(cache_dir / "indexer_scores.json"))
         iisa_http_endpoints.get_settings.cache_clear()
         try:

@@ -166,6 +166,34 @@ class TestStaleMark:
         assert _pair(store, chain=OTHER_CHAIN)["marked"] is True
 
 
+class TestStaleIndexers:
+    def test_marked_and_unrecorded_indexers_are_stale(self):
+        store = FreshnessStore()
+        _run(store, ["fail"] * 5)
+        unknown = "0x" + "c3" * 20
+
+        assert store.stale_indexers(CHAIN, [INDEXER, OTHER, unknown]) == {INDEXER, unknown}
+        assert store.stale_indexers(OTHER_CHAIN, [OTHER]) == {OTHER}
+
+    def test_indexers_are_looked_up_in_lower_case(self):
+        store = FreshnessStore()
+        _run(store, ["pass"] * 5)
+
+        assert store.stale_indexers(CHAIN, [INDEXER.upper().replace("0X", "0x")]) == set()
+
+    def test_snapshot_lists_enforced_chains_even_without_indexers(self):
+        store = FreshnessStore()
+        _push(store, START, _check("pass"))
+
+        chains = store.snapshot(frozenset({"amoy"}))["chains"]
+
+        assert {chain: body["enforced"] for chain, body in chains.items()} == {
+            "amoy": True,
+            CHAIN: False,
+        }
+        assert chains["amoy"]["indexers"] == {}
+
+
 class TestPushes:
     def test_repeated_or_older_minute_is_ignored(self):
         saves: list[dict[str, Any]] = []
