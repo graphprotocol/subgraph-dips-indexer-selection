@@ -156,7 +156,26 @@ def test_error_text_is_escaped_named_and_cut_short():
 
     assert "\n" not in text
     assert text.startswith("ValueError: bad\\nINFO")
-    assert len(text) < 300
+    assert len(text) < 600
+
+
+def test_error_text_of_300_characters_keeps_its_last_words():
+    # Certificate errors run to about 300 characters and give the reason, such as an expired
+    # certificate, at the very end.
+    from escaping import error_for_log
+
+    text = error_for_log(OSError("x" * 280 + " certificate has expired"))
+
+    assert text.endswith(" certificate has expired")
+
+
+def test_error_text_of_600_characters_is_cut():
+    from escaping import error_for_log
+
+    text = error_for_log(OSError("x" * 580 + " certificate has expired"))
+
+    assert "certificate has expired" not in text
+    assert text.endswith("...")
 
 
 def test_missing_error_is_said_plainly():
