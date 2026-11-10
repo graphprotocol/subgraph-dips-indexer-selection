@@ -13,6 +13,7 @@ from pathlib import Path
 
 import aiohttp
 import pandas as pd
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
@@ -182,3 +183,24 @@ def test_missing_error_is_said_plainly():
     from escaping import error_for_log
 
     assert error_for_log(None) == "no error recorded"
+
+
+# Characters that end a line, move the cursor or flip text direction in a terminal or log viewer,
+# besides the line feed every other test uses.
+LINE_BREAKING_CHARACTERS = [
+    pytest.param("\r", id="carriage-return"),
+    pytest.param("\x1b", id="escape"),
+    pytest.param("\x85", id="next-line"),
+    pytest.param("\u2028", id="line-separator"),
+    pytest.param("\u2029", id="paragraph-separator"),
+    pytest.param("\u202e", id="right-to-left-override"),
+    pytest.param("\ud800", id="lone-surrogate"),
+]
+
+
+@pytest.mark.parametrize("character", LINE_BREAKING_CHARACTERS)
+def test_both_helpers_give_1_line_of_printable_ascii(character):
+    from escaping import error_for_log, for_log
+
+    for text in (for_log("a" + character + "b"), error_for_log(ValueError("a" + character + "b"))):
+        assert text.isascii() and text.isprintable(), repr(text)
