@@ -1,7 +1,5 @@
-"""
-IISA HTTP API - FastAPI endpoints for the Indexing Indexer Selection Algorithm.
-
-This module exposes the indexer-selection HTTP endpoints the dipper-iisa Rust client calls.
+"""IISA HTTP API - FastAPI endpoints for the Indexing Indexer Selection Algorithm, which the
+dipper-iisa Rust client calls.
 
 Endpoints:
 - GET /health - Health check, reports if data is loaded
@@ -11,8 +9,7 @@ Endpoints:
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (bearer-auth)
 - GET /dips-indexers - Indexers selection would pick for a required ?chain (bearer-auth)
 - POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
-- POST /freshness - Push 1 minute of freshness check outcomes from the prober (bearer-auth)
-- GET /freshness - Each indexer's stale mark and freshness counts by chain (bearer-auth)
+- POST, GET /freshness - Push 1 minute of freshness outcomes; read the stale marks (bearer-auth)
 - POST /get-score - Return weighted score and components for one indexer (bearer-auth)
 - POST /select-indexers - Select optimal indexers for a deployment
 """
