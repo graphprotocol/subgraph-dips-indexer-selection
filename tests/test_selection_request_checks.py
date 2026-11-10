@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from iisa import iisa_http_endpoints, score_loader
-from iisa.iisa_http_endpoints import app
+from iisa.iisa_http_endpoints import MAX_SELECTION_BODY_BYTES, _SelectionBodyLimit, app
 
 CHAIN = "arbitrum-one"
 INDEXERS = ["0x" + "a1" * 20, "0x" + "b2" * 20, "0x" + "c3" * 20]
@@ -208,7 +208,7 @@ def test_a_hostile_body_gets_a_short_refusal(fields):
 TOO_LARGE = b'{"padding": "' + b"x" * (4 * 1024 * 1024) + b'"}'
 
 
-def test_a_body_declared_over_the_limit_is_refused_unread():
+def test_a_body_declared_over_the_limit_is_refused():
     response = TestClient(app, raise_server_exceptions=False).post(
         "/select-indexers", content=TOO_LARGE, headers={"Content-Type": "application/json"}
     )
@@ -227,6 +227,100 @@ def test_a_body_with_no_declared_length_is_refused_once_over_the_limit():
     )
 
     assert response.status_code == 413
+
+
+# The test client hands the app a whole body as 1 piece. A real server hands over a large body
+# in many, so these drive the limit directly with a stand-in for the server and the route.
+
+PIECE = 64 * 1024
+
+
+async def _through_the_limit(pieces, declared_length=None, path="/select-indexers"):
+    """Send the pieces through the limit to a stand-in route.
+
+    Returns the answer's status, the body the route read (None if it never ran), and how many
+    times the limit or the route asked the server for more of the body.
+    """
+    messages = [
+        {"type": "http.request", "body": piece, "more_body": i < len(pieces) - 1}
+        for i, piece in enumerate(pieces)
+    ]
+    asked = 0
+    sent = []
+    read_by_route = []
+
+    async def receive():
+        nonlocal asked
+        asked += 1
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    async def route(scope, receive, send):
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+        read_by_route.append(body)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    headers = [(b"content-type", b"application/json")]
+    if declared_length is not None:
+        headers.append((b"content-length", str(declared_length).encode()))
+    scope = {"type": "http", "method": "POST", "path": path, "headers": headers}
+    await _SelectionBodyLimit(route)(scope, receive, send)
+    return sent[0]["status"], (read_by_route[0] if read_by_route else None), asked
+
+
+def _pieces(total):
+    body = bytes(i % 251 for i in range(total))
+    return [body[start : start + PIECE] for start in range(0, total, PIECE)]
+
+
+@pytest.mark.parametrize("declare", [False, True], ids=["no-declared-length", "declared-length"])
+async def test_a_body_in_many_pieces_under_the_limit_reaches_the_route_whole(declare):
+    pieces = _pieces(MAX_SELECTION_BODY_BYTES - 1_000)
+    body = b"".join(pieces)
+
+    status, read, asked = await _through_the_limit(pieces, len(body) if declare else None)
+
+    assert status == 200
+    assert read == body
+    # Each piece asked for once; the route then reads the whole body in 1 go.
+    assert asked == len(pieces)
+
+
+async def test_a_body_in_many_pieces_over_the_limit_is_refused_at_the_first_piece_past_it():
+    pieces = _pieces(MAX_SELECTION_BODY_BYTES + 3 * PIECE)
+
+    status, read, asked = await _through_the_limit(pieces)
+
+    assert status == 413
+    assert read is None
+    assert asked == MAX_SELECTION_BODY_BYTES // PIECE + 1
+
+
+async def test_a_body_declared_over_the_limit_is_refused_without_reading_any_of_it():
+    pieces = _pieces(MAX_SELECTION_BODY_BYTES + 3 * PIECE)
+
+    status, read, asked = await _through_the_limit(pieces, sum(map(len, pieces)))
+
+    assert status == 413
+    assert read is None
+    assert asked == 0
+
+
+async def test_other_routes_pass_through_untouched():
+    pieces = _pieces(MAX_SELECTION_BODY_BYTES + 3 * PIECE)
+
+    status, read, _ = await _through_the_limit(pieces, sum(map(len, pieces)), path="/scores")
+
+    assert status == 200
+    assert read == b"".join(pieces)
 
 
 def test_the_scores_push_is_not_held_to_the_selection_body_limit():
