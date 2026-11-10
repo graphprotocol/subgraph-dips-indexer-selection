@@ -14,21 +14,26 @@ from pathlib import Path
 
 import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
+import processing  # noqa: E402
 from processing import _fetch_single_graph_node_version_async  # noqa: E402
 
 
 class _FakeContent:
-    """Mimics `aiohttp.ClientResponse.content.read(n)` for size-capped reads."""
+    """Mimics `aiohttp.ClientResponse.content.read(n)`: each read returns the next part of the
+    body, at most `n` bytes of it, and an empty read means the body has ended."""
 
     def __init__(self, body_bytes: bytes):
         self._body = body_bytes
 
     async def read(self, n: int) -> bytes:
-        return self._body[:n]
+        piece, self._body = self._body[:n], self._body[n:]
+        return piece
 
 
 class _FakeRequestInfo:
@@ -40,6 +45,9 @@ class _FakeRequestInfo:
 
 
 class _FakeResponse:
+    # No declared length, so the size limit is enforced by counting what arrives.
+    content_length = None
+
     def __init__(self, body, status=200, oversize_bytes: int = 0):
         # body is a Python dict — encode once and store. oversize_bytes lets a
         # test simulate a response that exceeds the configured cap so the
@@ -86,6 +94,8 @@ class _HtmlResponse:
     """Stub that returns raw non-JSON bytes from `content.read`. Used to
     cover the malformed-body branch: aiohttp itself is happy with the
     response (2xx, valid framing), only `json.loads` rejects the body."""
+
+    content_length = None
 
     def __init__(self, body_bytes: bytes = b"<html>Bad Gateway</html>", status: int = 200):
         self.content = _FakeContent(body_bytes)
@@ -332,8 +342,10 @@ def test_fetch_oversized_response_returns_unknown(semaphore, monkeypatch):
         )
     )
 
-    # Assert — overflow triggered the failure path, all retries consumed.
+    # Assert — overflow triggered the failure path. The same indexer would send the same
+    # oversized reply again, so it is asked only once.
     assert result["graph_node_version"] is None
+    assert len(session.calls) == 1
 
 
 def test_fetch_5xx_retries_then_succeeds(semaphore, monkeypatch):
@@ -459,3 +471,46 @@ def test_fetch_handles_top_level_array_body(semaphore):
     # Assert — shape mismatch handled cleanly, all-None record.
     assert result["graph_node_version"] is None
     assert result["graph_node_commit"] is None
+
+
+# --- Reading the whole reply when it arrives in more than 1 piece ---------------------------
+#
+# A proxy that streams, or a slow link, can deliver an honest reply in several pieces. Reading
+# only the first piece left the rest unread, so the version failed to parse and was recorded as
+# unknown. These tests serve the reply from a local aiohttp server so the real reading runs.
+
+
+@pytest.mark.parametrize(
+    "declare_length", [True, False], ids=["declared-length", "no-declared-length"]
+)
+def test_reply_sent_in_2_pieces_is_read_whole(declare_length, monkeypatch):
+    # 1 attempt only, so a first read that comes back short cannot be rescued by a retry.
+    monkeypatch.setattr(processing, "GRAPH_NODE_VERSION_MAX_RETRIES", 1)
+    body = json_module.dumps({"data": {"version": {"version": "0.36.0", "commit": "abc"}}}).encode()
+
+    async def handler(request):
+        resp = web.StreamResponse(headers={"Content-Type": "application/json"})
+        if declare_length:
+            resp.content_length = len(body)
+        await resp.prepare(request)
+        await resp.write(body[:20])
+        await asyncio.sleep(0.2)
+        await resp.write(body[20:])
+        await resp.write_eof()
+        return resp
+
+    async def run():
+        app = web.Application()
+        app.router.add_post("/status", handler)
+        async with TestServer(app) as server, aiohttp.ClientSession() as session:
+            return await _fetch_single_graph_node_version_async(
+                session, "0xpieces", str(server.make_url("/")), asyncio.Semaphore(1)
+            )
+
+    result = _run(run())
+
+    assert result == {
+        "indexer": "0xpieces",
+        "graph_node_version": "0.36.0",
+        "graph_node_commit": "abc",
+    }

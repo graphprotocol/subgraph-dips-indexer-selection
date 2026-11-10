@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     import aiohttp
 
 from iisa_client import IISAPushError, get_push_token, post_sync_status
+from reply_body import read_reply_body
 from subgraph import discover_indexers_from_network_subgraph, subgraph_url_problem
 
 logging.basicConfig(
@@ -41,6 +42,10 @@ MAX_RETRIES = int(os.environ.get("SYNC_STATUS_MAX_RETRIES", "5"))
 RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MULTIPLIER", "1"))
 RETRY_BACKOFF_MAX = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MAX", "5"))
 HTTP_PORT = int(os.environ.get("SYNC_STATUS_HTTP_PORT", "9091"))
+# Byte limit on 1 indexer's /status reply. It lists every deployment the indexer has, about 100
+# bytes each, and large indexers have several thousand, so the limit leaves plenty of room while
+# stopping a huge or never-ending reply from running the fetcher out of memory.
+MAX_RESPONSE_BYTES = int(os.environ.get("SYNC_STATUS_MAX_RESPONSE_BYTES", str(16 * 1024 * 1024)))
 # Unhealthy once 2 cycles in a row fail to push. The extra half interval leaves room for the
 # cycles' own run time, so 1 failed cycle followed by a slow good one stays healthy.
 MAX_PUSH_AGE = int(os.environ.get("SYNC_STATUS_MAX_PUSH_AGE", str(FETCH_INTERVAL * 5 // 2)))
@@ -107,7 +112,7 @@ async def _fetch_single_status(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                return await resp.json()
+                return json.loads(await read_reply_body(resp, MAX_RESPONSE_BYTES))
 
     last_error: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
@@ -117,7 +122,8 @@ async def _fetch_single_status(
                 "deployments": _synced_deployments(await do_fetch()),
             }
         except ValueError as e:
-            # Unparseable JSON or the wrong shape won't change on a retry; skip this indexer only.
+            # Unparseable JSON, a reply over the size limit or the wrong shape won't change on a
+            # retry; skip this indexer only.
             logger.warning("Malformed /status reply from %s (%s): %s", indexer[:10], url, e)
             return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
