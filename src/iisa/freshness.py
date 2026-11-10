@@ -84,6 +84,8 @@ class PairState(BaseModel):
 
     # A pair starts marked, so an indexer has to pass checks before it can win agreements.
     marked: bool = True
+    # The minute of the pair's first recorded outcome.
+    first_minute: int
     # Set by the pair's first pass or fail. Until then its no_evidence minutes aren't counted.
     counting: bool = False
     # Outcome by minute, for the minutes in the current window only.
@@ -108,12 +110,15 @@ def _window(pair: PairState, received: set[int], last_minute: int) -> tuple[int,
     """(passed, counted) over the WINDOW_MINUTES clock minutes ending at ``last_minute``.
 
     A minute the service never received is void, and so is a void outcome. A received minute
-    with no outcome for the pair counts as not passed, so silence never clears a mark.
+    with no outcome for the pair counts as not passed before the pair's first outcome, so a
+    newcomer earns its place, and is void after it, so a short push marks nobody it leaves out.
     """
     passed = counted = 0
     for minute in range(last_minute - WINDOW_MINUTES + 1, last_minute + 1):
         outcome = pair.minutes.get(minute)
         if minute not in received or outcome == "void":
+            continue
+        if outcome is None and minute >= pair.first_minute:
             continue
         counted += 1
         if outcome == "pass":
@@ -146,7 +151,7 @@ def _record(state: FreshnessState, minute: int, check: Check) -> None:
     pairs = state.chains.setdefault(check.chain, {})
     pair = pairs.get(check.indexer)
     if pair is None:
-        pair = pairs[check.indexer] = PairState(last=last)
+        pair = pairs[check.indexer] = PairState(first_minute=minute, last=last)
     else:
         pair.last = last
     pair.minutes[minute] = check.outcome

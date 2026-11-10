@@ -103,13 +103,40 @@ class TestStaleMark:
         assert marks == [True, True, True, True, False]
         assert _pair(store)["window_passed"] == 5
 
-    def test_pair_the_prober_stops_checking_becomes_marked(self):
+    @pytest.mark.parametrize(("history", "marked"), [("pass", False), ("fail", True)])
+    def test_empty_pushes_after_a_history_leave_the_mark_alone(self, history, marked):
+        """From a pair's first outcome on, a received minute without one is void, so a prober
+        that sends nothing for a while doesn't mark every indexer it knows.
+        """
+        store = FreshnessStore()
+        minute = _run(store, [history] * 10)
+        for offset in range(10):
+            _push(store, minute + offset)
+
+        pair = _pair(store)
+        assert (pair["marked"], pair["judged"], pair["window_counted"]) == (marked, False, 0)
+
+    def test_pair_left_out_of_shortened_pushes_keeps_its_mark(self):
         store = FreshnessStore()
         _run(store, ["pass"] * 10 + [None] * 6)
 
         pair = _pair(store)
-        assert pair["marked"] is True
-        assert (pair["window_passed"], pair["window_counted"]) == (4, 10)
+        assert (pair["marked"], pair["judged"]) == (False, False)
+        assert (pair["window_passed"], pair["window_counted"]) == (4, 4)
+
+    def test_pair_forgotten_after_28_days_is_a_newcomer_again(self):
+        """Once dropped, the pair's earlier received minutes count as not passed again."""
+        store = FreshnessStore()
+        _run(store, ["pass"] * 10)
+        last = START + 9 + 28 * DAY
+        _run(store, [None] * 10, start=last - 9)
+        assert INDEXER not in store.snapshot()["chains"][CHAIN]["indexers"]
+
+        _push(store, last + 1, _check("pass"), _check("pass", indexer=OTHER))
+
+        pair = _pair(store)
+        assert (pair["marked"], pair["judged"]) == (True, True)
+        assert (pair["window_passed"], pair["window_counted"]) == (1, 10)
 
     def test_minutes_never_received_are_void(self):
         """3 passes, 5 minutes with no push, then 2 fails: 3 of 5 counted minutes passed. Had
