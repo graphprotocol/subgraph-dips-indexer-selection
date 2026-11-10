@@ -22,10 +22,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Retry policy: 10 attempts, starting at 0.15s and doubling each time.
-# Total wait ~153s before giving up — long enough to ride through an iisa
-# rollout (readinessProbe initialDelaySeconds=90, startupProbe up to ~300s)
-# but bounded so a stuck iisa fails the cronjob within a few minutes.
+# 10 attempts, starting at 0.15s and doubling: about 153s in all, enough to ride through an iisa
+# rollout (readinessProbe initialDelaySeconds=90, startupProbe up to ~300s) while a stuck iisa
+# still fails the cronjob within a few minutes.
 RETRY_ATTEMPTS = 10
 RETRY_INITIAL_DELAY_SECONDS = 0.15
 RETRY_BACKOFF_MULTIPLIER = 2.0
@@ -182,6 +181,32 @@ def get_scores_status(iisa_api_url: str, token: Optional[str]) -> Any:
     """
     url = f"{_require_url(iisa_api_url)}/scores/status"
     response = _request_with_retry("GET", url, token=token)
+    return response.json()
+
+
+def get_scores(iisa_api_url: str, token: Optional[str]) -> Any:
+    """Fetch the loaded scores, {"computed_at", "count", "scores": [records]}, from iisa.
+
+    The freshness prober reads which chains each indexer offers DIPs on from it.
+    Raises IISAPushError on failure after all retries exhausted.
+    """
+    url = f"{_require_url(iisa_api_url)}/scores"
+    response = _request_with_retry("GET", url, token=token)
+    return response.json()
+
+
+def post_freshness(iisa_api_url: str, token: Optional[str], payload: dict, timeout: float) -> Any:
+    """Push 1 minute of freshness outcomes to iisa in a single attempt.
+
+    No retries: a minute that doesn't arrive is void by design, and the next minute's push must
+    not queue behind this one. Raises IISAPushError on any failure.
+    """
+    url = f"{_require_url(iisa_api_url)}/freshness"
+    headers = {**_auth_header(token), "Content-Type": "application/json"}
+    try:
+        response = _attempt_request("POST", url, headers, payload, timeout)
+    except _AttemptFailed as failed:
+        raise IISAPushError(f"POST {url} failed: {failed.error}") from failed.error
     return response.json()
 
 
