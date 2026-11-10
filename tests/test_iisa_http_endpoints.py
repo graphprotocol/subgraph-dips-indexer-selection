@@ -1755,6 +1755,23 @@ class TestSelectIndexersEndpoint:
         assert "chain_id" in response.text
         mock_processor_class.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "body",
+        [b'{"deployment_id": "Qm123", "chain_id": "x\\ud800"}', b'{"x\\ud800": 1}'],
+        ids=["in-a-value", "in-a-field-name"],
+    )
+    def test_lone_surrogate_in_a_rejected_request_gets_a_422(self, body):
+        """The 422 repeats the request, and half of a UTF-16 surrogate pair can't be encoded."""
+        from iisa.iisa_http_endpoints import app
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/select-indexers", content=body, headers={"Content-Type": "application/json"}
+        )
+
+        assert response.status_code == 422
+        assert "ud800" in response.text
+
     @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_indexers_returns_deployment_id_and_indexers(
         self, mock_processor_class, mock_history_df

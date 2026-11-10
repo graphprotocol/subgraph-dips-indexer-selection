@@ -232,6 +232,30 @@ class TestPushValidation:
         assert response.status_code == 422, response.text
 
 
+class TestUnencodableText:
+    """Text holding half of a UTF-16 surrogate pair can't be written out as UTF-8."""
+
+    @staticmethod
+    def _post(client: TestClient, body: dict[str, Any]) -> Any:
+        content = json.dumps(body).replace("-HALF", "\\ud800").encode()
+        return client.post(
+            "/freshness", content=content, headers={"Content-Type": "application/json"}
+        )
+
+    @pytest.mark.parametrize("field", ["chain", "detail", "deployment"])
+    def test_lone_surrogate_is_a_422_and_nothing_is_stored(self, client, field):
+        response = self._post(client, _push(_minute(), _outcome(**{field: "x-HALF"})))
+
+        assert response.status_code == 422, response.text
+        assert "ud800" in response.text
+        assert client.get("/freshness").json()["chains"] == {}
+
+    def test_lone_surrogate_in_a_field_name_is_a_422(self, client):
+        response = self._post(client, {**_push(_minute()), "x-HALF": 1})
+
+        assert response.status_code == 422, response.text
+
+
 class TestRead:
     def test_reports_nothing_before_the_first_push(self, client):
         response = client.get("/freshness")
