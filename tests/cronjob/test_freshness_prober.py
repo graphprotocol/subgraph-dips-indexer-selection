@@ -257,6 +257,8 @@ async def test_a_minute_where_no_indexer_answers_is_void_for_all():
 
 
 async def test_a_pairing_the_gateway_doesnt_know_is_dropped_until_the_next_refresh():
+    """While every eligible deployment is dropped, the pair is void rather than no_evidence: a
+    gateway that briefly lost track of an allocation is not the indexer's fault."""
     clock = FakeClock(MINUTE)
     pair = (_indexer(1), "mainnet")
     targets = Targets(pairs=(pair,), eligible={pair: (_deployment("A"),)})
@@ -273,12 +275,26 @@ async def test_a_pairing_the_gateway_doesnt_know_is_dropped_until_the_next_refre
     await prober.run_minute(MINUTE + 120)
 
     outcomes = [(p["outcomes"][0]["outcome"], p["outcomes"][0]["reason"]) for p in pushed]
-    assert outcomes == [
-        ("void", "pairing_unknown"),
-        ("no_evidence", "no_eligible_subgraph"),
-        ("void", "pairing_unknown"),
-    ]
+    assert outcomes == [("void", "pairing_unknown")] * 3
+    assert pushed[1]["outcomes"][0]["deployment"] is None
     assert len(gateway.asked) == 2
+
+
+async def test_a_pair_with_no_eligible_deployment_at_all_is_no_evidence():
+    clock = FakeClock(MINUTE)
+    pair = (_indexer(1), "mainnet")
+    pushed = []
+    prober = _prober(None, FakeGateway(clock, {}), clock, pushed)
+    prober._targets = Targets(pairs=(pair,), eligible={})
+
+    await prober.run_minute(MINUTE)
+
+    assert _single_outcome(pushed[0]) == ("no_evidence", "no_eligible_subgraph")
+
+
+def _single_outcome(payload):
+    (outcome,) = payload["outcomes"]
+    return outcome["outcome"], outcome["reason"]
 
 
 async def test_checks_still_waiting_when_they_could_no_longer_be_answered_are_not_sent():

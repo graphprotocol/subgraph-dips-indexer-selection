@@ -238,15 +238,24 @@ class FreshnessProber:
             logger.exception("Freshness check of %s on %s failed in the prober", indexer, chain)
             return CheckResult(indexer, chain, VOID, NOT_SENT, "prober error")
 
-    def _eligible_now(self, indexer: str, chain: str) -> list[str]:
+    def _eligible(self, indexer: str, chain: str) -> tuple[str, ...]:
         targets = self._targets
-        eligible = targets.eligible.get((indexer, chain), ()) if targets else ()
-        return [d for d in eligible if (indexer, d) not in self._dropped]
+        return targets.eligible.get((indexer, chain), ()) if targets else ()
+
+    @staticmethod
+    def _nothing_to_ask(indexer: str, chain: str, eligible: tuple[str, ...]) -> CheckResult:
+        if eligible:
+            # The gateway said it doesn't know any of them; that clears at the next refresh and
+            # isn't evidence against the indexer.
+            detail = "the gateway doesn't know this indexer on any eligible subgraph"
+            return CheckResult(indexer, chain, VOID, PAIRING_UNKNOWN, detail)
+        return CheckResult(indexer, chain, NO_EVIDENCE, NO_ELIGIBLE_SUBGRAPH)
 
     async def _check_now(self, indexer: str, chain: str, send_by: float) -> CheckResult:
-        choices = self._eligible_now(indexer, chain)
+        eligible = self._eligible(indexer, chain)
+        choices = [d for d in eligible if (indexer, d) not in self._dropped]
         if not choices:
-            return CheckResult(indexer, chain, NO_EVIDENCE, NO_ELIGIBLE_SUBGRAPH)
+            return self._nothing_to_ask(indexer, chain, eligible)
         deployment = self._rng.choice(choices)
         async with self._semaphore:
             if self._clock() > send_by:
