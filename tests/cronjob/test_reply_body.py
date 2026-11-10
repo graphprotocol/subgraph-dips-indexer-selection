@@ -6,6 +6,7 @@ real network reading runs.
 """
 
 import asyncio
+import gzip
 import sys
 from pathlib import Path
 from typing import Optional
@@ -116,3 +117,44 @@ async def test_reply_that_never_ends_is_cut_off_at_the_limit():
 
     with pytest.raises(ReplyTooLargeError, match="1,024"):
         await _read(handler)
+
+
+# --- Compressed replies ---------------------------------------------------------------------
+#
+# aiohttp decompresses gzip replies itself, so a reply can be small on the wire and huge once
+# decompressed. The limit has to apply to the decompressed body.
+
+
+async def test_compressed_reply_over_the_limit_once_decompressed_is_refused():
+    limit = 64 * 1024
+    compressed = gzip.compress(b" " * (1024 * 1024))
+    # Small enough on the wire that its declared length alone does not refuse it.
+    assert len(compressed) < limit
+
+    async def handler(request):
+        return web.Response(body=compressed, headers={"Content-Encoding": "gzip"})
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    async with TestServer(app) as server, aiohttp.ClientSession() as session:
+        async with session.get(server.make_url("/")) as resp:
+            with pytest.raises(ReplyTooLargeError):
+                await read_reply_body(resp, limit)
+
+
+async def test_reading_leaves_aiohttps_own_buffer_at_its_usual_size():
+    # aiohttp raises its buffer size, and how much it decompresses at once, to match the largest
+    # read asked of it, and keeps them raised. Asking for a whole 8 MiB limit in 1 read let a
+    # small compressed reply fill about 3 times the limit in memory before reading paused.
+    compressed = gzip.compress(b" " * (1024 * 1024))
+
+    async def handler(request):
+        return web.Response(body=compressed, headers={"Content-Encoding": "gzip"})
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    async with TestServer(app) as server, aiohttp.ClientSession() as session:
+        async with session.get(server.make_url("/")) as resp:
+            usual = resp.content.get_read_buffer_limits()
+            assert await read_reply_body(resp, 8 * 1024 * 1024) == b" " * (1024 * 1024)
+            assert resp.content.get_read_buffer_limits() == usual

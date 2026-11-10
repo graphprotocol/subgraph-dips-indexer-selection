@@ -9,6 +9,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import aiohttp
 
+# aiohttp raises its own buffer size, and how much of a compressed reply it decompresses at once,
+# to match the largest read asked of it. Reads this small leave both at aiohttp's usual size, so
+# a small compressed reply cannot fill several times the limit in memory before reading pauses.
+_READ_SIZE = 64 * 1024
+
 
 class ReplyTooLargeError(ValueError):
     """An indexer's reply was bigger than the limit set for it.
@@ -29,8 +34,8 @@ async def read_reply_body(resp: "aiohttp.ClientResponse", limit: int) -> bytes:
     received = 0
     while True:
         # A read returns as soon as any of the body has arrived, so keep reading until it ends.
-        # Asking for at most 1 byte past the limit means no more than that is ever held.
-        piece = await resp.content.read(limit + 1 - received)
+        # Never asking past 1 byte over the limit keeps what is collected here within it.
+        piece = await resp.content.read(min(_READ_SIZE, limit + 1 - received))
         if not piece:
             return b"".join(pieces)
         received += len(piece)
