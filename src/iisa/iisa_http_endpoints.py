@@ -3,15 +3,15 @@ IISA HTTP API - FastAPI endpoints for the Indexing Indexer Selection Algorithm.
 
 This module exposes the indexer-selection HTTP endpoints the dipper-iisa Rust client calls.
 
-Endpoints:
+Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or IISA_READ_TOKEN):
 - GET /health - Health check, reports if data is loaded
-- POST /scores - Push computed indexer scores from the cronjob (bearer-auth)
-- GET /scores - Return the current scores snapshot (bearer-auth)
-- GET /scores/status - Return last computed_at; lets the cronjob skip a redundant run (bearer-auth)
-- GET /scores/weighted - Bulk weighted scores for every loaded indexer (bearer-auth)
-- GET /dips-indexers - Indexers selection would pick for a required ?chain (bearer-auth)
-- POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
-- POST /get-score - Return weighted score and components for one indexer (bearer-auth)
+- POST /scores - Push computed indexer scores from the cronjob (push token)
+- GET /scores - Return the current scores snapshot (read token)
+- GET /scores/status - Return last computed_at; lets the cronjob skip a redundant run (read token)
+- GET /scores/weighted - Bulk weighted scores for every loaded indexer (read token)
+- GET /dips-indexers - Indexers selection would pick for a required ?chain (read token)
+- POST /sync-status - Push sync-status snapshot from the fetcher (push token)
+- POST /get-score - Return weighted score and components for one indexer (read token)
 - POST /select-indexers - Select optimal indexers for a deployment
 """
 
@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     # misconfigured Secret is caught at rollout rather than leaving production
     # iisa accepting unauthenticated pushes. Default off for compose/local dev.
     require_push_token: bool = False
+    # Optional bearer token for callers that only read, such as dipper. The endpoints that only
+    # read accept it as well as push_token; POST /scores and POST /sync-status accept only
+    # push_token. Unset, reads need push_token as before.
+    read_token: Optional[str] = None
 
 
 @lru_cache
@@ -516,19 +520,38 @@ def _supports_chain(networks_json: Any, chain_id: str) -> bool:
 
 
 def _require_push_token(authorization: Optional[str]) -> None:
-    """Validate the bearer token against IISA_PUSH_TOKEN.
+    """Validate the bearer token against IISA_PUSH_TOKEN, for the endpoints that push.
 
-    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience). "Bearer" is
-    matched in any letter case per RFC 6750 §2.1, the token exactly. hmac.compare_digest
-    dodges timing oracles; it compares bytes, since it refuses text with non-ASCII letters.
+    When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience).
     """
-    expected = get_settings().push_token
+    _require_one_of([get_settings().push_token], authorization)
+
+
+def _require_read_token(authorization: Optional[str]) -> None:
+    """Validate the bearer token against IISA_PUSH_TOKEN or IISA_READ_TOKEN, for reads.
+
+    When neither is set, auth is off (local dev convenience).
+    """
+    settings = get_settings()
+    _require_one_of([settings.push_token, settings.read_token], authorization)
+
+
+def _require_one_of(tokens: list[Optional[str]], authorization: Optional[str]) -> None:
+    """Raise a 401 unless the bearer token is 1 of the tokens set; with none set, allow all.
+
+    "Bearer" is matched in any letter case per RFC 6750 §2.1, the token exactly.
+    hmac.compare_digest dodges timing oracles; it compares bytes, since it refuses text with
+    non-ASCII letters. Every token is compared, so the time taken says nothing about which one
+    the provided token was closest to.
+    """
+    expected = [token.encode() for token in tokens if token]
     if not expected:
         return
     if not authorization or authorization[:7].lower() != "bearer ":
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
-    provided = authorization[7:].strip()
-    if not hmac.compare_digest(provided.encode(), expected.encode()):
+    provided = authorization[7:].strip().encode()
+    matches = [hmac.compare_digest(provided, token) for token in expected]
+    if not any(matches):
         raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
@@ -571,6 +594,12 @@ async def lifespan(_app: FastAPI):
         logger.warning(
             "IISA_PUSH_TOKEN is not set; push endpoints will accept unauthenticated "
             "requests. This is acceptable in local development only."
+        )
+
+    if settings.read_token and settings.read_token == settings.push_token:
+        logger.warning(
+            "IISA_READ_TOKEN is the same as IISA_PUSH_TOKEN, so whoever holds it can push "
+            "scores and sync status too. Give readers a token of their own."
         )
 
     # Initialize providers
@@ -713,7 +742,7 @@ def scores_status(
     today's scores are already pushed. Sync def for consistency with the
     other push endpoints — no awaitable work in the body.
     """
-    _require_push_token(authorization)
+    _require_read_token(authorization)
 
     if _state.data_manager is None:
         return ScoresStatusResponse(computed_at=None, rows=0)
@@ -735,7 +764,7 @@ def scores_snapshot(
     here. For ops debugging and external monitoring, not the selection hot
     path. Sync def so the DataFrame→JSON conversion runs on the threadpool.
     """
-    _require_push_token(authorization)
+    _require_read_token(authorization)
 
     if _state.data_manager is None:
         return ScoresSnapshotResponse(computed_at=None, count=0, scores=[])
@@ -878,7 +907,7 @@ def scores_weighted(
     Selection can pass `max_grt_per_30_days` as a `price_ceiling`; this endpoint
     cannot, so each chain's prices are normalised against its observed max instead.
     """
-    _require_push_token(authorization)
+    _require_read_token(authorization)
 
     if _state.data_manager is None:
         return WeightedScoresResponse(computed_at=None, count=0, scores=[])
@@ -922,7 +951,7 @@ def dips_indexers(
     ``max_grt_per_billion_entities_per_30_days`` ceilings (omit either to skip it).
     Omitting ``chain`` is a 422. Example: ``?chain=arbitrum-one&max_grt_per_30_days=4500``.
     """
-    _require_push_token(authorization)
+    _require_read_token(authorization)
 
     if _state.data_manager is None:
         return DipsIndexersResponse(computed_at=None, count=0, indexers=[])
@@ -998,7 +1027,7 @@ async def get_score(
     Useful for debugging selection decisions and monitoring per-indexer
     performance without running a full selection request.
     """
-    _require_push_token(authorization)
+    _require_read_token(authorization)
 
     if not _state.is_ready or _state.history is None:
         raise HTTPException(status_code=503, detail="IISA data not loaded")
