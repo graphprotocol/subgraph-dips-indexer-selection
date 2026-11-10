@@ -32,7 +32,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
@@ -73,9 +73,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
-    # Bearer token required on every endpoint except /health and /select-indexers.
-    # When unset, those endpoints accept unauthenticated requests and a WARNING
-    # is logged at startup — local dev convenience only.
+    # Bearer token for pushing scores and sync status, also accepted on every read.
+    # /health and /select-indexers take no token. When it is unset, a WARNING is
+    # logged at startup and the pushes accept unauthenticated requests, as do the
+    # reads unless read_token is set: local dev convenience only.
     push_token: Optional[str] = None
     # When true, startup fails hard if push_token is unset. Set in k8s so a
     # misconfigured Secret is caught at rollout rather than leaving production
@@ -85,6 +86,18 @@ class Settings(BaseSettings):
     # read accept it as well as push_token; POST /scores and POST /sync-status accept only
     # push_token. Unset, reads need push_token as before.
     read_token: Optional[str] = None
+
+    @field_validator("push_token", "read_token")
+    @classmethod
+    def _strip_token(cls, token: Optional[str]) -> Optional[str]:
+        """Drop whitespace around a configured token; 1 of only whitespace counts as unset.
+
+        A secret made from a file often ends in a newline that no caller sends, and the token a
+        caller sends is stripped before it is compared, so an unstripped one could never match.
+        """
+        if token is None:
+            return None
+        return token.strip() or None
 
 
 @lru_cache

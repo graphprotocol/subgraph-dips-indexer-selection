@@ -154,6 +154,47 @@ def test_without_any_token_nothing_is_checked(tokens, method, path, body):
     assert _call(method, path, body, None).status_code == 200
 
 
+# --- Whitespace around a configured token ---------------------------------------------------
+#
+# A secret made from a file often ends in a newline that no caller sends, and the caller's token
+# has its whitespace stripped before it is compared. So the configured tokens are stripped too.
+
+
+@pytest.mark.parametrize(("method", "path", "body"), READS)
+def test_a_read_token_set_with_a_trailing_newline_still_reads(tokens, method, path, body):
+    tokens(push=PUSH_TOKEN, read=READ_TOKEN + "\n")
+
+    assert _call(method, path, body, READ_TOKEN).status_code == 200
+
+
+@pytest.mark.parametrize(("method", "path", "body"), READS + WRITES)
+def test_a_push_token_set_with_a_trailing_newline_still_works(tokens, method, path, body):
+    tokens(push=PUSH_TOKEN + "\n", read=READ_TOKEN)
+
+    assert _call(method, path, body, PUSH_TOKEN).status_code == 200
+
+
+@pytest.mark.parametrize("name", ["push_token", "read_token"])
+@pytest.mark.parametrize("value", [" ", "\n", " \t\n"], ids=["space", "newline", "mixed"])
+def test_a_token_of_only_whitespace_counts_as_unset(name, value):
+    assert getattr(iisa_http_endpoints.Settings(**{name: value}), name) is None
+
+
+def test_a_required_push_token_of_only_whitespace_stops_the_service_starting(monkeypatch):
+    # Counted as unset, it trips the same check as a missing token, rather than leaving every
+    # request refused by a token no caller can send.
+    monkeypatch.setenv("IISA_REQUIRE_PUSH_TOKEN", "true")
+    monkeypatch.setenv("IISA_PUSH_TOKEN", " \n")
+    monkeypatch.delenv("IISA_READ_TOKEN", raising=False)
+    iisa_http_endpoints.get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="IISA_PUSH_TOKEN is required"):
+            with TestClient(app):
+                pass
+    finally:
+        iisa_http_endpoints.get_settings.cache_clear()
+
+
 # --- Startup --------------------------------------------------------------------------------
 
 
