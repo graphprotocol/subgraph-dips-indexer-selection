@@ -431,6 +431,32 @@ def test_fetch_handles_invalid_utf8_body(semaphore, monkeypatch):
     assert len(session.calls) == 3
 
 
+def test_fetch_handles_deeply_nested_body(semaphore, monkeypatch):
+    # Arrange — about 40 KB of nested brackets, well under the size limit, is deeper than the
+    # JSON reader can follow, so it raises RecursionError. Uncaught, that would escape through
+    # `asyncio.gather` and lose every indexer's version, failing the run when a minimum is set.
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr("processing.asyncio.sleep", _no_sleep)
+    deep = b"[" * 20_000 + b"]" * 20_000
+    session = _FakeSession([_HtmlResponse(body_bytes=deep) for _ in range(3)])
+
+    # Act
+    result = _run(
+        _fetch_single_graph_node_version_async(
+            session, indexer="0xdeep", url="http://i.example", semaphore=semaphore
+        )
+    )
+
+    # Assert — treated like any other unreadable body: all-None record.
+    assert result == {
+        "indexer": "0xdeep",
+        "graph_node_version": None,
+        "graph_node_commit": None,
+    }
+
+
 def test_fetch_handles_non_dict_version_field(semaphore):
     # Arrange — a graph-node fork returns `data.version` as a bare string
     # instead of the expected `{version, commit}` object. The isinstance

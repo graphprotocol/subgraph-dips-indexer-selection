@@ -121,9 +121,9 @@ async def _fetch_single_status(
                 "indexer": indexer,
                 "deployments": _synced_deployments(await do_fetch()),
             }
-        except ValueError as e:
-            # Unparseable JSON, a reply over the size limit or the wrong shape won't change on a
-            # retry; skip this indexer only.
+        except (ValueError, RecursionError) as e:
+            # Unparseable JSON, JSON nested too deep to read, a reply over the size limit or the
+            # wrong shape won't change on a retry; skip this indexer only.
             logger.warning("Malformed /status reply from %s (%s): %s", indexer[:10], url, e)
             return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:

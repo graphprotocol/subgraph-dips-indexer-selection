@@ -46,8 +46,18 @@ def _session_returning(body):
         {"data": {"indexingStatuses": ["not an object"]}},
         {"data": {"indexingStatuses": [{"synced": True, "health": "healthy"}]}},
         b"<html>",
+        # Deeper than the JSON reader can follow, so it raises RecursionError, not ValueError.
+        b"[" * 20_000 + b"]" * 20_000,
     ],
-    ids=["null-data", "null-statuses", "list-body", "non-object-status", "no-subgraph", "bad-json"],
+    ids=[
+        "null-data",
+        "null-statuses",
+        "list-body",
+        "non-object-status",
+        "no-subgraph",
+        "bad-json",
+        "nested-too-deep",
+    ],
 )
 async def test_a_malformed_reply_counts_as_no_answer(body):
     """One indexer's bad reply must not raise out of the fetch and sink every other indexer."""

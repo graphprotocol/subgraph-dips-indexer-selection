@@ -501,10 +501,12 @@ async def _fetch_single_graph_node_version_async(
             aiohttp.ClientError,
             asyncio.TimeoutError,
             ValueError,
+            RecursionError,
             AttributeError,
         ) as e:
-            # Deliberately broad: 1 indexer returning HTML, invalid UTF-8 (a ValueError)
-            # or a malformed shape would otherwise crash the whole run through gather().
+            # Deliberately broad: 1 indexer returning HTML, invalid UTF-8 (a ValueError), JSON
+            # nested too deep to read or a malformed shape would otherwise crash the whole run
+            # through gather().
             last_error = e
         if _retry_would_not_help(last_error):
             break
