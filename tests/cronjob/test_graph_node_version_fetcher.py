@@ -395,14 +395,14 @@ def test_fetch_handles_malformed_json_body(semaphore, monkeypatch):
         )
     )
 
-    # Assert — JSONDecodeError was caught and treated like any transient
-    # failure: three attempts, all-None record returned.
+    # Assert — JSONDecodeError was caught and the record is all-None. The whole
+    # body was read, so asking again would get the same page: 1 attempt only.
     assert result == {
         "indexer": "0xhtml",
         "graph_node_version": None,
         "graph_node_commit": None,
     }
-    assert len(session.calls) == 3
+    assert len(session.calls) == 1
 
 
 def test_fetch_handles_invalid_utf8_body(semaphore, monkeypatch):
@@ -413,9 +413,8 @@ def test_fetch_handles_invalid_utf8_body(semaphore, monkeypatch):
 
     monkeypatch.setattr("processing.asyncio.sleep", _no_sleep)
 
-    # Provide one bad-bytes response per retry attempt; the decode error
-    # is transient-like (could in principle be a partial read), so the
-    # fetcher exhausts the retry budget before giving up.
+    # Provide one bad-bytes response per possible attempt. The whole body is
+    # read, so the same bytes would come back and only 1 attempt should be made.
     session = _FakeSession([_HtmlResponse(body_bytes=b"\xc3\x28\xff\xfe") for _ in range(3)])
 
     # Act
@@ -428,7 +427,7 @@ def test_fetch_handles_invalid_utf8_body(semaphore, monkeypatch):
     # Assert — the decode error was caught; the record falls through to
     # all-None and the cron run continues.
     assert result["graph_node_version"] is None
-    assert len(session.calls) == 3
+    assert len(session.calls) == 1
 
 
 def test_fetch_handles_deeply_nested_body(semaphore, monkeypatch):
@@ -449,12 +448,13 @@ def test_fetch_handles_deeply_nested_body(semaphore, monkeypatch):
         )
     )
 
-    # Assert — treated like any other unreadable body: all-None record.
+    # Assert — treated like any other unreadable body: all-None record, 1 attempt.
     assert result == {
         "indexer": "0xdeep",
         "graph_node_version": None,
         "graph_node_commit": None,
     }
+    assert len(session.calls) == 1
 
 
 def test_fetch_handles_non_dict_version_field(semaphore):

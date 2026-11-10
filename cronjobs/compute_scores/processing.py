@@ -25,7 +25,7 @@ import geoip2.errors
 import numpy as np
 import pandas as pd
 from numpy.linalg import pinv
-from reply_body import ReplyTooLargeError, read_reply_body
+from reply_body import read_reply_body
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LinearRegression
@@ -469,14 +469,15 @@ def _extract_graph_node_version(data: object) -> tuple[Optional[str], Optional[s
 def _retry_would_not_help(error: Exception) -> bool:
     """True when asking again would get the same answer, so a retry is wasted.
 
-    That is a 4xx, where the endpoint is missing or rejects the query, or a reply over the size
-    limit.
+    Only a network fault, a timeout or a 5xx is worth another try. A 4xx means the endpoint is
+    missing or rejects the query, and a reply that arrived whole but is too large, not JSON or the
+    wrong shape would arrive the same way again.
     """
     import aiohttp
 
-    if isinstance(error, ReplyTooLargeError):
-        return True
-    return isinstance(error, aiohttp.ClientResponseError) and 400 <= error.status < 500
+    if isinstance(error, aiohttp.ClientResponseError):
+        return 400 <= error.status < 500
+    return not isinstance(error, (aiohttp.ClientError, asyncio.TimeoutError))
 
 
 async def _fetch_single_graph_node_version_async(
