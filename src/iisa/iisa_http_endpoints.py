@@ -99,8 +99,8 @@ def get_settings() -> Settings:
 # Request/Response Models
 # =============================================================================
 
-# Limits on a selection request, set far above anything a real request holds. /select-indexers
-# takes no token, so without them a request could be any size.
+# Limits on a selection request. /select-indexers takes no token, so without them a request
+# could be any size. Each field limit is far above anything a real request holds.
 # Dipper never asks for more than this many candidates.
 MAX_NUM_CANDIDATES = 100
 # A deployment's IPFS hash is 46 characters and an indexer address 42.
@@ -110,9 +110,16 @@ _MAX_CHAIN_ID_CHARS = 64
 _MAX_INDEXERS = 10_000
 # Keys in a map keyed by deployment. Dipper sends every deployment with a pending agreement or a
 # decline in the last 30 days, so these grow with all of dipper's work, not just this request.
+# The body limit below binds first, since 100,000 deployment ids alone are about 5 MB; this one
+# still holds if the body limit is ever raised.
 _MAX_DEPLOYMENTS = 100_000
-# The whole body, checked before it is read in full. A real request is a few kilobytes, and one
-# naming 10,000 deployments with recent declines would still be about 1 MiB.
+# The whole body, checked before it is read in full. Dipper sends the pending agreements and
+# recent declines of every deployment it handles, though selection uses only this deployment's
+# declines and the indexers named in the pending agreements, so today a request grows with
+# dipper's whole workload. By 1 estimate it is about 0.14 MB at 1,000 deployments and 1.4 MB at
+# 10,000, and reaches this limit somewhere between 7,000 and 31,000, after which every request
+# is refused. Once dipper sends only what selection uses, a request is a few kilobytes and this
+# limit is far out of reach.
 MAX_SELECTION_BODY_BYTES = 4 * 1024 * 1024
 
 # fail_fast stops checking a list or map at its first bad entry. Without it each bad entry is
