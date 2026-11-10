@@ -2,6 +2,9 @@
 
 Long-running service that periodically polls each indexer's /status
 endpoint to discover which deployments they have synced and healthy.
+Keeps only the deployments each indexer also holds an active allocation on,
+read from the network subgraph, since a /status reply is the indexer's own
+word; when the allocations can't be read, the cycle pushes nothing.
 Pushes the resulting snapshot directly to the iisa HTTP service via
 iisa_client.post_sync_status; no shared filesystem is involved.
 

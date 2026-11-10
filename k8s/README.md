@@ -22,9 +22,11 @@ POSTs them to the IISA service.
 
 The sync-status fetcher runs all the time, from the CronJob's image. Every hour it reads
 indexer URLs from the Graph Network subgraph, asks each indexer's `/status` which
-deployments it has synced, and POSTs that snapshot to the service the same way. The
-service uses it to prefer indexers that have already synced a deployment. Nothing is
-shared on disk between them.
+deployments it has synced, keeps only the deployments the indexer also holds an active
+allocation on, read from the same subgraph, and POSTs that snapshot to the service the
+same way. If it cannot read the allocations it pushes nothing that hour. The service uses
+the snapshot to prefer indexers that have already synced a deployment. Nothing is shared
+on disk between them.
 
 The IISA service answers indexer-selection requests. On startup it loads the last
 scores and sync status from its own cache volume, so a restart serves the most
