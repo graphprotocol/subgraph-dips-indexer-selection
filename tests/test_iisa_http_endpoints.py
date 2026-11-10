@@ -402,7 +402,7 @@ class TestOpenApiErrorResponses:
             ("get", "/dips-indexers", {"401"}),
             ("post", "/sync-status", {"400", "401", "503"}),
             ("post", "/get-score", {"400", "401", "503"}),
-            ("post", "/select-indexers", {"400", "503"}),
+            ("post", "/select-indexers", {"400", "413", "503"}),
         ],
     )
     def test_lists_each_error_answer(self, method, path, codes):

@@ -34,6 +34,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
 from .score_loader import (
@@ -97,6 +98,26 @@ def get_settings() -> Settings:
 # Request/Response Models
 # =============================================================================
 
+# Limits on a selection request, set far above anything a real request holds. /select-indexers
+# takes no token, so without them a request could be any size.
+# Dipper never asks for more than this many candidates.
+MAX_NUM_CANDIDATES = 100
+# A deployment's IPFS hash is 46 characters and an indexer address 42.
+_MAX_ID_CHARS = 128
+_MAX_CHAIN_ID_CHARS = 64
+# Entries in a list or map of indexers, far more than the network has indexers.
+_MAX_INDEXERS = 10_000
+# Keys in a map keyed by deployment. Dipper sends every deployment with a pending agreement or a
+# decline in the last 30 days, so these grow with all of dipper's work, not just this request.
+_MAX_DEPLOYMENTS = 100_000
+# The whole body, checked before it is read in full. A real request is a few kilobytes, and one
+# naming 10,000 deployments with recent declines would still be about 1 MiB.
+MAX_SELECTION_BODY_BYTES = 4 * 1024 * 1024
+
+_IdText = Annotated[str, Field(max_length=_MAX_ID_CHARS)]
+_IndexerList = Annotated[list[_IdText], Field(max_length=_MAX_INDEXERS)]
+_IndexersByDeployment = Annotated[dict[_IdText, _IndexerList], Field(max_length=_MAX_DEPLOYMENTS)]
+
 
 class SelectionRequest(BaseModel):
     """
@@ -112,16 +133,17 @@ class SelectionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    deployment_id: str
-    existing_indexers: Optional[list[str]] = None
-    pending_agreements: Optional[dict[str, list[str]]] = None
-    num_candidates: int  # Target group size (required)
-    blocklist: Optional[list[str]] = None
-    declined_indexers: Optional[dict[str, list[str]]] = None
+    deployment_id: _IdText
+    existing_indexers: Optional[_IndexerList] = None
+    pending_agreements: Optional[_IndexersByDeployment] = None
+    # Target group size (required). 0 or below selects nobody.
+    num_candidates: int = Field(le=MAX_NUM_CANDIDATES)
+    blocklist: Optional[_IndexerList] = None
+    declined_indexers: Optional[_IndexersByDeployment] = None
     # Required: the DIPs-info, chain-support and price filters all key on the chain, so a
     # request without one would skip them all. They also skip any step whose DIPs column is
     # missing from the loaded scores, and every step when dips_info_available is missing.
-    chain_id: str = Field(min_length=1)  # e.g., "arbitrum-one"
+    chain_id: str = Field(min_length=1, max_length=_MAX_CHAIN_ID_CHARS)  # e.g., "arbitrum-one"
     max_grt_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
     )  # e.g., 4500.0
@@ -132,7 +154,10 @@ class SelectionRequest(BaseModel):
     # stake-to-fees is scored. A negative or infinite fee would skew that score and a NaN
     # one would be silently treated as 0, so each is a 422.
     optimistic_dips_fees: Optional[
-        dict[str, Annotated[float, Field(ge=0, allow_inf_nan=False)]]
+        Annotated[
+            dict[_IdText, Annotated[float, Field(ge=0, allow_inf_nan=False)]],
+            Field(max_length=_MAX_INDEXERS),
+        ]
     ] = None
 
 
@@ -288,6 +313,7 @@ class ErrorResponse(BaseModel):
 _ERROR_RESPONSES: dict[int, dict[str, Any]] = {
     400: {"model": ErrorResponse, "description": "The body could not be read as text"},
     401: {"model": ErrorResponse, "description": "The bearer token is missing or wrong"},
+    413: {"model": ErrorResponse, "description": "The body is over the size limit"},
     503: {"model": ErrorResponse, "description": "The service has not started or has no scores"},
 }
 
@@ -615,6 +641,66 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+class _SelectionBodyLimit:
+    """Refuse a /select-indexers body over MAX_SELECTION_BODY_BYTES with a 413 before it is parsed.
+
+    The request's own checks run only once the whole body has been read and parsed, and this is
+    the 1 endpoint that takes no token, so a huge body could use up the service's memory first.
+    Only this route is covered, since the score job's POST /scores is legitimately large.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] != "/select-indexers":
+            await self.app(scope, receive, send)
+            return
+        declared = dict(scope["headers"]).get(b"content-length", b"")
+        if declared.isdigit() and int(declared) > MAX_SELECTION_BODY_BYTES:
+            await _body_too_large(scope, receive, send)
+            return
+
+        # No length, or one within the limit: read the body, counting what arrives.
+        pieces: list[bytes] = []
+        received = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                return  # The client went away before sending the whole body.
+            received += len(message.get("body", b""))
+            if received > MAX_SELECTION_BODY_BYTES:
+                await _body_too_large(scope, receive, send)
+                return
+            pieces.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+
+        body = b"".join(pieces)
+        replayed = False
+
+        async def replay() -> Message:
+            nonlocal replayed
+            if replayed:
+                return await receive()
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await self.app(scope, replay, send)
+
+
+async def _body_too_large(scope: Scope, receive: Receive, send: Send) -> None:
+    logger.warning("Refused a /select-indexers body over %s bytes", f"{MAX_SELECTION_BODY_BYTES:,}")
+    response = JSONResponse(
+        status_code=413,
+        content={"detail": f"Request body is over the {MAX_SELECTION_BODY_BYTES:,} byte limit"},
+    )
+    await response(scope, receive, send)
+
+
+app.add_middleware(_SelectionBodyLimit)
 
 
 def _json_safe(value: Any) -> Any:
@@ -1030,7 +1116,9 @@ async def get_score(
 
 
 @app.post(
-    "/select-indexers", response_model=SelectionResponse, responses=_documented_errors(400, 503)
+    "/select-indexers",
+    response_model=SelectionResponse,
+    responses=_documented_errors(400, 413, 503),
 )
 async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     """Select N indexers for a deployment via weighted scoring.

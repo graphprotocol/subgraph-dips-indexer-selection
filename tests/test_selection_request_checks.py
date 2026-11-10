@@ -2,7 +2,8 @@
 
 Dipper keeps its own copy of the request's fields in step with this service by hand, so a field
 it renames must be refused rather than dropped without a word: a dropped blocklist or price
-ceiling would select blocked or over-priced indexers.
+ceiling would select blocked or over-priced indexers. This is also the 1 endpoint that takes no
+token, so nothing in a request may be unboundedly large.
 """
 
 import json
@@ -114,3 +115,101 @@ def test_the_published_schema_says_unknown_fields_are_refused():
     schema = app.openapi()["components"]["schemas"]["SelectionRequest"]
 
     assert schema["additionalProperties"] is False
+
+
+# --- Sizes ----------------------------------------------------------------------------------
+
+
+def test_100_candidates_is_accepted():
+    assert _post(_request(num_candidates=100)).status_code == 200
+
+
+def test_more_than_100_candidates_is_refused():
+    response = _post(_request(num_candidates=101))
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "num_candidates"]
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_no_candidates_still_selects_nobody(count):
+    response = _post(_request(num_candidates=count))
+
+    assert response.status_code == 200
+    assert response.json()["indexers"] == []
+
+
+@pytest.mark.parametrize(
+    ("fields", "location"),
+    [
+        pytest.param({"deployment_id": "Q" * 129}, ["deployment_id"], id="long-deployment-id"),
+        pytest.param({"chain_id": "c" * 65}, ["chain_id"], id="long-chain-id"),
+        pytest.param({"blocklist": ["0x"] * 10_001}, ["blocklist"], id="long-blocklist"),
+        pytest.param(
+            {"existing_indexers": ["0x" + "1" * 127]}, ["existing_indexers", 0], id="long-address"
+        ),
+        pytest.param(
+            {"declined_indexers": {f"Qm{i}": [] for i in range(100_001)}},
+            ["declined_indexers"],
+            id="too-many-deployments",
+        ),
+        pytest.param(
+            {"pending_agreements": {"QmOther": ["0x"] * 10_001}},
+            ["pending_agreements", "QmOther"],
+            id="too-many-indexers-on-a-deployment",
+        ),
+        pytest.param(
+            {"optimistic_dips_fees": {f"0x{i}": 1.0 for i in range(10_001)}},
+            ["optimistic_dips_fees"],
+            id="too-many-fees",
+        ),
+    ],
+)
+def test_an_oversized_field_is_refused(fields, location):
+    response = _post(_request(**fields))
+
+    assert response.status_code == 422, response.status_code
+    assert [e["loc"] for e in response.json()["detail"]] == [["body", *location]]
+
+
+# --- The size of the whole body -------------------------------------------------------------
+#
+# The checks above run only once the whole body has been read and parsed, which for a huge body
+# could use up the service's memory first. So the body itself has a limit, on this route only.
+
+TOO_LARGE = b'{"padding": "' + b"x" * (4 * 1024 * 1024) + b'"}'
+
+
+def test_a_body_declared_over_the_limit_is_refused_unread():
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/select-indexers", content=TOO_LARGE, headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 413
+    assert "4,194,304" in response.json()["detail"]
+
+
+def test_a_body_with_no_declared_length_is_refused_once_over_the_limit():
+    def in_pieces():
+        for start in range(0, len(TOO_LARGE), 64 * 1024):
+            yield TOO_LARGE[start : start + 64 * 1024]
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/select-indexers", content=in_pieces(), headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 413
+
+
+def test_the_scores_push_is_not_held_to_the_selection_body_limit():
+    # The score job's daily push is legitimately large and carries the push token.
+    records = [{"indexer": f"0x{i:040x}", "padding": "x" * 1_000} for i in range(5_000)]
+    body = json.dumps(records).encode()
+    assert len(body) > 4 * 1024 * 1024
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/scores", content=body, headers={"Content-Type": "application/json"}
+    )
+
+    # Read and checked in full: refused for lacking score columns, not for its size.
+    assert response.status_code == 422, response.status_code
