@@ -26,7 +26,7 @@ spec:
       containers:
         - name: sync-status-fetcher
           # The score-computation CronJob's image, which ships the fetcher; the rebuild workflow bumps both tags.
-          image: ghcr.io/graphprotocol/subgraph-dips-indexer-selection-cronjob:sha-6bf8bc8
+          image: ghcr.io/graphprotocol/subgraph-dips-indexer-selection-cronjob:sha-b241b97
           imagePullPolicy: Always
           command: ["python", "sync_status_fetcher.py"]
           ports:
