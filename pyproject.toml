@@ -14,7 +14,7 @@ dependencies = [
     # a typosquat package via its `[standard]` extras (OSV MAL-2026-4750).
     "fastapi>=0.100,!=0.136.3,<1.0",
     "uvicorn[standard]>=0.23,<1.0",
-    "pydantic>=2.0,<3.0",
+    "pydantic>=2.8,<3.0",
     "pydantic-settings>=2.0,<3.0",
     "geoip2>=5.2.0",
 ]

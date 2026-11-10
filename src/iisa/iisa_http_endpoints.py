@@ -16,6 +16,7 @@ Endpoints:
 """
 
 import hmac
+import itertools
 import json
 import logging
 import math
@@ -32,7 +33,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -114,9 +115,13 @@ _MAX_DEPLOYMENTS = 100_000
 # naming 10,000 deployments with recent declines would still be about 1 MiB.
 MAX_SELECTION_BODY_BYTES = 4 * 1024 * 1024
 
+# fail_fast stops checking a list or map at its first bad entry. Without it each bad entry is
+# its own error, so a body of thousands of them builds thousands of errors in memory.
 _IdText = Annotated[str, Field(max_length=_MAX_ID_CHARS)]
-_IndexerList = Annotated[list[_IdText], Field(max_length=_MAX_INDEXERS)]
-_IndexersByDeployment = Annotated[dict[_IdText, _IndexerList], Field(max_length=_MAX_DEPLOYMENTS)]
+_IndexerList = Annotated[list[_IdText], Field(max_length=_MAX_INDEXERS, fail_fast=True)]
+_IndexersByDeployment = Annotated[
+    dict[_IdText, _IndexerList], Field(max_length=_MAX_DEPLOYMENTS, fail_fast=True)
+]
 
 
 class SelectionRequest(BaseModel):
@@ -156,9 +161,22 @@ class SelectionRequest(BaseModel):
     optimistic_dips_fees: Optional[
         Annotated[
             dict[_IdText, Annotated[float, Field(ge=0, allow_inf_nan=False)]],
-            Field(max_length=_MAX_INDEXERS),
+            Field(max_length=_MAX_INDEXERS, fail_fast=True),
         ]
     ] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_a_flood_of_fields(cls, data: Any) -> Any:
+        """Refuse a body with far more fields than this model has, before checking any of them.
+
+        Each unknown field is its own error, so thousands of them would build thousands of
+        errors in memory. Up to twice the model's own fields, each unknown 1 is still named.
+        """
+        most = 2 * len(cls.model_fields)
+        if isinstance(data, dict) and len(data) > most:
+            raise ValueError(f"has {len(data):,} fields, more than the {most} a request may have")
+        return data
 
 
 class SelectedIndexer(BaseModel):
@@ -714,12 +732,64 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+# A 422 reports at most this many errors, each echoing only a short excerpt of what was sent,
+# so a refusal stays small however much a request got wrong.
+_MAX_REPORTED_ERRORS = 20
+_MAX_EXCERPT_CHARS = 100
+_MAX_EXCERPT_ITEMS = 5
+
+
+def _excerpt(value: Any, depth: int = 0) -> Any:
+    """A short excerpt of a value a request sent, of the same type where it can be.
+
+    Text is cut to 100 characters, a list or map to its first 5 entries, and anything nested
+    deeper than 2 levels is described rather than copied. Other values are returned as they are.
+    """
+    if isinstance(value, str):
+        cut = len(value) > _MAX_EXCERPT_CHARS
+        return value[:_MAX_EXCERPT_CHARS] + "..." if cut else value
+    if isinstance(value, (list, tuple, dict)) and depth >= 2:
+        return f"{len(value):,} entries"
+    if isinstance(value, (list, tuple)):
+        return _excerpt_list(value, depth)
+    if isinstance(value, dict):
+        return _excerpt_map(value, depth)
+    return value
+
+
+def _excerpt_list(value: list | tuple, depth: int) -> list:
+    """The first entries of a list, each cut to an excerpt, and how many more there were."""
+    kept = [_excerpt(item, depth + 1) for item in value[:_MAX_EXCERPT_ITEMS]]
+    more = len(value) - len(kept)
+    return kept + [f"... {more:,} more"] if more else kept
+
+
+def _excerpt_map(value: dict, depth: int) -> dict:
+    """The first entries of a map, keys and values cut to excerpts, and how many more there were."""
+    first = itertools.islice(value.items(), _MAX_EXCERPT_ITEMS)
+    kept = {_excerpt(str(key)): _excerpt(item, depth + 1) for key, item in first}
+    more = len(value) - len(kept)
+    return {**kept, "...": f"{more:,} more"} if more else kept
+
+
+def _reported_error(error: Mapping[str, Any]) -> dict[str, Any]:
+    """1 validation error as a 422 reports it: its input and location cut to excerpts."""
+    reported = dict(error)
+    if "input" in reported:
+        reported["input"] = _excerpt(reported["input"])
+    reported["loc"] = [_excerpt(part) for part in reported.get("loc", ())]
+    return reported
+
+
 @app.exception_handler(RequestValidationError)
 async def _request_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
     """FastAPI's own 422 echoes the rejected input, and a NaN or infinite float there
-    can't be written as JSON, which turns the 422 into a 500.
+    can't be written as JSON, which turns the 422 into a 500. It also echoes every error in
+    full, so a request with thousands of errors, or 1 huge value, got an answer far larger than
+    itself; this reports the first 20, each with excerpts of what was sent.
     """
-    errors = _json_safe(jsonable_encoder(exc.errors()))
+    reported = [_reported_error(error) for error in exc.errors()[:_MAX_REPORTED_ERRORS]]
+    errors = _json_safe(jsonable_encoder(reported))
     return JSONResponse(status_code=422, content={"detail": errors})
 
 

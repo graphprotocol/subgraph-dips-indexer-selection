@@ -172,6 +172,34 @@ def test_an_oversized_field_is_refused(fields, location):
     assert [e["loc"] for e in response.json()["detail"]] == [["body", *location]]
 
 
+# --- The size of a refusal ------------------------------------------------------------------
+#
+# A body well under the size limit could still hold thousands of bad values, and each used to
+# be its own error, echoed back in full. Building and sending them all took far more memory and
+# time than the body itself, on the same thread that answers every other request.
+
+HOSTILE_BODIES = [
+    pytest.param(
+        {"pending_agreements": {f"Qm{i}": list(range(1_000)) for i in range(20)}},
+        id="many-bad-entries",
+    ),
+    pytest.param({f"unknown{i}": 0 for i in range(20_000)}, id="many-unknown-fields"),
+    pytest.param({"deployment_id": "Q" * 1_000_000}, id="huge-string"),
+    pytest.param({"pending_agreements": {"Q" * 1_000_000: []}}, id="huge-key"),
+]
+
+
+@pytest.mark.parametrize("fields", HOSTILE_BODIES)
+def test_a_hostile_body_gets_a_short_refusal(fields):
+    response = _post(_request(**fields))
+
+    assert response.status_code == 422
+    assert len(response.content) < 20_000, f"{len(response.content):,} bytes"
+    detail = response.json()["detail"]
+    assert 1 <= len(detail) <= 20, f"{len(detail):,} errors"
+    assert detail[0]["loc"][0] == "body"
+
+
 # --- The size of the whole body -------------------------------------------------------------
 #
 # The checks above run only once the whole body has been read and parsed, which for a huge body
