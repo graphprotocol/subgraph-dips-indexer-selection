@@ -9,6 +9,7 @@ import random
 import re
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -114,10 +115,14 @@ OUTCOME_FIELDS = {"indexer", "chain", "outcome", "reason", "detail", "deployment
 
 
 def assert_matches_contract(payload):
-    """Check a pushed body against every rule CONTRACT.md sets for POST /freshness."""
+    """Check a pushed body against every rule CONTRACT.md sets for POST /freshness, and the
+    stricter ones the service's validation adds."""
     json.dumps(payload, allow_nan=False)
     assert set(payload) == {"minute", "outcomes"}
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:00Z", payload["minute"])
+    minute = datetime.fromisoformat(payload["minute"])
+    assert minute.tzinfo is not None
+    assert (minute.second, minute.microsecond) == (0, 0)
     outcomes = payload["outcomes"]
     assert len(outcomes) <= 50_000
     assert len({(o["indexer"], o["chain"]) for o in outcomes}) == len(outcomes)
@@ -126,6 +131,7 @@ def assert_matches_contract(payload):
         assert re.fullmatch(r"0x[0-9a-f]{40}", o["indexer"])
         assert 1 <= len(o["chain"]) <= 64
         assert o["reason"] in CONTRACT_REASONS[o["outcome"]]
+        assert o["reason"] is None or re.fullmatch(r"[a-z][a-z0-9_]*", o["reason"])
         assert o["detail"] is None or (isinstance(o["detail"], str) and len(o["detail"]) <= 300)
         assert o["deployment"] is None or len(o["deployment"]) <= 64
         age = o["age_seconds"]
@@ -193,6 +199,42 @@ async def test_a_whole_minute_end_to_end():
     assert clock.now == MINUTE + 90
     assert len(gateway.asked) == 7
     assert prober.last_push is not None
+
+
+async def test_the_pushed_minute_is_the_one_just_ended_never_one_ahead_of_the_clock():
+    """The service rejects a minute more than 5 minutes ahead of its clock, or off a whole
+    minute, so the prober pushes the minute it checked, 90 seconds after it began."""
+    clock = FakeClock(MINUTE)
+    pushed = []
+    prober = _prober(None, FakeGateway(clock, {}), clock, pushed)
+    prober._targets = Targets(pairs=(), eligible={})
+
+    await prober.run_minute(MINUTE)
+
+    assert_matches_contract(pushed[0])
+    assert datetime.fromisoformat(pushed[0]["minute"]).timestamp() == MINUTE
+    assert clock.now == MINUTE + 90
+
+
+async def test_a_minute_the_service_already_applied_counts_as_pushed(caplog):
+    """An answer of applied: false means the service already has that minute; it isn't a
+    failure, so it is neither retried nor held against the prober's health."""
+    clock = FakeClock(MINUTE)
+    pushed = []
+    prober = _prober(None, FakeGateway(clock, {}), clock, pushed)
+    prober._targets = Targets(pairs=(), eligible={})
+    prober._push_payload = lambda payload: (
+        pushed.append(payload) or {"status": "success", "minute": payload["minute"],
+                                   "applied": False, "pairs": 0}
+    )
+
+    with caplog.at_level(logging.INFO, logger="freshness_prober"):
+        await prober.run_minute(MINUTE)
+
+    assert len(pushed) == 1
+    assert prober.last_push is not None
+    assert "applied=False" in caplog.text
+    assert "Failed to push" not in caplog.text
 
 
 async def test_a_minute_where_no_indexer_answers_is_void_for_all():
