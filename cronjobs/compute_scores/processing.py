@@ -243,7 +243,7 @@ def _valid_chain_prices(indexer: str, min_prices: dict) -> dict:
     """
     valid = {}
     invalid_count = 0
-    examples = []
+    examples: list[str] = []
     for chain, price in min_prices.items():
         parsed = _parse_price(price)
         if parsed is not None:
