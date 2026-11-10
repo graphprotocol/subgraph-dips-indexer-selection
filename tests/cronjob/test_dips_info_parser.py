@@ -201,6 +201,21 @@ def test_invalid_base_price_leaves_chain_unpriced(bad_price, caplog):
     assert "0xindexer" in warning and "arbitrum-one" in warning and _for_log(bad_price) in warning
 
 
+def test_many_invalid_base_prices_give_1_warning_with_their_count(caplog):
+    # A reply can list any number of chains, so 1 line for each bad price could flood the log.
+    body = {"min_grt_per_30_days": {f"chain-{i}": None for i in range(1_000)}}
+
+    with caplog.at_level(logging.WARNING, logger="processing"):
+        record = _fetch_record(body)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"{len(warnings):,} warnings"
+    assert "0xindexer" in warnings[0] and "1,000" in warnings[0]
+    # The first 3 are named as examples, and no more.
+    assert "'chain-2'" in warnings[0] and "'chain-3'" not in warnings[0]
+    assert json.loads(record["dips_min_grt_per_30_days"]) == {}
+
+
 @pytest.mark.parametrize("bad_price", INVALID_PRICES)
 def test_invalid_base_price_is_not_inferred_as_supported_network(bad_price):
     body = {"min_grt_per_30_days": {"arbitrum-one": bad_price, "mainnet": 45}}

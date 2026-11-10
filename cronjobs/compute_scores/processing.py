@@ -238,19 +238,27 @@ def _valid_chain_prices(indexer: str, min_prices: dict) -> dict:
     """Keep each per-chain base price as a float, dropping and logging any that is not valid.
 
     The selection service treats a chain with no price as unpriced and excludes the indexer there.
+    A reply can list any number of chains, so the dropped prices get 1 warning per indexer, with
+    their count and the first 3 as examples.
     """
     valid = {}
+    invalid_count = 0
+    examples = []
     for chain, price in min_prices.items():
         parsed = _parse_price(price)
         if parsed is not None:
             valid[chain] = parsed
-        else:
-            logger.warning(
-                "Ignoring invalid DIPs base price from indexer %s for chain %s: %s",
-                indexer,
-                _for_log(chain),
-                _for_log(price),
-            )
+            continue
+        invalid_count += 1
+        if len(examples) < 3:
+            examples.append(f"chain {_for_log(chain)}: {_for_log(price)}")
+    if invalid_count:
+        logger.warning(
+            "Ignoring invalid DIPs base prices from indexer %s for %s chain(s), including %s",
+            indexer,
+            f"{invalid_count:,}",
+            "; ".join(examples),
+        )
     return valid
 
 
