@@ -32,7 +32,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
@@ -104,7 +104,13 @@ class SelectionRequest(BaseModel):
 
     Follows the SelectionRequest struct in dipper's Rust HTTP client, which types chain_id
     as optional. Dipper's reassess job always sets it, and a request without one is a 422.
+
+    A field this model does not know is a 422 too. Dipper's struct is kept in step with this
+    model by hand, so a field renamed on 1 side would otherwise be dropped without a word, and a
+    dropped blocklist or price ceiling would select blocked or over-priced indexers.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     deployment_id: str
     existing_indexers: Optional[list[str]] = None
