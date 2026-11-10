@@ -61,7 +61,9 @@ pushes in a row fail, and the liveness probe then restarts it. A restart fixes a
 inside the pod, such as a rotated push token. If IISA or the network subgraph stays
 unreachable instead, each restarted container fails its first push and then its startup
 probe, so the pod shows CrashLoopBackOff and retries every 15 to 20 minutes until the cause clears. It has no readiness probe, since nothing
-sends it traffic.
+sends it traffic. A rollout stops the old fetcher pod before starting the new one too:
+otherwise the old pod, running the old code, would keep pushing every hour for as long as
+the new one could not make its first push.
 
 ## Prerequisites
 
