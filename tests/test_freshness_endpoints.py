@@ -4,7 +4,7 @@ import json
 import logging
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,9 +20,16 @@ TOKEN = "fake-freshness-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
-def _minute(minutes_ago: int = 2) -> str:
-    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    return (now - timedelta(minutes=minutes_ago)).isoformat().replace("+00:00", "Z")
+def _now_minute() -> datetime:
+    return datetime.now(timezone.utc).replace(second=0, microsecond=0)
+
+
+def _minute(minutes_ago: int = 2, now: Optional[datetime] = None) -> str:
+    """The minute ``minutes_ago`` before ``now``. A test that needs 2 minutes in a fixed order
+    reads the clock once and passes it as ``now``, since the clock may pass a minute between.
+    """
+    moment = (now or _now_minute()) - timedelta(minutes=minutes_ago)
+    return moment.isoformat().replace("+00:00", "Z")
 
 
 def _outcome(**overrides: Any) -> dict[str, Any]:
@@ -93,10 +100,11 @@ class TestPush:
         assert (response.json()["applied"], response.json()["pairs"]) == (True, 0)
 
     def test_repeated_or_older_minute_is_ignored(self, client):
-        client.post("/freshness", json=_push(_minute(2), _outcome()))
+        now = _now_minute()
+        client.post("/freshness", json=_push(_minute(2, now), _outcome()))
 
-        repeated = client.post("/freshness", json=_push(_minute(2), _outcome(outcome="fail")))
-        older = client.post("/freshness", json=_push(_minute(3), _outcome(outcome="fail")))
+        repeated = client.post("/freshness", json=_push(_minute(2, now), _outcome(outcome="fail")))
+        older = client.post("/freshness", json=_push(_minute(3, now), _outcome(outcome="fail")))
 
         for response in (repeated, older):
             assert response.status_code == 200
@@ -115,8 +123,11 @@ class TestPush:
 
     def test_indexer_is_compared_in_lower_case(self, client):
         mixed_case = "0x" + "A1" * 20
-        response = client.post("/freshness", json=_push(_minute(3), _outcome(indexer=mixed_case)))
-        client.post("/freshness", json=_push(_minute(2), _outcome()))
+        now = _now_minute()
+        response = client.post(
+            "/freshness", json=_push(_minute(3, now), _outcome(indexer=mixed_case))
+        )
+        client.post("/freshness", json=_push(_minute(2, now), _outcome()))
 
         assert response.status_code == 200
         assert list(client.get("/freshness").json()["chains"][CHAIN]["indexers"]) == [INDEXER]
@@ -129,9 +140,10 @@ class TestPush:
         )
         freshness_file.write_text("a file where a folder would have to be")
 
+        minute = _minute()
         with caplog.at_level(logging.ERROR, logger="iisa-service"):
-            failed = client.post("/freshness", json=_push(_minute(), _outcome()))
-        retried = client.post("/freshness", json=_push(_minute(), _outcome()))
+            failed = client.post("/freshness", json=_push(minute, _outcome()))
+        retried = client.post("/freshness", json=_push(minute, _outcome()))
 
         assert failed.status_code == 500
         assert any("Failed to apply or save" in r.getMessage() for r in caplog.records)
@@ -232,6 +244,30 @@ class TestPushValidation:
         assert response.status_code == 422, response.text
 
 
+class TestUnencodableText:
+    """Text holding half of a UTF-16 surrogate pair can't be written out as UTF-8."""
+
+    @staticmethod
+    def _post(client: TestClient, body: dict[str, Any]) -> Any:
+        content = json.dumps(body).replace("-HALF", "\\ud800").encode()
+        return client.post(
+            "/freshness", content=content, headers={"Content-Type": "application/json"}
+        )
+
+    @pytest.mark.parametrize("field", ["chain", "detail", "deployment"])
+    def test_lone_surrogate_is_a_422_and_nothing_is_stored(self, client, field):
+        response = self._post(client, _push(_minute(), _outcome(**{field: "x-HALF"})))
+
+        assert response.status_code == 422, response.text
+        assert "ud800" in response.text
+        assert client.get("/freshness").json()["chains"] == {}
+
+    def test_lone_surrogate_in_a_field_name_is_a_422(self, client):
+        response = self._post(client, {**_push(_minute()), "x-HALF": 1})
+
+        assert response.status_code == 422, response.text
+
+
 class TestRead:
     def test_reports_nothing_before_the_first_push(self, client):
         response = client.get("/freshness")
@@ -279,8 +315,9 @@ class TestRead:
         assert body["chains"][CHAIN]["indexers"][INDEXER]["window_passed"] == 1
 
     def test_mark_clears_after_5_passing_minutes(self, client):
+        now = _now_minute()
         for minutes_ago in range(7, 2, -1):
-            client.post("/freshness", json=_push(_minute(minutes_ago), _outcome()))
+            client.post("/freshness", json=_push(_minute(minutes_ago, now), _outcome()))
 
         pair = client.get("/freshness").json()["chains"][CHAIN]["indexers"][INDEXER]
         assert (pair["marked"], pair["judged"], pair["share_28d"]) == (False, True, 1.0)

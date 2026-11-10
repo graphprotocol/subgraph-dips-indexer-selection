@@ -317,17 +317,31 @@ def _whole_utc_minute(value: Any) -> datetime:
     return utc
 
 
+def _utf8_text(text: str) -> str:
+    """Refuse text holding half of a UTF-16 surrogate pair. Stored, it could never be written
+    out as UTF-8, and every later GET /freshness would fail.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ValueError("text holds half of a UTF-16 surrogate pair") from e
+    return text
+
+
+_Utf8Text = Annotated[str, AfterValidator(_utf8_text)]
+
+
 class FreshnessOutcome(BaseModel):
     """1 indexer's outcome on 1 chain in a freshness push. Numbers sent as text are refused."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     indexer: Annotated[str, Field(pattern=r"^0x[0-9a-fA-F]{40}$"), AfterValidator(str.lower)]
-    chain: str = Field(min_length=1, max_length=64)
+    chain: _Utf8Text = Field(min_length=1, max_length=64)
     outcome: Literal["pass", "fail", "no_evidence", "void"]
     reason: Optional[str] = Field(default=None, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
-    detail: Optional[str] = Field(default=None, max_length=300)
-    deployment: Optional[str] = Field(default=None, max_length=64)
+    detail: Optional[_Utf8Text] = Field(default=None, max_length=300)
+    deployment: Optional[_Utf8Text] = Field(default=None, max_length=64)
     age_seconds: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
 
 
@@ -767,11 +781,15 @@ app = FastAPI(
 
 
 def _json_safe(value: Any) -> Any:
-    """Replace NaN and infinite floats, at any depth, with their text form."""
+    """Replace NaN and infinite floats, at any depth, with their text form, and write half of a
+    UTF-16 surrogate pair in text as a \\u escape, since UTF-8 can't encode it.
+    """
     if isinstance(value, float) and not math.isfinite(value):
         return str(value)
+    if isinstance(value, str):
+        return value.encode("utf-8", "backslashreplace").decode("utf-8")
     if isinstance(value, dict):
-        return {key: _json_safe(item) for key, item in value.items()}
+        return {_json_safe(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
