@@ -228,6 +228,24 @@ def test_error_text_of_600_characters_is_cut():
     assert text.endswith("...")
 
 
+class _ErrorWithBrokenText(Exception):
+    def __str__(self):
+        raise RuntimeError("cannot describe this error")
+
+
+class _ErrorWithNonText(Exception):
+    def __str__(self):
+        return 5  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize("error", [_ErrorWithBrokenText(), _ErrorWithNonText()])
+def test_error_whose_text_cannot_be_read_is_named_alone(error):
+    # This runs while handling an error. Raising here would fail the fetch for every indexer.
+    from escaping import error_for_log
+
+    assert error_for_log(error) == type(error).__name__
+
+
 def test_missing_error_is_said_plainly():
     from escaping import error_for_log
 

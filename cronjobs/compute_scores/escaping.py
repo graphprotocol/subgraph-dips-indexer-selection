@@ -42,7 +42,12 @@ def error_for_log(error: Optional[BaseException]) -> str:
     """
     if error is None:
         return "no error recorded"
-    text = f"{type(error).__name__}: {error}".encode("unicode_escape").decode("ascii")
+    try:
+        text = f"{type(error).__name__}: {error}".encode("unicode_escape").decode("ascii")
+    except Exception:
+        # The error's own text could not be read. This runs while another error is being
+        # handled, so raising here would replace it; the log line keeps the error's name alone.
+        return type(error).__name__
     if len(text) <= _MAX_LOGGED_ERROR_CHARS:
         return text
     return text[:_MAX_LOGGED_ERROR_CHARS] + "..."
