@@ -7,6 +7,7 @@ token, so nothing in a request may be unboundedly large.
 """
 
 import json
+import tracemalloc
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -312,6 +313,42 @@ async def test_a_body_declared_over_the_limit_is_refused_without_reading_any_of_
     assert status == 413
     assert read is None
     assert asked == 0
+
+
+async def test_the_pieces_are_let_go_once_joined():
+    # Each piece is made only when asked for, so the limit holds the only copy. While the route
+    # runs, only the joined body should still be held, not the pieces it was made from too.
+    total = MAX_SELECTION_BODY_BYTES - 1_000
+    count = -(-total // PIECE)
+    sent = 0
+    held_while_routing = []
+
+    async def receive():
+        nonlocal sent
+        size = min(PIECE, total - sent)
+        sent += size
+        return {"type": "http.request", "body": bytes(size), "more_body": sent < total}
+
+    async def route(scope, receive, send):
+        await receive()
+        held_while_routing.append(tracemalloc.get_traced_memory()[0] - before)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def send(message):
+        pass
+
+    scope = {"type": "http", "method": "POST", "path": "/select-indexers", "headers": []}
+    tracemalloc.start()
+    before = tracemalloc.get_traced_memory()[0]
+    try:
+        await _SelectionBodyLimit(route)(scope, receive, send)
+    finally:
+        tracemalloc.stop()
+
+    assert count > 1
+    [held] = held_while_routing
+    assert held < 1.5 * total, f"{held:,} bytes held for a {total:,} byte body"
 
 
 async def test_other_routes_pass_through_untouched():

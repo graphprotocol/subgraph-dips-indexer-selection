@@ -704,6 +704,8 @@ class _SelectionBodyLimit:
                 break
 
         body = b"".join(pieces)
+        # Let the pieces go, so the route runs holding 1 copy of the body rather than 2.
+        del pieces
         replayed = False
 
         async def replay() -> Message:
