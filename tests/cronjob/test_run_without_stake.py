@@ -9,7 +9,7 @@ for the fallback's equal neutral scores.
 import logging
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
@@ -28,6 +28,7 @@ from redpanda import RedpandaProvider  # noqa: E402
 INDEXERS = ["0x" + c * 40 for c in "abc"]
 URLS = {indexer: f"https://{indexer[2:8]}.example/" for indexer in INDEXERS}
 STAKE_COLUMNS = ["stake_to_fees", "total_query_fees", "last_known_slashable_stake"]
+READ_AT = "stake_read_at"
 QUALITY_COLUMNS = ["uptime_score", "success_rate", "lat_lin_reg_coefficient", "query_count"]
 STAKE = [{"id": indexer, "stakedTokens": "1000000", "lockedTokens": "0"} for indexer in INDEXERS]
 REJECTED_KEY = {"errors": [{"message": "auth error: API key not found"}]}
@@ -118,6 +119,20 @@ def _scores(stake_reply: dict[str, Any]) -> pd.DataFrame:
         ).set_index("indexer")
 
 
+def _run_job(monkeypatch: pytest.MonkeyPatch, stake_reply: dict[str, Any]) -> list[dict[str, Any]]:
+    """Run the whole job without GeoIP, the stake read answered by stake_reply; return the rows
+    it pushed to iisa.
+    """
+    pushed: list[list[dict[str, Any]]] = []
+    monkeypatch.setattr(main, "RedpandaProvider", _provider)
+    monkeypatch.setattr(main, "validate_geoip_databases", lambda: False)
+    monkeypatch.setattr(main, "discover_indexers_from_network_subgraph", lambda _url: URLS)
+    monkeypatch.setattr("redpanda.post_scores", lambda _url, _token, rows: pushed.append(rows))
+    with patch("subgraph.requests.post", return_value=_subgraph_reply(stake_reply)):
+        assert main.run_scoring() is True
+    return pushed[-1]
+
+
 def _failed_stake_lookup() -> pd.DataFrame:
     with patch("subgraph.requests.post", return_value=_subgraph_reply(REJECTED_KEY)):
         return _provider().fetch_stake_to_fees()
@@ -167,28 +182,49 @@ class TestFailedStakeLookup:
 
     @pytest.mark.usefixtures("replay")
     def test_the_job_pushes_measured_scores_with_stake_missing(self, monkeypatch, caplog):
-        pushed: list[list[dict[str, Any]]] = []
-        provider = _provider()
-        monkeypatch.setattr(main, "RedpandaProvider", lambda: provider)
-        monkeypatch.setattr(main, "validate_geoip_databases", lambda: False)
-        monkeypatch.setattr(main, "discover_indexers_from_network_subgraph", lambda _url: URLS)
-        monkeypatch.setattr("redpanda.post_scores", lambda _url, _token, rows: pushed.append(rows))
-
-        with (
-            patch("subgraph.requests.post", return_value=_subgraph_reply(REJECTED_KEY)),
-            caplog.at_level("INFO"),
-        ):
-            assert main.run_scoring() is True
+        with caplog.at_level("INFO"):
+            pushed = _run_job(monkeypatch, REJECTED_KEY)
 
         assert any("mode=partial" in r.getMessage() for r in caplog.records)
-        rows = {row["indexer"]: row for row in pushed[0]}
+        rows = {row["indexer"]: row for row in pushed}
         assert [rows[i]["success_rate"] for i in INDEXERS] == [1.0, 0.75, 0.5]
         for row in rows.values():
-            assert [row[column] for column in STAKE_COLUMNS] == [None, None, None]
+            assert [row[column] for column in [*STAKE_COLUMNS, READ_AT]] == [None] * 4
             assert "norm_stake_to_fees" not in row
         lookup_error = _first(caplog.records, "ERROR", "Failed to fetch stake data")
         assert lookup_error is not None and lookup_error.exc_info is not None
         assert _first(caplog.records, "WARNING", "Scores pushed without stake data") is not None
+
+
+class TestStakeReadTime:
+    """Each run records when its stake was read from the network subgraph."""
+
+    @pytest.mark.usefixtures("replay")
+    def test_a_successful_lookup_stamps_the_read_time_as_now(self):
+        before = datetime.now(timezone.utc)
+        scores = _scores({"data": {"indexers": STAKE}})
+        after = datetime.now(timezone.utc)
+
+        read_at = pd.to_datetime(scores.loc[INDEXERS, READ_AT], utc=True)
+        assert ((read_at >= before) & (read_at <= after)).all()
+
+    @pytest.mark.usefixtures("replay")
+    def test_the_pushed_scores_carry_the_read_time(self, monkeypatch):
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        pushed = _run_job(monkeypatch, {"data": {"indexers": STAKE}})
+        after = datetime.now(timezone.utc)
+
+        read_at = pd.to_datetime([row[READ_AT] for row in pushed], utc=True)
+        assert ((read_at >= before) & (read_at <= after)).all()
+
+    def test_the_fallback_scores_have_no_read_time(self, monkeypatch):
+        """The fallback never reads stake, so its zeros can never pass for a reading."""
+        monkeypatch.setattr(processing, "fetch_dips_info", _pricing)
+        monkeypatch.setattr(processing, "fetch_and_filter_graph_node_versions", lambda df, _u: df)
+
+        scores = processing.compute_degraded_scores(URLS)
+
+        assert scores[READ_AT].isna().all()
 
 
 def _first(records: list[logging.LogRecord], level: str, text: str) -> Optional[logging.LogRecord]:
