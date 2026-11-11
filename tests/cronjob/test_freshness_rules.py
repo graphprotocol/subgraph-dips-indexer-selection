@@ -516,6 +516,29 @@ def test_an_indexer_is_paired_only_with_chains_it_has_priced_as_the_service_read
     assert {chain for _, chain in dips_pairs([record])} == priced
 
 
+def test_without_a_price_field_in_any_record_every_listed_chain_is_paired():
+    """As selection does when the scores have no price column at all."""
+    records = [
+        {"indexer": INDEXER, "dips_supported_networks": ["mainnet", "base"]},
+        {"indexer": "0x" + "b" * 40, "dips_supported_networks": '["matic"]'},
+    ]
+
+    assert dips_pairs(records) == [
+        (INDEXER, "base"),
+        (INDEXER, "mainnet"),
+        ("0x" + "b" * 40, "matic"),
+    ]
+
+
+def test_with_a_price_field_in_some_records_a_record_without_one_has_no_priced_chains():
+    records = [
+        {"indexer": INDEXER, "dips_supported_networks": ["mainnet"]},
+        _offer("0x" + "b" * 40, ["matic"], {"matic": 1}),
+    ]
+
+    assert dips_pairs(records) == [("0x" + "b" * 40, "matic")]
+
+
 def test_an_indexers_chains_keep_their_order_without_repeats():
     record = _offer(INDEXER, ["mainnet", "base", "matic", "mainnet"], {"matic": 5, "mainnet": 10})
 

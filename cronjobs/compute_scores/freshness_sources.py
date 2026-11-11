@@ -208,6 +208,11 @@ def _counted(count: int, noun: str) -> str:
 
 def _log_left_out(left_out: LeftOut) -> None:
     """1 line for each kind of thing a refresh left out of GET /scores, however many there were."""
+    if left_out.no_price_field:
+        logger.warning(
+            "GET /scores records have no dips_min_grt_per_30_days field, so every chain an "
+            "indexer lists is checked, as selection applies no price filter without it"
+        )
     if left_out.refused_names:
         indexer, name = left_out.refused_names[0]
         logger.warning(

@@ -293,6 +293,20 @@ def test_a_listed_chain_without_a_price_is_logged_at_debug_only(caplog):
     assert any("2 listed chains" in r.getMessage() for r in caplog.records)
 
 
+def test_scores_without_a_price_field_check_every_listed_chain_with_a_warning(caplog):
+    """Selection applies no price filter when the scores carry no price field at all, so every
+    listed chain can be picked and is worth checking."""
+    records = [{"indexer": INDEXER_A, "dips_supported_networks": ["mainnet", "base"]}]
+    sources = _Sources(_scores(*records), [])
+
+    with caplog.at_level(logging.WARNING):
+        targets = sources.loader()()
+
+    assert targets.pairs == ((INDEXER_A, "base"), (INDEXER_A, "mainnet"))
+    (warning,) = _warnings(caplog)
+    assert "dips_min_grt_per_30_days" in warning
+
+
 def test_first_allocations_are_cached_across_refreshes():
     young = _allocation(INDEXER_A, "B", int(NOW - DAY))
     sources = _Sources(

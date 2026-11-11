@@ -392,6 +392,8 @@ class LeftOut:
     unpriced: int = 0
     # Indexers offering more than MAX_CHAINS_PER_INDEXER chains, with how many they offer
     over_limit: dict[str, int] = field(default_factory=dict)
+    # No record had a price field, so every listed chain was paired, as selection then does
+    no_price_field: bool = False
 
 
 def _listed(value: object) -> list[object]:
@@ -443,6 +445,8 @@ def _chains_of(indexer: str, record: Mapping[str, Any], left_out: LeftOut) -> li
     entries = _listed(record.get("dips_supported_networks"))
     left_out.refused_names.extend((indexer, entry) for entry in entries if not is_chain_name(entry))
     listed = supported_chains(entries)
+    if left_out.no_price_field:
+        return listed
     priced = _priced_chains(record.get("dips_min_grt_per_30_days"))
     if priced is None:
         left_out.unreadable_prices.append(indexer)
@@ -454,11 +458,15 @@ def _chains_of(indexer: str, record: Mapping[str, Any], left_out: LeftOut) -> li
 
 def _offered_chains(records: Iterable[object], left_out: LeftOut) -> dict[str, list[str]]:
     """Each indexer's chains from GET /scores records: those it offers DIPs on and has priced,
-    in the order it lists them, without repeats. Indexers are in lower case."""
+    or all it offers when no record has a price field, in the order it lists them, without
+    repeats. Indexers are in lower case."""
+    usable = [r for r in records if isinstance(r, dict) and is_indexer_address(r.get("indexer"))]
+    # The service applies no price filter when its scores have no price column at all.
+    left_out.no_price_field = bool(usable) and not any(
+        "dips_min_grt_per_30_days" in record for record in usable
+    )
     chains: dict[str, dict[str, None]] = {}
-    for record in records:
-        if not isinstance(record, dict) or not is_indexer_address(record.get("indexer")):
-            continue
+    for record in usable:
         indexer = record["indexer"].lower()
         offered = chains.setdefault(indexer, {})
         offered.update(dict.fromkeys(_chains_of(indexer, record, left_out)))
