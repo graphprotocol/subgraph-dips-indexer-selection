@@ -74,6 +74,12 @@ Because the traffic is enormous, the job samples it instead of reading every rec
 
 The measurement is built to degrade rather than disappear. If geographic lookups are unavailable it falls back to neutral latency scores; if the wider pipeline fails it still publishes real prices with equal quality scores rather than going dark. It can also be told to exclude any indexer running below a minimum `graph-node` version, so stale software does not win paid work.
 
+### Checking freshness (off by default)
+
+The sync-status fetcher can also check, once a minute, that each indexer serves fresh data on every chain it offers DIPs on. For each indexer and chain it picks at random 1 subgraph the indexer first allocated to at least `FRESHNESS_MIN_ALLOCATION_AGE_DAYS` days ago (7 by default) and still has open, asks the indexer for that subgraph's latest block through the gateway, as a customer's query would reach it, and counts the answer as fresh when the block is at most `FRESHNESS_BAR_SECONDS` old (36 by default). Each minute's outcomes go to the service about 30 seconds after the minute ends. A failure on the gateway's side or the fetcher's own is reported as void rather than held against the indexer, and so is a minute in which most indexers didn't answer at all.
+
+It runs only when `FRESHNESS_PROBE_ENABLED` is `true`. It then needs `FRESHNESS_GATEWAY_URL`, the gateway's base address such as `https://gateway.thegraph.com/api`, and `FRESHNESS_GATEWAY_API_KEY`, and the fetcher refuses to start without them. Every check is a paid query, so switching it on spends query fees on that API key, about 1,440 queries a day for each indexer and chain. `FRESHNESS_REFRESH_INTERVAL` (900 seconds) sets how often it re-reads which indexers and subgraphs to check, `FRESHNESS_REQUEST_TIMEOUT` (25 seconds) how long a check waits for an answer, and `FRESHNESS_MAX_CONCURRENCY` (50) how many checks run at once. The fetcher's `/health` body shows when the last minute was pushed.
+
 ### Choosing indexers
 
 When asked to fill a deployment, the service blends each indexer's measurements into a single weighted score:
