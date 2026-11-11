@@ -9,10 +9,9 @@ are the ones the service's POST /freshness accepts.
 from __future__ import annotations
 
 import json
-import logging
 import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Optional, Sequence, TypeGuard, Union
 
@@ -70,8 +69,6 @@ _BAD_INDEXER_ERROR = re.compile(
 )
 # indexer-service answers 400 or 402 when it rejects the gateway's payment receipt.
 _PAYMENT_REFUSED_ERROR = re.compile(r'^BadResponse\("?40[02]\b')
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -382,19 +379,36 @@ def is_chain_name(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and bool(_CHAIN_NAME.fullmatch(value))
 
 
-def supported_chains(value: object) -> list[str]:
-    """The chain names in a ``dips_supported_networks`` value, a list or a JSON string of one.
+@dataclass
+class LeftOut:
+    """What dips_pairs left out of GET /scores records, for the caller to log once per refresh
+    rather than once per item."""
 
-    Anything unreadable gives no chains, as the service's own parser does.
-    """
+    # (indexer, the entry it listed) for each listed chain name that isn't a usable one
+    refused_names: list[tuple[str, object]] = field(default_factory=list)
+    # Indexers whose price field is there but can't be read
+    unreadable_prices: list[str] = field(default_factory=list)
+    # Listed chains without a price, which selection can't pick an indexer on anyway
+    unpriced: int = 0
+    # Indexers offering more than MAX_CHAINS_PER_INDEXER chains, with how many they offer
+    over_limit: dict[str, int] = field(default_factory=dict)
+
+
+def _listed(value: object) -> list[object]:
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except (ValueError, RecursionError):
             return []
-    if not isinstance(value, list):
-        return []
-    return list(dict.fromkeys(chain for chain in value if is_chain_name(chain)))
+    return value if isinstance(value, list) else []
+
+
+def supported_chains(value: object) -> list[str]:
+    """The chain names in a ``dips_supported_networks`` value, a list or a JSON string of one.
+
+    Anything unreadable gives no chains, as the service's own parser does.
+    """
+    return list(dict.fromkeys(chain for chain in _listed(value) if is_chain_name(chain)))
 
 
 def _is_price(value: object) -> bool:
@@ -407,47 +421,61 @@ def _is_price(value: object) -> bool:
     return math.isfinite(price) and price >= 0
 
 
-def _priced_chains(value: object) -> set[str]:
+def _priced_chains(value: object) -> Optional[set[str]]:
     """The chains with a usable price in a ``dips_min_grt_per_30_days`` value, an object or a
-    JSON string of one. Selection leaves an indexer out on any other chain, as the service's
-    _extract_chain_price reads a price: a finite number of at least 0, not true or false.
+    JSON string of one, or None when the value is there but can't be read. Selection leaves an
+    indexer out on any other chain, as the service's _extract_chain_price reads a price: a finite
+    number of at least 0, not true or false.
     """
+    if value is None:
+        return set()
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except (ValueError, RecursionError):
-            return set()
+            return None
     if not isinstance(value, dict):
-        return set()
+        return None
     return {chain for chain, price in value.items() if _is_price(price)}
 
 
-def _offered_chains(records: Iterable[object]) -> dict[str, list[str]]:
+def _chains_of(indexer: str, record: Mapping[str, Any], left_out: LeftOut) -> list[str]:
+    entries = _listed(record.get("dips_supported_networks"))
+    left_out.refused_names.extend((indexer, entry) for entry in entries if not is_chain_name(entry))
+    listed = supported_chains(entries)
+    priced = _priced_chains(record.get("dips_min_grt_per_30_days"))
+    if priced is None:
+        left_out.unreadable_prices.append(indexer)
+        priced = set()
+    kept = [chain for chain in listed if chain in priced]
+    left_out.unpriced += len(listed) - len(kept)
+    return kept
+
+
+def _offered_chains(records: Iterable[object], left_out: LeftOut) -> dict[str, list[str]]:
     """Each indexer's chains from GET /scores records: those it offers DIPs on and has priced,
     in the order it lists them, without repeats. Indexers are in lower case."""
     chains: dict[str, dict[str, None]] = {}
     for record in records:
         if not isinstance(record, dict) or not is_indexer_address(record.get("indexer")):
             continue
-        priced = _priced_chains(record.get("dips_min_grt_per_30_days"))
-        listed = supported_chains(record.get("dips_supported_networks"))
-        offered = chains.setdefault(record["indexer"].lower(), {})
-        offered.update((chain, None) for chain in listed if chain in priced)
+        indexer = record["indexer"].lower()
+        offered = chains.setdefault(indexer, {})
+        offered.update(dict.fromkeys(_chains_of(indexer, record, left_out)))
     return {indexer: list(offered) for indexer, offered in chains.items() if offered}
 
 
-def dips_pairs(records: Iterable[object]) -> list[tuple[str, str]]:
+def dips_pairs(
+    records: Iterable[object], left_out: Optional[LeftOut] = None
+) -> list[tuple[str, str]]:
     """Every (indexer, chain) to check from GET /scores records, sorted: of the chains an indexer
-    offers DIPs on and has priced, the first MAX_CHAINS_PER_INDEXER in the order it lists them."""
+    offers DIPs on and has priced, the first MAX_CHAINS_PER_INDEXER in the order it lists them.
+    What is left out is added to ``left_out`` when it is given."""
+    left_out = LeftOut() if left_out is None else left_out
     pairs: list[tuple[str, str]] = []
-    for indexer, chains in _offered_chains(records).items():
+    for indexer, chains in _offered_chains(records, left_out).items():
         if len(chains) > MAX_CHAINS_PER_INDEXER:
-            logger.warning(
-                "Indexer %s offers DIPs on %d priced chains; checking only the first %d",
-                indexer,
-                len(chains),
-                MAX_CHAINS_PER_INDEXER,
-            )
+            left_out.over_limit[indexer] = len(chains)
         pairs.extend((indexer, chain) for chain in chains[:MAX_CHAINS_PER_INDEXER])
     return sorted(pairs)
 

@@ -239,6 +239,60 @@ def test_an_indexer_listing_150_chains_is_checked_on_100_with_a_warning(caplog):
     assert "150" in warning.getMessage()
 
 
+def _warnings(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_refused_chain_names_get_1_warning_per_refresh(caplog):
+    """Nothing is dropped silently, and 1 line covers them however many there are."""
+    sources = _Sources(
+        _scores(
+            _offer(INDEXER_A, ["mainnet", "bad\nname", 7]),
+            _offer(INDEXER_B, ["\ud800", "base"]),
+        ),
+        [],
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        targets = sources.loader()()
+
+    assert targets.pairs == ((INDEXER_A, "mainnet"), (INDEXER_B, "base"))
+    (warning,) = _warnings(caplog)
+    assert "3 chain names" in warning and "listed by 2 indexers" in warning
+    assert INDEXER_A in warning and "bad\\nname" in warning and "\n" not in warning
+
+
+def test_unreadable_price_fields_get_1_warning_per_refresh(caplog):
+    sources = _Sources(
+        _scores(
+            _offer(INDEXER_A, ["mainnet"], "x{"),
+            _offer(INDEXER_B, ["mainnet"], ["mainnet"]),
+            _offer("0x" + "c" * 40, ["mainnet"]),
+        ),
+        [],
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        targets = sources.loader()()
+
+    assert targets.pairs == (("0x" + "c" * 40, "mainnet"),)
+    (warning,) = _warnings(caplog)
+    assert "2 indexers" in warning and INDEXER_A in warning
+
+
+def test_a_listed_chain_without_a_price_is_logged_at_debug_only(caplog):
+    """An indexer listing a chain it hasn't priced yet is ordinary."""
+    sources = _Sources(
+        _scores(_offer(INDEXER_A, ["mainnet", "matic", "base"], {"mainnet": 100.0})), []
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        sources.loader()()
+
+    assert _warnings(caplog) == []
+    assert any("2 listed chains" in r.getMessage() for r in caplog.records)
+
+
 def test_first_allocations_are_cached_across_refreshes():
     young = _allocation(INDEXER_A, "B", int(NOW - DAY))
     sources = _Sources(

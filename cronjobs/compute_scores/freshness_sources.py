@@ -13,9 +13,12 @@ import time
 from typing import Any, Callable, Optional, Sequence
 
 import requests
+from escaping import for_log
 from freshness_rules import (
+    MAX_CHAINS_PER_INDEXER,
     MAX_PAIRS,
     Allocation,
+    LeftOut,
     Targets,
     dips_pairs,
     eligible_deployments,
@@ -199,6 +202,46 @@ def score_records(scores_response: Any) -> list:
     return records
 
 
+def _counted(count: int, noun: str) -> str:
+    return f"{count:,} {noun}" if count == 1 else f"{count:,} {noun}s"
+
+
+def _log_left_out(left_out: LeftOut) -> None:
+    """1 line for each kind of thing a refresh left out of GET /scores, however many there were."""
+    if left_out.refused_names:
+        indexer, name = left_out.refused_names[0]
+        logger.warning(
+            "Left out %s that aren't 1 to 64 printable characters without spaces, listed by %s, "
+            "such as %s from indexer %s",
+            _counted(len(left_out.refused_names), "chain name"),
+            _counted(len({indexer for indexer, _ in left_out.refused_names}), "indexer"),
+            for_log(name),
+            indexer,
+        )
+    if left_out.unreadable_prices:
+        logger.warning(
+            "Couldn't read the DIPs prices of %s, so none of their chains is checked, "
+            "such as indexer %s",
+            _counted(len(left_out.unreadable_prices), "indexer"),
+            left_out.unreadable_prices[0],
+        )
+    if left_out.unpriced:
+        logger.debug(
+            "Left out %s without a price, which selection can't pick an indexer on",
+            _counted(left_out.unpriced, "listed chain"),
+        )
+    if left_out.over_limit:
+        indexer, count = next(iter(left_out.over_limit.items()))
+        logger.warning(
+            "Checking only the first %d priced chains of each indexer offering DIPs on more (%s), "
+            "such as indexer %s with %d",
+            MAX_CHAINS_PER_INDEXER,
+            _counted(len(left_out.over_limit), "indexer"),
+            indexer,
+            count,
+        )
+
+
 class TargetLoader:
     """Builds the Targets each minute checks, keeping first-allocation times between refreshes,
     since an indexer's first allocation on a deployment never changes."""
@@ -220,7 +263,9 @@ class TargetLoader:
         self._first_allocated: dict[tuple[str, str], int] = {}
 
     def __call__(self) -> Targets:
-        pairs = dips_pairs(score_records(self._fetch_scores()))
+        left_out = LeftOut()
+        pairs = dips_pairs(score_records(self._fetch_scores()), left_out)
+        _log_left_out(left_out)
         if len(pairs) > MAX_PAIRS:
             logger.error(
                 "%d (indexer, chain) pairs offer DIPs, more than 1 push holds; checking %d",

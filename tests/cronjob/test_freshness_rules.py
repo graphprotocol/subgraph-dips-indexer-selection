@@ -522,15 +522,12 @@ def test_an_indexers_chains_keep_their_order_without_repeats():
     assert dips_pairs([record]) == [(INDEXER, "mainnet"), (INDEXER, "matic")]
 
 
-def test_an_indexer_listing_150_chains_is_checked_on_the_first_100_it_lists(caplog):
+def test_an_indexer_listing_150_chains_is_checked_on_the_first_100_it_lists():
     chains = [f"chain-{n:03d}" for n in reversed(range(150))]
 
-    with caplog.at_level("WARNING", logger="freshness_rules"):
-        pairs = dips_pairs([_offer(INDEXER, chains, dict.fromkeys(chains, 1))])
+    pairs = dips_pairs([_offer(INDEXER, chains, dict.fromkeys(chains, 1))])
 
     assert {chain for _, chain in pairs} == set(chains[:100])
-    (warning,) = caplog.records
-    assert INDEXER in warning.getMessage() and "150" in warning.getMessage()
 
 
 def test_the_100_chain_limit_counts_only_usable_chains():
