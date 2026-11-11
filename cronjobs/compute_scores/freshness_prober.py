@@ -121,12 +121,16 @@ class FreshnessProber:
         self._refreshing = False
         self.last_push: Optional[datetime] = None
         self.running = False
+        # Set once the prober's thread has ended, for whatever reason; the fetcher's /health
+        # fails on it unless the fetcher is shutting down.
+        self.stopped = False
 
     def health(self, now: datetime) -> dict[str, Any]:
         """Fields for the fetcher's /health body."""
         last = self.last_push
         return {
             "running": self.running,
+            "stopped": self.stopped,
             "last_push": last.isoformat() if last else None,
             "last_push_age_seconds": int((now - last).total_seconds()) if last else None,
         }
@@ -326,9 +330,11 @@ def _run_in_thread(prober: FreshnessProber, gateway: GatewayClient, stop: thread
         asyncio.run(main())
     except Exception:
         logger.critical(
-            "Freshness prober stopped unexpectedly; no freshness pushes until a restart",
+            "Freshness prober stopped unexpectedly; /health now fails so the pod is restarted",
             exc_info=True,
         )
+    finally:
+        prober.stopped = True
 
 
 def start_freshness_prober(

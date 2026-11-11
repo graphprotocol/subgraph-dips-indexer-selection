@@ -9,7 +9,7 @@ import random
 import re
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -443,6 +443,36 @@ async def test_a_failed_refresh_keeps_the_previous_lists(caplog):
     assert prober._targets is first
     assert "keeping the previous lists" in caplog.text
     assert "no score records" in caplog.text
+
+
+def test_health_says_the_prober_has_not_stopped_while_its_thread_runs_or_before_it_starts():
+    clock = FakeClock(MINUTE)
+    prober = _prober(None, FakeGateway(clock, {}), clock, [])
+
+    fields = prober.health(datetime.fromtimestamp(MINUTE, timezone.utc))
+
+    assert (fields["running"], fields["stopped"]) == (False, False)
+
+
+class _GatewayThatFails:
+    async def __aenter__(self):
+        raise RuntimeError("no connection pool")
+
+    async def __aexit__(self, *_exc):
+        return None
+
+
+def test_a_prober_thread_that_ends_on_an_error_is_marked_stopped(caplog):
+    """The fetcher's /health fails on this, so the pod is restarted."""
+    clock = FakeClock(MINUTE)
+    prober = _prober(None, FakeGateway(clock, {}), clock, [])
+
+    with caplog.at_level(logging.CRITICAL, logger="freshness_prober"):
+        freshness_prober._run_in_thread(prober, _GatewayThatFails(), threading.Event())
+
+    assert prober.stopped is True
+    assert prober.health(datetime.fromtimestamp(MINUTE, timezone.utc))["stopped"] is True
+    assert "Freshness prober stopped unexpectedly" in caplog.text
 
 
 # ---------------------------------------------------------------------------

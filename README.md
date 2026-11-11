@@ -80,6 +80,8 @@ The sync-status fetcher can also check, once a minute, that each indexer serves 
 
 It runs only when `FRESHNESS_PROBE_ENABLED` is `true`. It then needs `FRESHNESS_GATEWAY_URL`, the gateway's base address such as `https://gateway.thegraph.com/api`, and `FRESHNESS_GATEWAY_API_KEY`, and the fetcher refuses to start without them. Every check is a paid query, so switching it on spends query fees on that API key, about 1,440 queries a day for each indexer and chain. `FRESHNESS_REFRESH_INTERVAL` (900 seconds) sets how often it re-reads which indexers and subgraphs to check, `FRESHNESS_REQUEST_TIMEOUT` (25 seconds) how long a check waits for an answer, and `FRESHNESS_MAX_CONCURRENCY` (50) how many checks run at once. The fetcher's `/health` body shows when the last minute was pushed.
 
+If the prober stops unexpectedly, the fetcher's `/health` answers 503 so the pod is restarted. A prober that runs but can't push, because the service or the gateway is down, leaves the answer alone, so someone else's outage doesn't restart the pod over and over.
+
 ### Choosing indexers
 
 When asked to fill a deployment, the service blends each indexer's measurements into a single weighted score:
