@@ -253,12 +253,12 @@ class TestProtobufRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# RedpandaProvider: write_scores / scores_exist_for_today
+# RedpandaProvider: write_scores
 # ---------------------------------------------------------------------------
 
 
 class TestScoresPush:
-    """Tests for the HTTP push path — write_scores POSTs to iisa, idempotency uses GET."""
+    """Tests for the HTTP push path: write_scores POSTs to iisa."""
 
     def _make_scores_df(self, today: bool = True) -> pd.DataFrame:
         """Build a minimal scores DataFrame."""
@@ -338,63 +338,6 @@ class TestScoresPush:
         assert mock_request.call_count == RETRY_ATTEMPTS
         assert mock_sleep.call_count == RETRY_ATTEMPTS - 1
         assert f"{RETRY_ATTEMPTS} attempts" in str(exc_info.value)
-
-    def test_scores_exist_for_today_true(self):
-        """GET /scores/status returning today's computed_at ⇒ skip recompute."""
-        # Arrange
-        provider = self._build_provider()
-        today_iso = datetime.now(timezone.utc).isoformat()
-
-        # Act
-        with patch("iisa_client.requests.request") as mock_request:
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_response.json.return_value = {"computed_at": today_iso, "rows": 1}
-            mock_request.return_value = mock_response
-
-            assert provider.scores_exist_for_today() is True
-
-        # Assert — GET with bearer auth
-        call = mock_request.call_args
-        assert call.args[0] == "GET"
-        assert call.args[1] == "http://iisa:8080/scores/status"
-        assert call.kwargs["headers"]["Authorization"] == "Bearer test-token"
-
-    def test_scores_exist_for_today_false_old_timestamp(self):
-        """Pre-today computed_at ⇒ run again."""
-        provider = self._build_provider()
-        old_iso = datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()
-
-        with patch("iisa_client.requests.request") as mock_request:
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_response.json.return_value = {"computed_at": old_iso, "rows": 1}
-            mock_request.return_value = mock_response
-
-            assert provider.scores_exist_for_today() is False
-
-    def test_scores_exist_for_today_false_on_push_error(self):
-        """Network failure on the status query ⇒ proceed with a fresh run (fail-safe)."""
-        import requests
-
-        provider = self._build_provider()
-
-        with patch("iisa_client.requests.request") as mock_request, patch("iisa_client.time.sleep"):
-            mock_request.side_effect = requests.ConnectionError("dns lookup failed")
-
-            assert provider.scores_exist_for_today() is False
-
-    def test_scores_exist_for_today_false_missing_computed_at(self):
-        """Empty/missing computed_at ⇒ proceed with a fresh run."""
-        provider = self._build_provider()
-
-        with patch("iisa_client.requests.request") as mock_request:
-            mock_response = MagicMock()
-            mock_response.status_code = 200
-            mock_response.json.return_value = {"computed_at": None, "rows": 0}
-            mock_request.return_value = mock_response
-
-            assert provider.scores_exist_for_today() is False
 
 
 # ---------------------------------------------------------------------------
