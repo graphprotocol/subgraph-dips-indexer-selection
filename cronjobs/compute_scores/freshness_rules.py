@@ -367,15 +367,15 @@ def eligible_deployments(
 
 
 def is_indexer_address(value: object) -> TypeGuard[str]:
-    return isinstance(value, str) and bool(_INDEXER_ADDRESS.match(value))
+    return isinstance(value, str) and bool(_INDEXER_ADDRESS.fullmatch(value))
 
 
 def is_deployment_hash(value: object) -> TypeGuard[str]:
-    return isinstance(value, str) and bool(_DEPLOYMENT_HASH.match(value))
+    return isinstance(value, str) and bool(_DEPLOYMENT_HASH.fullmatch(value))
 
 
 def is_deployment_entity_id(value: object) -> TypeGuard[str]:
-    return isinstance(value, str) and bool(_DEPLOYMENT_ENTITY_ID.match(value))
+    return isinstance(value, str) and bool(_DEPLOYMENT_ENTITY_ID.fullmatch(value))
 
 
 def is_chain_name(value: object) -> TypeGuard[str]:
