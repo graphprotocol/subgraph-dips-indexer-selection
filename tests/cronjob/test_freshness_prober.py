@@ -224,8 +224,8 @@ async def test_a_minute_the_service_already_applied_counts_as_pushed(caplog):
     prober = _prober(None, FakeGateway(clock, {}), clock, pushed)
     prober._targets = Targets(pairs=(), eligible={})
     prober._push_payload = lambda payload: (
-        pushed.append(payload) or {"status": "success", "minute": payload["minute"],
-                                   "applied": False, "pairs": 0}
+        pushed.append(payload)
+        or {"status": "success", "minute": payload["minute"], "applied": False, "pairs": 0}
     )
 
     with caplog.at_level(logging.INFO, logger="freshness_prober"):
