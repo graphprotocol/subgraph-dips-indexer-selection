@@ -13,7 +13,7 @@ import re
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from escaping import for_log
-from freshness_rules import DETAIL_LIMIT, FAIL, MAX_PAIRS, NO_EVIDENCE, PASS, VOID, CheckResult
+from freshness_rules import DETAIL_LIMIT, FAIL, MAX_PAIRS, NO_EVIDENCE, PASS, VOID
 
 logger = logging.getLogger(__name__)
 
@@ -87,20 +87,20 @@ def refusals(outcomes: Sequence[Mapping[str, Any]]) -> list[Optional[str]]:
     return problems
 
 
-def without_refused(minute: str, results: Sequence[CheckResult]) -> list[CheckResult]:
-    """``results`` without the outcomes the service would refuse, logged as 1 error with the
-    count and 1 example."""
-    problems = refusals([result.to_payload() for result in results])
-    refused = [(result, problem) for result, problem in zip(results, problems) if problem]
+def without_refused(minute: str, outcomes: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """``outcomes`` without those the service would refuse, logged as 1 error with the count
+    and 1 example."""
+    problems = refusals(outcomes)
+    refused = [(outcome, problem) for outcome, problem in zip(outcomes, problems) if problem]
     if refused:
-        result, problem = refused[0]
+        outcome, problem = refused[0]
         logger.error(
             "Leaving %d freshness outcomes the service would refuse out of minute %s, "
             "such as indexer %s on chain %s: %s",
             len(refused),
             minute,
-            for_log(result.indexer),
-            for_log(result.chain),
+            for_log(outcome.get("indexer")),
+            for_log(outcome.get("chain")),
             problem,
         )
-    return [result for result, problem in zip(results, problems) if problem is None]
+    return [outcome for outcome, problem in zip(outcomes, problems) if problem is None]

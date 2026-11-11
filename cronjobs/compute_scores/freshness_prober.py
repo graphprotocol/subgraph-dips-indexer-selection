@@ -308,10 +308,11 @@ class FreshnessProber:
 
     async def _push(self, start: float, results: list[CheckResult]) -> None:
         minute = format_minute(start)
-        results = without_refused(minute, results)
-        counts = Counter(result.outcome for result in results)
+        payload = minute_payload(start, results)
+        payload["outcomes"] = without_refused(minute, payload["outcomes"])
+        counts = Counter(outcome["outcome"] for outcome in payload["outcomes"])
         try:
-            response = await asyncio.to_thread(self._push_payload, minute_payload(start, results))
+            response = await asyncio.to_thread(self._push_payload, payload)
         except (IISAPushError, ValueError) as e:
             logger.error("Failed to push freshness minute %s (%s): %s", minute, dict(counts), e)
             return

@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 import freshness_prober  # noqa: E402
 from freshness_config import FreshnessConfig  # noqa: E402
 from freshness_prober import FreshnessProber  # noqa: E402
-from freshness_rules import GatewayReply, GatewayUnreachable, Targets  # noqa: E402
+from freshness_rules import CheckResult, GatewayReply, GatewayUnreachable, Targets  # noqa: E402
 from iisa_client import IISAPushError  # noqa: E402
 
 FAKE_KEY = "fake-freshness-key-0000"
@@ -319,6 +319,24 @@ async def test_an_indexers_error_text_holding_half_a_surrogate_pair_is_pushed_cl
     assert (outcome["outcome"], outcome["reason"]) == ("fail", "indexer_error")
     assert outcome["detail"] == "store error \\ud800"
     assert_matches_contract(pushed[0])
+
+
+async def test_each_outcome_is_turned_into_its_payload_once(monkeypatch):
+    """The last check before the push reads the same payloads that are then sent."""
+    clock = FakeClock(MINUTE)
+    built = []
+    to_payload = CheckResult.to_payload
+    monkeypatch.setattr(
+        CheckResult, "to_payload", lambda result: built.append(result) or to_payload(result)
+    )
+    pushed = []
+    prober = _prober(None, FakeGateway(clock, {}), clock, pushed)
+    prober._targets = Targets(pairs=tuple((_indexer(n), "mainnet") for n in range(3)), eligible={})
+
+    await prober.run_minute(MINUTE)
+
+    assert len(pushed[0]["outcomes"]) == 3
+    assert len(built) == 3
 
 
 async def test_an_outcome_the_service_would_refuse_is_left_out_and_logged(caplog):
