@@ -66,6 +66,9 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # A settings error is logged when startup fails, and by default it prints the values it
+        # was given, cut short: among them the tokens and the gateway API key.
+        hide_input_in_errors=True,
     )
 
     # Service configuration

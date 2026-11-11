@@ -396,3 +396,25 @@ class TestSettings:
     def test_a_half_set_or_unusable_setting_stops_the_service_starting(self, changes):
         with pytest.raises(ValidationError):
             Settings(_env_file=None, **{**self.GATEWAY, **changes})
+
+    @pytest.mark.parametrize(
+        "changes",
+        [{"sync_check_gateway_url": None}, {"sync_check_gateway_url": "gateway.example/api"}],
+    )
+    def test_the_startup_error_shows_no_part_of_any_secret(self, changes):
+        """The error is logged when startup fails. Left alone, it prints the settings it was
+        given, cut short, and the API key and tokens are among them.
+        """
+        secrets = {
+            "push_token": "push-token-0123456789abcdef",
+            "read_token": "read-token-0123456789abcdef",
+            "sync_check_gateway_api_key": "gateway-key-0123456789abcdef0123456789abcdef",
+        }
+        settings = {"host": "0.0.0.0", "port": 8080, **self.GATEWAY, **secrets, **changes}
+
+        with pytest.raises(ValidationError) as error:
+            Settings(_env_file=None, **settings)
+
+        shown = str(error.value)
+        for secret in secrets.values():
+            assert not any(secret[i : i + 6] in shown for i in range(len(secret) - 5))
