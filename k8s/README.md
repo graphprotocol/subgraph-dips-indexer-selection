@@ -79,6 +79,12 @@ These secrets are created out of band and are never committed:
 - `iisa-read-token` (optional, key `IISA_READ_TOKEN`) - a bearer token that reads from the
   service but cannot push to it. Without it the service starts as before, and reads need the
   push token.
+- `iisa-sync-check-gateway` (optional, keys `IISA_SYNC_CHECK_GATEWAY_URL` and
+  `IISA_SYNC_CHECK_GATEWAY_API_KEY`) - the gateway's base address, such as
+  `https://gateway.thegraph.com/api`, and an API key for it. With both, the service checks
+  an indexer's claim to have synced a deployment before selection relies on it. Each check is
+  1 paid query on that key, made only for an indexer about to be picked. Without the secret
+  the claim is taken on trust; with only 1 of the 2 keys the service refuses to start.
 - `github-registry-secret` - image pull secret for the GitHub container registry.
 
 Each caller should hold only the token it needs. The CronJob and the sync-status fetcher

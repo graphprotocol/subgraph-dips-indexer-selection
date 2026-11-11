@@ -59,6 +59,22 @@ spec:
                   name: iisa-read-token
                   key: IISA_READ_TOKEN
                   optional: true
+            # Optional. With both set, the service checks an indexer's claim to have synced a
+            # deployment through the gateway before selection relies on it, 1 paid query for
+            # each check. Without the secret the claim is taken on trust, as before. With only
+            # 1 of the 2 keys the service refuses to start.
+            - name: IISA_SYNC_CHECK_GATEWAY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-sync-check-gateway
+                  key: IISA_SYNC_CHECK_GATEWAY_URL
+                  optional: true
+            - name: IISA_SYNC_CHECK_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-sync-check-gateway
+                  key: IISA_SYNC_CHECK_GATEWAY_API_KEY
+                  optional: true
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
