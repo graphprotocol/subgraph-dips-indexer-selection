@@ -167,7 +167,10 @@ def _run_carried_over_pipeline(
     """
     logger.info("Carrying over what an earlier run measured, with today's prices")
     try:
-        carried = carried_over(provider.held_scores(), indexer_urls, utc_now())
+        held = provider.held_scores()
+        if held is None:
+            return None, MODE_FAILED
+        carried = carried_over(held, indexer_urls, utc_now())
         if carried.empty:
             logger.warning("iisa holds nothing recent enough to carry over")
             return None, MODE_FAILED
@@ -261,17 +264,21 @@ def _warn_about_missing_stake(
 def _warn_about_carried_over(
     scores_df: Optional[pd.DataFrame], mode: str, listed_today: int, run_started: datetime
 ) -> None:
-    """Tell operators how old the carried-over measurements are and how many of today's
-    indexers went out with them; the rest have no score until a run measures them.
+    """Tell operators how old the oldest carried-over quality and stake are and how many of
+    today's indexers went out with them; the rest have no score until a run measures them.
     """
     if scores_df is None or mode != MODE_CARRIED_OVER:
         return
-    oldest = pd.to_datetime(scores_df[QUALITY_MEASURED_AT], utc=True).min()
+    measured = pd.to_datetime(scores_df[QUALITY_MEASURED_AT], utc=True).min()
+    read = pd.to_datetime(scores_df[STAKE_READ_AT], utc=True).min()
     logger.warning(
-        "Quality measured at %s (%.0f hours before this run) carried over for %d of today's %d "
-        "indexer(s), as this run could measure nothing; the rest are left out",
-        oldest.isoformat(),
-        (run_started - oldest).total_seconds() / 3600,
+        "Quality measured at %s (%.0f hours before this run) and stake read at %s (%.0f hours "
+        "before this run) carried over for %d of today's %d indexer(s), as this run could "
+        "measure nothing; the rest are left out",
+        measured.isoformat(),
+        (run_started - measured).total_seconds() / 3600,
+        read.isoformat(),
+        (run_started - read).total_seconds() / 3600,
         len(scores_df),
         listed_today,
     )

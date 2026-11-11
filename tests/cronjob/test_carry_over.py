@@ -157,7 +157,8 @@ class TestAFailedRun:
         assert {pd.Timestamp(row[MEASURED_AT]) for row in pushed} == {NOW}
         assert any("mode=carried_over" in r.getMessage() for r in caplog.records)
         warning = _first(caplog.records, "WARNING", "carried over for 3 of today's 3 indexer(s)")
-        assert warning is not None and "24 hours before this run" in warning.getMessage()
+        assert warning is not None
+        assert warning.getMessage().count(f"{NOW.isoformat()} (24 hours before this run)") == 2
 
     def test_the_rows_have_the_columns_a_good_run_pushes(self, monkeypatch, iisa, clock):
         measured = _good_run(monkeypatch, iisa)
@@ -238,6 +239,7 @@ class TestWhoIsCarriedOver:
         pushed = _failed_run(monkeypatch, iisa, {A: URLS[A], B: URLS[B]})
 
         assert [row["indexer"] for row in pushed] == [A, B]
+        assert {pd.Timestamp(row[MEASURED_AT]) for row in pushed} == {NOW}
 
     @pytest.mark.parametrize("stale", [MEASURED_AT, READ_AT])
     def test_an_indexer_with_quality_or_stake_too_old_is_left_out(
@@ -297,6 +299,24 @@ class TestNothingToCarryOver:
 
         assert _is_fallback(pushed)
         assert _first(caplog.records, "WARNING", "Could not read the scores iisa holds")
+        assert _first(caplog.records, "WARNING", "holds nothing recent enough") is None
+
+    def test_a_failure_while_carrying_over_gives_the_fallback_scores(
+        self, monkeypatch, iisa, clock, caplog
+    ):
+        def broken(*_a: Any) -> pd.DataFrame:
+            raise RuntimeError("could not build the scores")
+
+        _good_run(monkeypatch, iisa)
+        clock["now"] = NOW + DAY
+        monkeypatch.setattr(main, "compute_carried_over_scores", broken)
+
+        with caplog.at_level("INFO"):
+            pushed = _failed_run(monkeypatch, iisa)
+
+        assert _is_fallback(pushed)
+        error = _first(caplog.records, "ERROR", "Carrying scores over failed")
+        assert error is not None and error.exc_info is not None
 
 
 class TestCarriedOver:
