@@ -194,6 +194,20 @@ def _warn_about_mode(mode: str) -> None:
         logger.error("Scoring failed")
 
 
+def _warn_about_missing_stake(scores_df: Optional[pd.DataFrame], mode: str) -> None:
+    """Tell operators when measured scores went out with no stake for any indexer, which
+    happens when the network subgraph could not be read for stake during the run.
+    """
+    if scores_df is None or mode not in (MODE_FULL, MODE_PARTIAL):
+        return
+    stake = scores_df.get("last_known_slashable_stake")
+    if stake is not None and not stake.empty and stake.isna().all():
+        logger.warning(
+            "Scores pushed without stake data: no indexer has stake or query fees in this "
+            "run, so stake-to-fees scores every indexer the same until a run reads stake."
+        )
+
+
 def run_scoring() -> bool:
     """Run one scoring cycle. Returns True on success."""
     pipeline_start = time.time()
@@ -227,6 +241,7 @@ def run_scoring() -> bool:
         mode = MODE_FAILED
 
     _warn_about_mode(mode)
+    _warn_about_missing_stake(scores_df, mode)
 
     logger.info(
         "Scoring complete: mode=%s, indexers=%d, elapsed=%.1fs, peak_memory=%.0fMB",

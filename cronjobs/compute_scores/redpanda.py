@@ -70,6 +70,9 @@ PROGRESS_LOG_INTERVAL_SEC = int(os.environ.get("PROGRESS_LOG_INTERVAL_SEC", "120
 # without excessive Kafka connections on topics with many partitions.
 MAX_PARTITION_WORKERS = int(os.environ.get("REDPANDA_MAX_WORKERS", "8"))
 
+# Columns of the stake lookup's answer, which is indexed by indexer.
+STAKE_COLUMNS = ["stake_to_fees", "total_query_fees", "last_known_slashable_stake"]
+
 # Column order for sample-pass row tuples emitted by _sample_partition_worker.
 # Rows are stored as tuples (not dicts) to cut per-row memory footprint: a
 # populated 10-field dict is ~500B of container overhead, while an 8-tuple is
@@ -578,15 +581,22 @@ class RedpandaProvider:
         Fees come from self._fees_per_indexer, populated during _count_pass
         by summing fee_grt across all indexer attempts in the 28-day window.
 
-        Returns a DataFrame indexed by 'indexer' with a 'stake_to_fees' column,
-        matching the schema expected by compute_all_scores.
+        Returns a DataFrame indexed by 'indexer' with the STAKE_COLUMNS, matching the schema
+        expected by compute_all_scores. When the subgraph cannot be read it has no rows, so the
+        run keeps its measured quality scores and sends every indexer's stake and fees as missing.
         """
         logger.info("Fetching stake data from %s", redact_url(self.graph_network_url))
         try:
             indexers = self._paginate_graphql_indexers()
         except Exception:
-            logger.exception("Failed to fetch stake data from subgraph")
-            return pd.DataFrame(columns=["stake_to_fees"])
+            logger.exception(
+                "Failed to fetch stake data from the network subgraph at %s; scoring carries on "
+                "without it, so this run's scores will have no stake or query fees for anyone",
+                redact_url(self.graph_network_url),
+            )
+            # Keyed by text like a real answer, so the merge never compares unlike key types.
+            no_rows = pd.Index([], dtype="str", name="indexer")
+            return pd.DataFrame(columns=STAKE_COLUMNS, index=no_rows, dtype=float)
 
         df = pd.DataFrame(indexers)
         df = df.rename(columns={"id": "indexer"})
@@ -603,7 +613,7 @@ class RedpandaProvider:
             0.0, float("nan")
         )
 
-        df = df[["indexer", "stake_to_fees", "total_query_fees", "last_known_slashable_stake"]]
+        df = df[["indexer", *STAKE_COLUMNS]]
         df = df.set_index("indexer")
 
         matched = df["stake_to_fees"].notna().sum()
