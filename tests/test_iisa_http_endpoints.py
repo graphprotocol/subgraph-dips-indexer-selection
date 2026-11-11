@@ -1031,7 +1031,7 @@ class TestPushScoresEndpoint:
 
 
 class TestScoresStatusEndpoint:
-    """Tests for GET /scores/status endpoint (cronjob idempotency check)."""
+    """Tests for GET /scores/status endpoint (when the loaded scores were computed)."""
 
     def test_returns_computed_at_when_loaded(self, monkeypatch):
         from iisa import iisa_http_endpoints

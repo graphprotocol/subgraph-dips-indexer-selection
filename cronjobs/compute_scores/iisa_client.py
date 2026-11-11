@@ -175,16 +175,6 @@ def post_sync_status(iisa_api_url: str, token: Optional[str], payload: dict) -> 
     return response.json()
 
 
-def get_scores_status(iisa_api_url: str, token: Optional[str]) -> Any:
-    """Fetch the current scores status from iisa (used for same-day idempotency).
-
-    Returns {"computed_at": "<iso>"|None}. Raises IISAPushError on failure.
-    """
-    url = f"{_require_url(iisa_api_url)}/scores/status"
-    response = _request_with_retry("GET", url, token=token)
-    return response.json()
-
-
 def get_push_token() -> Optional[str]:
     """Read the bearer token from IISA_PUSH_TOKEN, or return None if unset."""
     token = os.environ.get("IISA_PUSH_TOKEN", "").strip()
