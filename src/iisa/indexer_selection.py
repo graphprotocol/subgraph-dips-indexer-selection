@@ -184,6 +184,8 @@ class IndexerSelector:
         """
         # The score job's fallback scores have no stake or query fees to add expected fees to,
         # and already score every indexer the same on stake to fees, so they are left alone.
+        # While they are loaded, expected fees do not spread agreements across indexers, and
+        # price is all that sets indexers apart.
         fallback = _are_fallback_scores(self.data)
         if self.optimistic_dips_fees and fallback:
             logger.info(
