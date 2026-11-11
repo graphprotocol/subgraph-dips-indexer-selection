@@ -72,7 +72,7 @@ Once a day the job replays roughly the last few weeks of real gateway query traf
 
 Because the traffic is enormous, the job samples it instead of reading every record, and balances the sample so each indexer is represented fairly rather than being drowned out by the busiest ones. The sampling is seeded, so a given seed and the same input reproduce the same scores.
 
-The measurement is built to degrade rather than disappear. If geographic lookups are unavailable it falls back to neutral latency scores; if stake cannot be read, it reuses the stake and fees from the last run that read them, for up to 60 hours, since they barely move in a day; if the wider pipeline fails it still publishes real prices with equal quality scores rather than going dark. It can also be told to exclude any indexer running below a minimum `graph-node` version, so stale software does not win paid work.
+The measurement is built to degrade rather than disappear. If geographic lookups are unavailable it falls back to neutral latency scores; if stake cannot be read, it reuses the stake and fees the service holds from a run that read them, for up to 60 hours, since they barely move in a day, and leaves out any indexer it has no reading for; if the wider pipeline fails it publishes today's prices with the quality, stake and fees the service holds from a run that measured them, again for up to 60 hours, and only with nothing recent to carry over does it publish real prices with equal quality scores rather than going dark. It can also be told to exclude any indexer running below a minimum `graph-node` version, so stale software does not win paid work.
 
 ### Choosing indexers
 

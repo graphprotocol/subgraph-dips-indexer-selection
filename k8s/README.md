@@ -21,8 +21,16 @@ indexer stake from the Graph Network subgraph, computes each indexer's scores, a
 POSTs them to the IISA service. When the stake read fails, it reads the scores the
 service holds and reuses each indexer's stake and fees from them if they were read
 less than 60 hours ago, so 2 failed days in a row can reuse a reading and a third
-cannot. The scores record when each indexer's stake was read, and the run's log ends
-with a warning saying what it reused.
+cannot. An indexer with no such reading is left out that day, since stake sent as
+missing beside real stake would score as the best.
+
+When the replay itself fails, the run has no quality scores of its own. It still reads
+today's prices and indexer list, and carries each indexer's quality, stake and fees
+over from the scores the service holds, if both were measured less than 60 hours ago.
+An indexer with nothing recent is left out until a run measures it. Only when nothing
+can be carried over does the run push the fallback scores, which give every indexer
+the same quality. The scores record when each indexer's stake was read and its quality
+measured, and the run's log ends with a warning saying what it reused or carried over.
 
 The sync-status fetcher runs all the time, from the CronJob's image. Every hour it reads
 indexer URLs from the Graph Network subgraph, asks each indexer's `/status` which
