@@ -12,7 +12,12 @@ from typing import Any, Callable, NewType, Optional, TypedDict, Union, cast
 import numpy as np
 import pandas as pd
 
-from .score_columns import NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI
+from .score_columns import (
+    NORM_LAT_LIN_REG_COEFFICIENT,
+    SCORING_MODE,
+    SCORING_MODE_DEGRADED,
+    SEL_LATENCY_CI,
+)
 
 __all__ = [
     "IndexerSelector",
@@ -103,15 +108,12 @@ class IndexerSelector:
         optimistic_dips_fees: Optional[dict[str, float]] = None,
         price_ceiling: Optional[float] = None,
         synced_indexers: Optional[set[IndexerId]] = None,
-        snapshot_has_stake: Optional[bool] = None,
     ):
         """Initialize the selector and run scoring for one deployment.
         Non-obvious args: optimistic_dips_fees lowers stake_to_fees for indexers
         that already hold agreements (load-balancing), price_ceiling caps pricing
         normalisation so one outlier can't compress the rest, and synced_indexers
-        are preferred so queries serve right after acceptance. snapshot_has_stake says
-        whether the whole loaded snapshot carries stake, for a caller that passes only part
-        of it as history; left out, history is taken to be the whole snapshot.
+        are preferred so queries serve right after acceptance.
         """
         self.data = pd.DataFrame(history)
         self.deployment_id = deployment_id
@@ -124,7 +126,6 @@ class IndexerSelector:
         self.optimistic_dips_fees = optimistic_dips_fees or {}
         self.price_ceiling = price_ceiling
         self.synced_indexers = {s.lower() for s in synced_indexers} if synced_indexers else set()
-        self.snapshot_has_stake = snapshot_has_stake
         self.current_group: list[IndexerId] = []
         self.initial_group: list[IndexerId] = []
 
@@ -181,8 +182,37 @@ class IndexerSelector:
         """
         Process data by normalizing metrics and calculating weighted scores.
         """
-        if self.optimistic_dips_fees and "total_query_fees" in self.data.columns:
-            self._apply_optimistic_dips_fees(self.optimistic_dips_fees)
+        # The score job's fallback scores have no stake or query fees to add expected fees to,
+        # and already score every indexer the same on stake to fees, so they are left alone.
+        fallback = _are_fallback_scores(self.data)
+        if self.optimistic_dips_fees and fallback:
+            logger.info(
+                "deployment=%s left dipper's expected DIPs fees out of stake_to_fees: these are "
+                "the score job's fallback scores, with no stake or query fees to add them to",
+                self.deployment_id,
+            )
+
+        # Add dipper's expected fees from accepted agreements to the query fees
+        # before normalisation, so stake_to_fees can tell indexers apart even
+        # before on-chain payment claims appear.
+        if self.optimistic_dips_fees and not fallback and "total_query_fees" in self.data.columns:
+            dips_adjustment = self.data["indexer"].map(self.optimistic_dips_fees).fillna(0.0)
+            effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
+
+            if "last_known_slashable_stake" in self.data.columns:
+                self.data["stake_to_fees"] = self.data[
+                    "last_known_slashable_stake"
+                ] / effective_fees.replace(0.0, float("nan"))
+                # Drop pre-normalised column so _normalize_metrics recomputes it
+                self.data = self.data.drop(columns=["norm_stake_to_fees"], errors="ignore")
+
+            adjusted_count = (dips_adjustment > 0).sum()
+            logger.info(
+                "deployment=%s applied optimistic DIPs fees to %d/%d indexers",
+                self.deployment_id,
+                adjusted_count,
+                len(self.data),
+            )
 
         # Get the current group of indexers for the subgraph using '_get_current_group'
         self.current_group = self._get_current_group()
@@ -210,45 +240,6 @@ class IndexerSelector:
 
         # Call _assign_indexers_to_subgraph to assign/replace/remove an indexer on the subgraph.
         self._assign_indexers_to_subgraph()
-
-    def _apply_optimistic_dips_fees(self, fees: dict[str, float]) -> None:
-        """Add dipper's expected fees from accepted agreements to the query fees and recompute
-        stake_to_fees, so it can tell indexers apart before on-chain payment claims appear.
-
-        With no slashable stake anywhere in the loaded snapshot there is nothing to divide the
-        fees into: each indexer holding fees would get a ratio of 0 and every other one the best
-        score, so the scores the snapshot carries are kept. The score job's fallback sends just
-        that, stake and query fees of 0 with a neutral 0.5. Stake on an indexer the chain or
-        price filters left out still counts, so a filtered snapshot scores as it always has.
-        """
-        dips_adjustment = self.data["indexer"].map(fees).fillna(0.0)
-        adjusted_count = (dips_adjustment > 0).sum()
-        has_stake = self.snapshot_has_stake
-        if has_stake is None:
-            has_stake = snapshot_carries_stake(self.data)
-
-        if not has_stake:
-            logger.info(
-                "deployment=%s left optimistic DIPs fees for %d/%d indexers out of "
-                "stake_to_fees: no indexer has slashable stake to weigh them against",
-                self.deployment_id,
-                adjusted_count,
-                len(self.data),
-            )
-            return
-
-        effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
-        self.data["stake_to_fees"] = self.data[
-            "last_known_slashable_stake"
-        ] / effective_fees.replace(0.0, float("nan"))
-        # Drop pre-normalised column so _normalize_metrics recomputes it
-        self.data = self.data.drop(columns=["norm_stake_to_fees"], errors="ignore")
-        logger.info(
-            "deployment=%s applied optimistic DIPs fees to %d/%d indexers",
-            self.deployment_id,
-            adjusted_count,
-            len(self.data),
-        )
 
     def _get_current_group(self):
         """
@@ -676,12 +667,11 @@ class IndexerSelector:
         return [("synced", synced), ("unsynced", unsynced)]
 
 
-def snapshot_carries_stake(data: pd.DataFrame) -> bool:
-    """Whether any indexer has slashable stake above 0 to divide its fees into."""
-    if "last_known_slashable_stake" not in data.columns:
+def _are_fallback_scores(data: pd.DataFrame) -> bool:
+    """Whether these are the score job's fallback scores, which it labels on every row."""
+    if SCORING_MODE not in data.columns:
         return False
-    stake, _ = read_metric(data, "last_known_slashable_stake")
-    return bool((stake > 0).any())
+    return bool((data[SCORING_MODE] == SCORING_MODE_DEGRADED).any())
 
 
 # Norm columns the CronJob ships already normalised and the selector keeps: latency, and

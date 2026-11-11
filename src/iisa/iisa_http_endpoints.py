@@ -35,12 +35,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .indexer_selection import (
-    EthAddressStr,
-    IndexerSelector,
-    IpfsHashStr,
-    snapshot_carries_stake,
-)
+from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
 from .score_loader import (
     STALE_SCORES_CRITICAL_HOURS,
     DataManager,
@@ -1476,11 +1471,8 @@ def _build_selector(
     request: SelectionRequest,
     enriched_history: pd.DataFrame,
     synced_indexers: set[str],
-    snapshot_has_stake: bool,
 ) -> IndexerSelector:
-    """Construct the IndexerSelector for this request; it selects on construction.
-    snapshot_has_stake is judged on the whole loaded snapshot, not the filtered history.
-    """
+    """Construct the IndexerSelector for this request; it selects on construction."""
     # Build existing_agreements dict from request
     existing_agreements: dict[str, list[str]] = {}
     if request.existing_indexers:
@@ -1503,7 +1495,6 @@ def _build_selector(
         optimistic_dips_fees=request.optimistic_dips_fees,
         price_ceiling=request.max_grt_per_30_days,
         synced_indexers=cast(set[EthAddressStr], synced_indexers),
-        snapshot_has_stake=snapshot_has_stake,
     )
 
 
@@ -1635,9 +1626,7 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     # Enrich with chain-specific price columns for normalization
     enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
     synced_indexers = _synced_indexers_for(request.deployment_id)
-    processor = _build_selector(
-        request, enriched_history, synced_indexers, snapshot_carries_stake(_state.history)
-    )
+    processor = _build_selector(request, enriched_history, synced_indexers)
     _log_selection_reasoning(processor, request.deployment_id)
 
     # Build response with pricing info

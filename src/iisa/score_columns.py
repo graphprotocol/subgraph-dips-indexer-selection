@@ -16,6 +16,11 @@ STAKE_TO_FEES = "stake_to_fees"
 DST_LAT = "dst_lat"
 DST_LON = "dst_lon"
 ORG = "org"
+SCORING_MODE = "scoring_mode"
+
+# The SCORING_MODE the score job's fallback puts on every row. It pushes these scores when its
+# main pipeline cannot run: equal quality for every indexer, with stake and query fees unknown.
+SCORING_MODE_DEGRADED = "degraded"
 
 # Columns as consumed by IndexerSelector after the transform.
 SEL_LATENCY_CI = "Latency Coefficient + Error Confidence Interval"
