@@ -37,12 +37,7 @@ import base58
 import numpy as np
 import pandas as pd
 from gateway_queries_pb2 import ClientQueryProtobuf  # type: ignore[attr-defined]
-from iisa_client import (
-    IISAPushError,
-    get_push_token,
-    get_scores_status,
-    post_scores,
-)
+from iisa_client import get_push_token, post_scores
 from subgraph import (
     SubgraphResponseError,
     paginate_subgraph_query,
@@ -449,7 +444,7 @@ class RedpandaProvider:
 
     Implements the interface expected by compute_all_scores:
       fetch_initial_query_results, fetch_combined_query_results,
-      fetch_stake_to_fees, write_scores, scores_exist_for_today.
+      fetch_stake_to_fees, write_scores.
 
     Uses a two-pass replay: pass 1 counts pairs and fees (cheap), pass 2
     reservoir-samples rows capped at rows_to_use (from adjust_rows).
@@ -650,30 +645,6 @@ class RedpandaProvider:
         )
 
         post_scores(self._iisa_api_url, self._iisa_push_token, payload)
-
-    def scores_exist_for_today(self) -> bool:
-        """
-        Return True if iisa reports today's scores are already loaded.
-
-        Queries GET /scores/status on iisa for the last computed_at timestamp.
-        On any network or auth failure, returns False so the caller proceeds
-        with a fresh run — idempotency is best-effort and the daily cadence
-        plus concurrencyPolicy: Forbid on the CronJob prevents wasteful races.
-        """
-        try:
-            status = get_scores_status(self._iisa_api_url, self._iisa_push_token)
-        except IISAPushError as e:
-            logger.warning("Could not check scores status on iisa: %s", e)
-            return False
-
-        computed_at_str = status.get("computed_at") if isinstance(status, dict) else None
-        if not computed_at_str:
-            return False
-        computed_at = pd.to_datetime(computed_at_str, utc=True, errors="coerce")
-        if pd.isna(computed_at):
-            logger.warning("Unparseable computed_at from iisa: %r", computed_at_str)
-            return False
-        return computed_at.date() == datetime.now(timezone.utc).date()
 
     # -----------------------------------------------------------------------
     # Internal: cache management
