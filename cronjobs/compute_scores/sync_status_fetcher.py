@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     import aiohttp
     from freshness_prober import FreshnessProber
 
+from escaping import error_for_log, url_for_log
 from freshness_config import FreshnessConfig, load_freshness_config
 from iisa_client import IISAPushError, get_push_token, post_sync_status
 from subgraph import discover_indexers_from_network_subgraph, subgraph_url_problem
@@ -124,7 +125,12 @@ async def _fetch_single_status(
             }
         except ValueError as e:
             # Unparseable JSON or the wrong shape won't change on a retry; skip this indexer only.
-            logger.warning("Malformed /status reply from %s (%s): %s", indexer[:10], url, e)
+            logger.warning(
+                "Malformed /status reply from %s (%s): %s",
+                indexer[:10],
+                url_for_log(url),
+                error_for_log(e),
+            )
             return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = e
@@ -138,8 +144,8 @@ async def _fetch_single_status(
     logger.warning(
         "Failed to fetch /status from %s (%s): %s",
         indexer[:10],
-        url,
-        last_error,
+        url_for_log(url),
+        error_for_log(last_error),
     )
     return None
 
