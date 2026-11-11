@@ -2,10 +2,10 @@
 
 Selection prefers an indexer that says it has already synced the deployment, so queries can be
 served straight after the agreement is accepted. That claim is the indexer's own word. Before a
-pick that rests on it goes back to dipper, the service asks the indexer through the gateway for
-the deployment's latest block, as a paying customer would. The claim is confirmed only if the
-indexer signed the answer and the block is recent. Each check is 1 paid query on the gateway
-API key, so it is made only for an indexer that is about to be picked.
+pick that rests on it goes back to dipper, the service asks each candidate that makes the claim,
+through the gateway, for the deployment's latest block, as a paying customer would. A claim is
+confirmed only if the indexer signed the answer and the block is recent. Each check is 1 paid
+query on the gateway API key, so none is made unless a pick rests on a claim.
 """
 
 import asyncio

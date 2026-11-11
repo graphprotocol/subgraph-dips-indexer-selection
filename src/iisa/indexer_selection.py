@@ -547,6 +547,21 @@ class IndexerSelector:
             + self.declined_indexers.get(self.deployment_id, [])
         )
 
+    def synced_candidates(self) -> list[IndexerId]:
+        """Every indexer counted as synced that this selection picked or could have picked,
+        best score first: the scored indexers outside the starting group that are not denied,
+        pending or declined.
+        """
+        if "weighted_score" not in self.data.columns:
+            return []
+        newly_picked = set(self.current_group) - set(self.initial_group)
+        out_of_reach = set(self._unpickable_indexers()) - newly_picked
+        within_reach = ~self.data["indexer"].isin(out_of_reach)
+        synced = self.data["indexer"].str.lower().isin(self.synced_indexers)
+        candidates = self.data[within_reach & synced]
+        ranked = candidates.sort_values(by="weighted_score", ascending=False)
+        return cast(list[IndexerId], ranked["indexer"].tolist())
+
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None
     ) -> Optional[IndexerId]:

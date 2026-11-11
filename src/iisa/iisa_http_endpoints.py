@@ -95,8 +95,8 @@ class Settings(BaseSettings):
     # key are both set, and each check is 1 paid query on that key. See sync_check.py.
     sync_check_gateway_url: Optional[str] = None
     sync_check_gateway_api_key: Optional[str] = None
-    # How long 1 round of checks may take. A selection makes at most 2 rounds and dipper waits
-    # 30 seconds for its answer, hence the upper limit.
+    # How long the checks for 1 selection may take; they all run at once. Dipper waits 30
+    # seconds for its answer, hence the upper limit.
     sync_check_timeout_seconds: float = Field(default=5.0, gt=0, le=10)
     # The oldest a deployment's latest block may be for a claim to be confirmed.
     sync_check_bar_seconds: float = Field(default=36.0, gt=0)
@@ -1707,8 +1707,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
 
 async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionResponse:
-    """_select_with_processor, with the synced claim behind each new pick checked through the
-    gateway first when the check is switched on.
+    """_select_with_processor, with the candidates' synced claims checked through the gateway
+    first, when the check is switched on and a new pick rests on such a claim.
     """
     selection = _prepare_selection(request)
     if isinstance(selection, SelectionResponse):
@@ -1719,43 +1719,35 @@ async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionRe
     return _selection_response(selection, processor)
 
 
-# A selection checks claims in at most this many rounds, which bounds how long dipper waits.
-_SYNC_CHECK_ROUNDS = 2
+# The most claims 1 selection will pay to check. Beyond it the best-scoring claimants are
+# checked and the rest are set aside unchecked, so a flood of claims cannot run up the bill.
+MAX_SYNC_CHECKS_PER_SELECTION = 50
 
 
 async def _with_claims_checked(
     selection: _Selection, processor: IndexerSelector, checker: SyncClaimChecker
 ) -> IndexerSelector:
-    """Check the synced claim of each indexer the selection newly picked, and select again
-    without any claim that was not confirmed, so that indexer competes on its score alone.
+    """When a new pick rests on a synced claim, check every candidate's claim through the
+    gateway at once, and select again counting only the claims that were confirmed.
 
-    Only a newly picked indexer's claim is checked, since each check is a paid query. Setting a
-    claim aside can bring another claimant forward, which is checked in the next round. After
-    _SYNC_CHECK_ROUNDS rounds nothing more is checked and only confirmed claims still count.
+    Nothing is checked when no new pick rests on a claim, since the claims then decided
+    nothing. Otherwise every candidate that claims is checked, not only the one picked, so a
+    false claim that led cannot cost an honest claimant behind it the preference. An indexer
+    whose claim is set aside still competes on its score.
     """
     request = selection.request
     synced = {indexer.lower() for indexer in selection.synced}
-    confirmed: set[str] = set()
-    for _ in range(_SYNC_CHECK_ROUNDS):
-        claims = _picked_on_a_claim(processor, synced) - confirmed
-        if not claims:
-            return processor
-        unconfirmed = await checker.unconfirmed(request.deployment_id, claims)
-        confirmed |= claims - unconfirmed.keys()
-        _log_claim_checks(request.deployment_id, claims, unconfirmed)
-        if not unconfirmed:
-            return processor
-        synced -= unconfirmed.keys()
-        processor = _build_selector(request, selection.history, synced)
-    if _picked_on_a_claim(processor, synced) - confirmed:
-        logger.info(
-            "deployment=%s another unchecked synced claim came forward after %d rounds of "
-            "checks; only confirmed claims count from here",
-            request.deployment_id,
-            _SYNC_CHECK_ROUNDS,
-        )
-        processor = _build_selector(request, selection.history, synced & confirmed)
-    return processor
+    if not _picked_on_a_claim(processor, synced):
+        return processor
+    claimants = [indexer.lower() for indexer in processor.synced_candidates()]
+    asked = claimants[:MAX_SYNC_CHECKS_PER_SELECTION]
+    not_asked = claimants[MAX_SYNC_CHECKS_PER_SELECTION:]
+    unconfirmed = await checker.unconfirmed(request.deployment_id, set(asked))
+    _log_claim_checks(request.deployment_id, asked, unconfirmed, not_asked)
+    set_aside = unconfirmed.keys() | set(not_asked)
+    if not set_aside:
+        return processor
+    return _build_selector(request, selection.history, synced - set_aside)
 
 
 def _picked_on_a_claim(processor: IndexerSelector, synced: set[str]) -> set[str]:
@@ -1765,13 +1757,15 @@ def _picked_on_a_claim(processor: IndexerSelector, synced: set[str]) -> set[str]
     return (picked - already_in) & synced
 
 
-def _log_claim_checks(deployment_id: str, claims: set[str], unconfirmed: dict[str, str]) -> None:
-    """Log how a round of checks went, with a warning for each claim that was not confirmed."""
+def _log_claim_checks(
+    deployment_id: str, asked: list[str], unconfirmed: dict[str, str], not_asked: list[str]
+) -> None:
+    """Log how the checks went, with a warning for each claim that was set aside."""
     logger.info(
         "deployment=%s checked %d synced claim(s) through the gateway: %d confirmed",
         deployment_id,
-        len(claims),
-        len(claims) - len(unconfirmed),
+        len(asked),
+        len(asked) - len(unconfirmed),
     )
     for indexer, reason in sorted(unconfirmed.items()):
         logger.warning(
@@ -1780,6 +1774,14 @@ def _log_claim_checks(deployment_id: str, claims: set[str], unconfirmed: dict[st
             deployment_id,
             indexer,
             reason,
+        )
+    if not_asked:
+        logger.warning(
+            "deployment=%s %d synced claim(s) beyond the limit of %d checks for 1 selection "
+            "were not checked and are set aside",
+            deployment_id,
+            len(not_asked),
+            MAX_SYNC_CHECKS_PER_SELECTION,
         )
 
 

@@ -5,6 +5,7 @@ indexer's own word, so before such a pick goes back to dipper the service can as
 through the gateway for the deployment's latest block, as a paying customer would. The claim
 counts only if the indexer signed the answer and the block is recent. A claim that is not
 confirmed, for whatever reason, loses the preference and the indexer competes on its score.
+Every candidate's claim is checked at once, so 1 false claim cannot cost an honest one its place.
 """
 
 import json
@@ -294,7 +295,9 @@ async def _pick(claimed: set[str], checker: Optional[FakeChecker], **request: An
 
 
 class TestSelection:
-    """A pick that rests on a synced claim is checked; an unconfirmed claim is set aside."""
+    """When a pick rests on a synced claim, every candidate's claim is checked at once, and
+    selection then counts only the claims that were confirmed.
+    """
 
     async def test_with_no_checker_the_claim_is_taken_on_trust_as_before(self):
         assert await _pick({A}, None) == [A]
@@ -312,20 +315,31 @@ class TestSelection:
         assert await _pick({A}, checker) == [D]
         assert checker.asked == [(DEPLOYMENT, {A})]
 
-    async def test_an_indexer_picked_on_its_score_is_not_checked(self):
+    async def test_with_no_claim_in_play_nothing_is_checked(self):
         checker = FakeChecker()
 
         assert await _pick(set(), checker) == [D]
         assert checker.asked == []
 
-    async def test_a_claim_that_did_not_win_a_place_is_not_checked(self):
-        """A and B both claim and 1 place is open. B, the better of the 2, takes it and is
-        checked; A's claim won nothing, so it costs nothing to leave alone.
-        """
+    async def test_every_claim_is_checked_together_in_1_round(self):
+        """C leads on its claim, so A, B and C are all asked at once, not only C."""
         checker = FakeChecker()
 
-        assert await _pick({A, B}, checker) == [B]
-        assert checker.asked == [(DEPLOYMENT, {B})]
+        assert await _pick({A, B, C}, checker) == [C]
+        assert checker.asked == [(DEPLOYMENT, {A, B, C})]
+
+    async def test_the_best_confirmed_claim_wins_when_better_ones_fail(self):
+        """C and B both claim falsely. A's claim is true, so A still gets its head start."""
+        checker = FakeChecker(fail=(B, C))
+
+        assert await _pick({A, B, C}, checker) == [A]
+        assert checker.asked == [(DEPLOYMENT, {A, B, C})]
+
+    async def test_when_every_claim_fails_the_best_score_wins(self):
+        checker = FakeChecker(fail=(A, B, C))
+
+        assert await _pick({A, B, C}, checker) == [D]
+        assert len(checker.asked) == 1
 
     async def test_an_indexer_already_in_the_group_is_not_checked(self):
         checker = FakeChecker(fail=(A,))
@@ -334,21 +348,22 @@ class TestSelection:
 
         assert picked == [A] and checker.asked == []
 
-    async def test_the_next_claimant_is_checked_in_a_second_round(self):
-        """B's claim fails, so A leads on its own claim; that is checked too, and holds."""
-        checker = FakeChecker(fail=(B,))
+    async def test_a_claimant_that_cannot_be_picked_is_not_checked(self):
+        """B is blocked by the caller, so its claim can win nothing and costs no query."""
+        checker = FakeChecker()
 
-        assert await _pick({A, B}, checker) == [A]
-        assert checker.asked == [(DEPLOYMENT, {B}), (DEPLOYMENT, {A})]
+        assert await _pick({A, B}, checker, blocklist=[B]) == [A]
+        assert checker.asked == [(DEPLOYMENT, {A})]
 
-    async def test_after_2_rounds_an_unchecked_claim_carries_no_preference(self):
-        """C, B and A all claim and each would lead in turn. C and B are checked and fail;
-        there is no third round, so A's claim is set aside unchecked and D wins on score.
+    async def test_no_more_than_the_limit_are_checked_best_scores_first(self, monkeypatch):
+        """With a limit of 2, the 2 best-scoring claimants are asked; A's claim is left out
+        unchecked, so it counts for nothing.
         """
-        checker = FakeChecker(fail=(A, B, C))
+        monkeypatch.setattr(endpoints, "MAX_SYNC_CHECKS_PER_SELECTION", 2)
+        checker = FakeChecker(fail=(B, C))
 
         assert await _pick({A, B, C}, checker) == [D]
-        assert checker.asked == [(DEPLOYMENT, {C}), (DEPLOYMENT, {B})]
+        assert checker.asked == [(DEPLOYMENT, {B, C})]
 
     async def test_a_failed_check_is_logged_with_its_reason(self, caplog):
         with caplog.at_level("INFO"):
