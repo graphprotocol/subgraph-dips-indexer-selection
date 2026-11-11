@@ -22,7 +22,8 @@ POSTs them to the IISA service. When the stake read fails, it reads the scores t
 service holds and reuses each indexer's stake and fees from them if they were read
 less than 60 hours ago, so 2 failed days in a row can reuse a reading and a third
 cannot. An indexer with no such reading is left out that day, since stake sent as
-missing beside real stake would score as the best.
+missing beside real stake would score as the best; if no indexer has one, all stay
+in, with stake missing for all alike.
 
 When the replay itself fails, the run has no quality scores of its own. It still reads
 today's prices and indexer list, and carries each indexer's quality, stake and fees

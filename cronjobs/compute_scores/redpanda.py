@@ -583,7 +583,8 @@ class RedpandaProvider:
         Returns a DataFrame indexed by 'indexer' with the STAKE_COLUMNS and the time the stake was
         read, matching the schema expected by compute_all_scores. When the subgraph cannot be read
         it holds what an earlier run read, from the scores iisa holds, where that reading may
-        still be reused; any indexer without one has its stake and fees sent as missing.
+        still be reused. An indexer without one is then left out of the scores; if no indexer
+        has one, the answer is empty and stake and fees go out as missing for all.
         """
         logger.info("Fetching stake data from %s", redact_url(self.graph_network_url))
         try:

@@ -4,7 +4,8 @@ Stake comes from the network subgraph, read near the end of the run, after the l
 gateway queries. When that read fails the run should carry on and push its real latency,
 uptime and success scores, rather than throw them all away for the fallback's equal neutral
 scores. For stake and query fees it reuses what an earlier run read, if that was less than 60
-hours ago, and otherwise sends them as missing.
+hours ago. An indexer with no such reading is left out beside those that have one, and if none
+has one, stake and fees go out as missing for all.
 """
 
 import logging
