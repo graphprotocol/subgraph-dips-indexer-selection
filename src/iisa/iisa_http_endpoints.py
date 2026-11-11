@@ -7,7 +7,7 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - GET /scores - Return the current scores snapshot (read token)
 - GET /scores/status - Return when the loaded scores were computed, for monitoring (read token)
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (read token)
-- GET /dips-indexers - Indexers selection would pick for a required ?chain (read token)
+- GET /dips-indexers - Indexers offering DIPs on a required ?chain (read token)
 - POST /sync-status - Push sync-status snapshot from the fetcher (push token)
 - POST, GET /freshness - Push 1 minute of freshness outcomes; read the stale marks (push token)
 - POST /get-score - Return weighted score and components for one indexer (read token)
@@ -301,9 +301,9 @@ class WeightedScoresResponse(BaseModel):
 
 
 class DipsIndexersResponse(BaseModel):
-    """Response for GET /dips-indexers: the indexers selection would pick for the
-    requested chain — answered their probe, support it, priced it. ``computed_at``
-    mirrors the push so callers can reject a stale snapshot. Example::
+    """Response for GET /dips-indexers: the indexers offering DIPs on the chain. Where freshness
+    is enforced there, selection also leaves out the ones marked stale. ``computed_at`` mirrors
+    the push so callers can reject an out-of-date snapshot. Example::
 
         {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2, "indexers": ["0xaa", "0xbb"]}
     """
@@ -1146,10 +1146,11 @@ def dips_indexers(
     ),
     authorization: Optional[str] = Header(None),
 ) -> DipsIndexersResponse:
-    """Indexers selection would pick for ``chain``: answered their DIPs probe, support
-    the chain, and priced within the optional ``max_grt_per_30_days`` and
-    ``max_grt_per_billion_entities_per_30_days`` ceilings (omit either to skip it).
-    Omitting ``chain`` is a 422. Example: ``?chain=arbitrum-one&max_grt_per_30_days=4500``.
+    """Indexers offering DIPs on ``chain`` (a 422 if omitted), by selection's price test: they
+    answered their DIPs probe, support the chain and are priced within the optional
+    ``max_grt_per_30_days`` and ``max_grt_per_billion_entities_per_30_days`` ceilings (omit
+    either to skip it). Where freshness is enforced on the chain, selection also leaves out
+    indexers marked stale, which this list still includes. Example: ``?chain=arbitrum-one``.
     """
     _require_read_token(authorization)
 
@@ -1163,9 +1164,8 @@ def dips_indexers(
     if snap.data is None or snap.data.empty or "dips_supported_networks" not in snap.data.columns:
         return DipsIndexersResponse(computed_at=computed_at, count=0, indexers=[])
 
-    # Reuse the selection path's test so this endpoint and selection can't disagree:
-    # an indexer accepts DIPs for a chain only if it answered its probe, supports the
-    # chain, and priced it within the optional ceilings (None skips a ceiling).
+    # Selection's own price test: an indexer offers DIPs on a chain only if it answered its
+    # probe, supports the chain and priced it within the optional ceilings (None skips one).
     matched, _ = _filter_by_price(
         snap.data, chain, max_grt_per_30_days, max_grt_per_billion_entities_per_30_days
     )
