@@ -12,7 +12,6 @@ import json
 import logging
 import math
 import os
-import reprlib
 import socket
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -24,6 +23,8 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
+from escaping import error_for_log, url_for_log
+from escaping import for_log as _for_log
 from numpy.linalg import pinv
 from reply_body import read_reply_body
 from scipy.stats import t
@@ -224,20 +225,6 @@ def _extract_dips_prices(data: dict) -> tuple:
     return min_prices, min_entity_price
 
 
-_LOG_REPR = reprlib.Repr()
-_LOG_REPR.maxlevel = 2
-_LOG_REPR.maxstring = _LOG_REPR.maxlong = _LOG_REPR.maxother = 60
-_MAX_LOGGED_CHARS = 200
-
-
-def _for_log(value: object) -> str:
-    """Quote a value an indexer sent for a log line: escaped, so a line break in it cannot start a
-    fake log line, and cut short, so a huge value cannot flood the log on every run.
-    """
-    text = _LOG_REPR.repr(value)
-    return text if len(text) <= _MAX_LOGGED_CHARS else text[:_MAX_LOGGED_CHARS] + "..."
-
-
 def _parse_price(value: object) -> Optional[float]:
     """An advertised price (JSON number or text) as a float if finite and >= 0, else None.
 
@@ -258,19 +245,27 @@ def _valid_chain_prices(indexer: str, min_prices: dict) -> dict:
     """Keep each per-chain base price as a float, dropping and logging any that is not valid.
 
     The selection service treats a chain with no price as unpriced and excludes the indexer there.
+    A reply can list any number of chains, so the dropped prices get 1 warning per indexer, with
+    their count and the first 3 as examples.
     """
     valid = {}
+    invalid_count = 0
+    examples: list[str] = []
     for chain, price in min_prices.items():
         parsed = _parse_price(price)
         if parsed is not None:
             valid[chain] = parsed
-        else:
-            logger.warning(
-                "Ignoring invalid DIPs base price from indexer %s for chain %s: %s",
-                indexer,
-                _for_log(chain),
-                _for_log(price),
-            )
+            continue
+        invalid_count += 1
+        if len(examples) < 3:
+            examples.append(f"chain {_for_log(chain)}: {_for_log(price)}")
+    if invalid_count:
+        logger.warning(
+            "Ignoring invalid DIPs base prices from indexer %s for %s chain(s), including %s",
+            indexer,
+            f"{invalid_count:,}",
+            "; ".join(examples),
+        )
     return valid
 
 
@@ -376,7 +371,10 @@ async def _fetch_single_dips_info_async(
             return _unavailable_dips_info(indexer)
         return _dips_info_record(indexer, data)
 
-    logger.debug(f"Failed to fetch /dips/info from {url} for indexer {indexer}: {last_error}")
+    logger.debug(
+        f"Failed to fetch /dips/info from {url_for_log(url)} for indexer {indexer}: "
+        f"{error_for_log(last_error)}"
+    )
     return _unavailable_dips_info(indexer)
 
 
@@ -522,7 +520,8 @@ async def _fetch_single_graph_node_version_async(
             await asyncio.sleep(delay)
 
     logger.debug(
-        f"Failed to fetch graph-node version from {url} for indexer {indexer}: {last_error}"
+        f"Failed to fetch graph-node version from {url_for_log(url)} for indexer {indexer}: "
+        f"{error_for_log(last_error)}"
     )
     return {"indexer": indexer, "graph_node_version": None, "graph_node_commit": None}
 
@@ -702,7 +701,7 @@ def filter_by_min_graph_node_version(
     for row in dropped.itertuples(index=False):
         logger.debug(
             "Excluding indexer below graph-node minimum: "
-            f"indexer={row.indexer} reported={row.graph_node_version} "
+            f"indexer={row.indexer} reported={_for_log(row.graph_node_version)} "
             f"minimum={min_version} strict={strict}"
         )
 
@@ -1175,7 +1174,7 @@ def resolve_url_geoip(url: str) -> dict:
         return lookup_geoip(ip_addr)
 
     except Exception as e:
-        logger.warning(f"GeoIP resolution failed for {url}: {e}")
+        logger.warning(f"GeoIP resolution failed for {url_for_log(url)}: {error_for_log(e)}")
         return _empty_geoip_result()
 
 

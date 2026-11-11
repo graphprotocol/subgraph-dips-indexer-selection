@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Dict, Optional
 if TYPE_CHECKING:
     import aiohttp
 
+from escaping import error_for_log, url_for_log
 from iisa_client import IISAPushError, get_push_token, post_sync_status
 from reply_body import read_reply_body
 from subgraph import discover_indexers_from_network_subgraph, subgraph_url_problem
@@ -128,7 +129,12 @@ async def _fetch_single_status(
         except (ValueError, RecursionError) as e:
             # Unparseable JSON, JSON nested too deep to read, a reply over the size limit or the
             # wrong shape won't change on a retry; skip this indexer only.
-            logger.warning("Malformed /status reply from %s (%s): %s", indexer[:10], url, e)
+            logger.warning(
+                "Malformed /status reply from %s (%s): %s",
+                indexer[:10],
+                url_for_log(url),
+                error_for_log(e),
+            )
             return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = e
@@ -142,8 +148,8 @@ async def _fetch_single_status(
     logger.warning(
         "Failed to fetch /status from %s (%s): %s",
         indexer[:10],
-        url,
-        last_error,
+        url_for_log(url),
+        error_for_log(last_error),
     )
     return None
 
