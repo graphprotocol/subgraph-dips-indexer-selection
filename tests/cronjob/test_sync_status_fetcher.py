@@ -197,6 +197,11 @@ class TestRunFetchCycle:
                 new_callable=AsyncMock,
                 return_value=fetch_result,
             ),
+            # The claim is backed by an allocation, so the check keeps it.
+            patch(
+                "sync_status_fetcher.read_active_allocations",
+                return_value={"0xaaa": {"QmDeploy1"}},
+            ),
             patch("sync_status_fetcher._push_sync_status") as mock_push,
         ):
             result = run_fetch_cycle()
@@ -225,6 +230,11 @@ class TestRunFetchCycle:
                 "sync_status_fetcher._fetch_all_statuses",
                 new_callable=AsyncMock,
                 return_value=fetch_result,
+            ),
+            # The claim is backed by an allocation, so the check keeps it.
+            patch(
+                "sync_status_fetcher.read_active_allocations",
+                return_value={"0xaaa": {"QmDeploy1"}},
             ),
             patch(
                 "sync_status_fetcher._push_sync_status",
