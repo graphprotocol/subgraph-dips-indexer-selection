@@ -7,7 +7,7 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - GET /health - Health check, reports if data is loaded
 - POST /scores - Push computed indexer scores from the cronjob (push token)
 - GET /scores - Return the current scores snapshot (read token)
-- GET /scores/status - Return last computed_at; lets the cronjob skip a redundant run (read token)
+- GET /scores/status - Return when the loaded scores were computed, for monitoring (read token)
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (read token)
 - GET /dips-indexers - Indexers selection would pick for a required ?chain (read token)
 - POST /sync-status - Push sync-status snapshot from the fetcher (push token)
