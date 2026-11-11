@@ -103,12 +103,15 @@ class IndexerSelector:
         optimistic_dips_fees: Optional[dict[str, float]] = None,
         price_ceiling: Optional[float] = None,
         synced_indexers: Optional[set[IndexerId]] = None,
+        snapshot_has_stake: Optional[bool] = None,
     ):
         """Initialize the selector and run scoring for one deployment.
         Non-obvious args: optimistic_dips_fees lowers stake_to_fees for indexers
         that already hold agreements (load-balancing), price_ceiling caps pricing
         normalisation so one outlier can't compress the rest, and synced_indexers
-        are preferred so queries serve right after acceptance.
+        are preferred so queries serve right after acceptance. snapshot_has_stake says
+        whether the whole loaded snapshot carries stake, for a caller that passes only part
+        of it as history; left out, history is taken to be the whole snapshot.
         """
         self.data = pd.DataFrame(history)
         self.deployment_id = deployment_id
@@ -121,6 +124,7 @@ class IndexerSelector:
         self.optimistic_dips_fees = optimistic_dips_fees or {}
         self.price_ceiling = price_ceiling
         self.synced_indexers = {s.lower() for s in synced_indexers} if synced_indexers else set()
+        self.snapshot_has_stake = snapshot_has_stake
         self.current_group: list[IndexerId] = []
         self.initial_group: list[IndexerId] = []
 
@@ -211,15 +215,19 @@ class IndexerSelector:
         """Add dipper's expected fees from accepted agreements to the query fees and recompute
         stake_to_fees, so it can tell indexers apart before on-chain payment claims appear.
 
-        With no slashable stake anywhere there is nothing to divide the fees into: each indexer
-        holding fees would get a ratio of 0 and every other one the best score, so the scores
-        the snapshot carries are kept. The score job's fallback sends stake and query fees of 0
-        with a neutral 0.5, and its full run sends both as 0 when it cannot read stake.
+        With no slashable stake anywhere in the loaded snapshot there is nothing to divide the
+        fees into: each indexer holding fees would get a ratio of 0 and every other one the best
+        score, so the scores the snapshot carries are kept. The score job's fallback sends just
+        that, stake and query fees of 0 with a neutral 0.5. Stake on an indexer the chain or
+        price filters left out still counts, so a filtered snapshot scores as it always has.
         """
         dips_adjustment = self.data["indexer"].map(fees).fillna(0.0)
         adjusted_count = (dips_adjustment > 0).sum()
+        has_stake = self.snapshot_has_stake
+        if has_stake is None:
+            has_stake = snapshot_carries_stake(self.data)
 
-        if not _carries_stake(self.data):
+        if not has_stake:
             logger.info(
                 "deployment=%s left optimistic DIPs fees for %d/%d indexers out of "
                 "stake_to_fees: no indexer has slashable stake to weigh them against",
@@ -668,7 +676,7 @@ class IndexerSelector:
         return [("synced", synced), ("unsynced", unsynced)]
 
 
-def _carries_stake(data: pd.DataFrame) -> bool:
+def snapshot_carries_stake(data: pd.DataFrame) -> bool:
     """Whether any indexer has slashable stake above 0 to divide its fees into."""
     if "last_known_slashable_stake" not in data.columns:
         return False

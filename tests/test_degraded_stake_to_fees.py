@@ -20,7 +20,7 @@ from iisa.indexer_selection import IndexerSelector
 
 CHAIN = "arbitrum-one"
 DEPLOYMENT = "QmDegradedStakeToFees"
-A, B, C, D = ("0x" + pair * 20 for pair in ("a1", "b2", "c3", "d4"))
+A, B, C, D, E = ("0x" + pair * 20 for pair in ("a1", "b2", "c3", "d4", "e5"))
 
 
 def _degraded_record(indexer: str, price: str = "450") -> dict[str, Any]:
@@ -56,7 +56,7 @@ def _degraded_record(indexer: str, price: str = "450") -> dict[str, Any]:
     }
 
 
-def _full_record(indexer: str, stake: float, fees: float) -> dict[str, Any]:
+def _full_record(indexer: str, stake: float, fees: float, **extra: Any) -> dict[str, Any]:
     """One indexer as the full pipeline pushes it: its own stake and query fees, and no
     neutral stake-to-fees score, which only the fallback sends.
     """
@@ -75,14 +75,22 @@ def _full_record(indexer: str, stake: float, fees: float) -> dict[str, Any]:
         "org": f"org-{indexer[2:4]}",
         "dst_lat": 52.4,
         "dst_lon": 4.9,
+        **extra,
     }
 
 
 def _select(
     records: list[dict[str, Any]], fees: Optional[dict[str, float]] = None, **request: Any
 ) -> pd.DataFrame:
+    """The selector's scored rows, indexed by indexer, from a run of _selection."""
+    return _selection(records, fees, **request)[0]
+
+
+def _selection(
+    records: list[dict[str, Any]], fees: Optional[dict[str, float]] = None, **request: Any
+) -> tuple[pd.DataFrame, list[str]]:
     """Load records through the score loader, run /select-indexers selection on them and
-    return the selector's scored rows, indexed by indexer.
+    return the selector's scored rows, indexed by indexer, and the indexers picked.
     """
     history = DataManager(MagicMock()).transform_scores_df(pd.DataFrame(records))
     built: list[IndexerSelector] = []
@@ -103,8 +111,8 @@ def _select(
         patch.object(endpoints, "_state", state),
         patch.object(endpoints, "IndexerSelector", side_effect=build),
     ):
-        _select_with_processor(selection)
-    return built[0].data.set_index("indexer")
+        response = _select_with_processor(selection)
+    return built[0].data.set_index("indexer"), [indexer.id for indexer in response.indexers]
 
 
 class TestSnapshotWithoutStake:
@@ -206,3 +214,26 @@ class TestSnapshotWithStake:
 
         expected = [0.0, 190 / 390, 90 / 390, 1.0]
         assert data.loc[[A, B, C, D], "norm_stake_to_fees"].tolist() == pytest.approx(expected)
+
+    def test_stake_outside_the_chain_still_counts_as_stake(self):
+        """E has stake but serves only another chain, so the chain filter leaves out the only
+        indexer with stake. The snapshot still carries stake, so A, an agreement holder with no
+        slashable stake, keeps the worst score instead of the best, and C is picked as before.
+        """
+        mainnet_only = {
+            "dips_min_grt_per_30_days": '{"mainnet": "450"}',
+            "dips_supported_networks": '["mainnet"]',
+        }
+        records = [
+            _full_record(A, 0.0, 0.0),
+            _full_record(B, 0.0, 10.0),
+            _full_record(C, 0.0, 0.0),
+            _full_record(D, 0.0, 10.0),
+            _full_record(E, 5_000.0, 10.0, **mainnet_only),
+        ]
+
+        data, picked = _selection(records, fees={A: 50.0}, num_candidates=1)
+
+        assert E not in data.index
+        assert data.loc[[A, B, C, D], "norm_stake_to_fees"].tolist() == [0.0, 0.0, 1.0, 0.0]
+        assert picked == [C]
