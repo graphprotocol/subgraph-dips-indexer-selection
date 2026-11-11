@@ -1717,7 +1717,9 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     """Equal quality metrics for every indexer, real per-indexer pricing from /dips/info.
 
     Last-resort fallback when the full pipeline can't run. indexer_urls is the network
-    subgraph's {address: url}; per-indexer pricing comes from /dips/info.
+    subgraph's {address: url}; per-indexer pricing comes from /dips/info. Stake and query fees
+    go out as unknown and every row is labelled "degraded", so iisa can tell these scores from
+    measured ones.
     """
     dips_info_df = fetch_dips_info(indexer_urls)
     now = datetime.now(timezone.utc)
@@ -1743,10 +1745,13 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["org"] = None
     scores["dst_lat"] = None
     scores["dst_lon"] = None
-    scores["total_query_fees"] = 0.0
-    scores["last_known_slashable_stake"] = 0.0
+    # Unknown, not 0: this run read neither, and iisa would take a 0 for a measured value.
+    scores["total_query_fees"] = None
+    scores["last_known_slashable_stake"] = None
     scores["computed_at"] = now
     scores["query_count"] = 0
+    # Tells iisa on every row that these are fallback scores, not measured ones.
+    scores["scoring_mode"] = "degraded"
 
     # Merge real pricing data from /dips/info
     if not dips_info_df.empty:
