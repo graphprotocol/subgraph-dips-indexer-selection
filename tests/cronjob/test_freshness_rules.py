@@ -269,6 +269,30 @@ def test_gateway_messages_are_cut_to_300_characters():
     assert len(judgement.detail) == 300
 
 
+def test_an_indexers_error_message_holding_half_a_surrogate_pair_becomes_text_utf8_can_hold():
+    """A JSON escape like \\ud800 decodes to half a pair, which the service refuses in detail."""
+    body = b'{"errors": [{"message": "store error \\ud800 here"}]}'
+
+    judgement = _judge(body, attested=True)
+
+    assert judgement.detail == "store error \\ud800 here"
+    judgement.detail.encode("utf-8")
+
+
+def test_a_gateway_message_quoting_half_a_surrogate_pair_becomes_text_utf8_can_hold():
+    judgement = _judge(_bad_indexer("BadResponse(\ud800)"), attested=False)
+
+    assert judgement.detail.endswith("BadResponse(\\ud800)}")
+    judgement.detail.encode("utf-8")
+
+
+def test_detail_is_cut_to_300_characters_after_it_is_cleaned():
+    judgement = _judge(_gateway_message("x" * 298 + "\udfff\udfff"), attested=False)
+
+    assert len(judgement.detail) == 300
+    judgement.detail.encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Eligibility
 # ---------------------------------------------------------------------------
@@ -442,12 +466,90 @@ def test_supported_chains_accepts_the_shapes_the_service_does(value, chains):
     assert supported_chains(value) == chains
 
 
+@pytest.mark.parametrize(
+    "chain",
+    ["\ud800", "main\nnet", "", "x" * 65, "arbitrum one", "mainnet\t", "réseau", "\x7f"],
+    ids=["half-surrogate", "line-break", "empty", "65-chars", "space", "tab", "non-ascii", "del"],
+)
+def test_a_chain_name_the_service_or_a_log_line_cannot_take_is_dropped(chain):
+    """1 such name from 1 indexer used to make the service refuse every outcome of the minute."""
+    assert supported_chains(["mainnet", chain]) == ["mainnet"]
+    assert supported_chains(json.dumps(["mainnet", chain])) == ["mainnet"]
+
+
+def test_a_chain_name_of_64_printable_characters_is_kept():
+    assert supported_chains(["!" + "x" * 62 + "~"]) == ["!" + "x" * 62 + "~"]
+
+
+def _offer(indexer, chains, prices):
+    return {
+        "indexer": indexer,
+        "dips_supported_networks": json.dumps(chains),
+        "dips_min_grt_per_30_days": json.dumps(prices),
+    }
+
+
+@pytest.mark.parametrize(
+    ("prices", "priced"),
+    [
+        ('{"mainnet": 100.5, "base": 0}', {"mainnet", "base"}),
+        ({"mainnet": 100.5}, {"mainnet"}),
+        ('{"mainnet": "12.5"}', {"mainnet"}),
+        ('{"a": NaN, "b": -1, "c": true, "d": null, "e": "cheap", "f": [1], "g": 1e400}', set()),
+        ("{}", set()),
+        ("", set()),
+        ("x{", set()),
+        ('["mainnet"]', set()),
+    ],
+)
+def test_an_indexer_is_paired_only_with_chains_it_has_priced_as_the_service_reads_prices(
+    prices, priced
+):
+    """Selection can't pick an indexer on a chain without a finite price of at least 0, so
+    checking it there is wasted."""
+    record = {
+        "indexer": INDEXER,
+        "dips_supported_networks": ["mainnet", "base", "a", "b", "c", "d", "e", "f", "g"],
+        "dips_min_grt_per_30_days": prices,
+    }
+
+    assert {chain for _, chain in dips_pairs([record])} == priced
+
+
+def test_an_indexers_chains_keep_their_order_without_repeats():
+    record = _offer(INDEXER, ["mainnet", "base", "matic", "mainnet"], {"matic": 5, "mainnet": 10})
+
+    assert dips_pairs([record]) == [(INDEXER, "mainnet"), (INDEXER, "matic")]
+
+
+def test_an_indexer_listing_150_chains_is_checked_on_the_first_100_it_lists(caplog):
+    chains = [f"chain-{n:03d}" for n in reversed(range(150))]
+
+    with caplog.at_level("WARNING", logger="freshness_rules"):
+        pairs = dips_pairs([_offer(INDEXER, chains, dict.fromkeys(chains, 1))])
+
+    assert {chain for _, chain in pairs} == set(chains[:100])
+    (warning,) = caplog.records
+    assert INDEXER in warning.getMessage() and "150" in warning.getMessage()
+
+
+def test_the_100_chain_limit_counts_only_usable_chains():
+    chains = ["\ud800", "unpriced", *(f"chain-{n:03d}" for n in range(100))]
+    prices = {chain: 1 for chain in chains if chain != "unpriced"}
+
+    pairs = dips_pairs([_offer(INDEXER, chains, prices)])
+
+    assert len(pairs) == 100
+    assert (INDEXER, "chain-099") in pairs
+
+
 def test_dips_pairs_lowercases_indexers_and_skips_records_without_an_address():
+    prices = {"mainnet": 1, "base": 1}
     records = [
-        {"indexer": "0x" + "B" * 40, "dips_supported_networks": '["mainnet", "base"]'},
-        {"indexer": "not-an-address", "dips_supported_networks": '["mainnet"]'},
-        {"indexer": None, "dips_supported_networks": '["mainnet"]'},
-        {"indexer": "0x" + "c" * 40, "dips_supported_networks": "[]"},
+        _offer("0x" + "B" * 40, ["mainnet", "base"], prices),
+        _offer("not-an-address", ["mainnet"], prices),
+        _offer(None, ["mainnet"], prices),
+        _offer("0x" + "c" * 40, [], prices),
         "not a record",
     ]
 

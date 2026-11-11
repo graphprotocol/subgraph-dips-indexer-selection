@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 import requests
 from freshness_config import PUSH_DELAY_SECONDS, FreshnessConfig
+from freshness_contract import without_refused
 from freshness_gateway import GatewayClient
 from freshness_rules import (
     KEY_OUT_OF_FUNDS,
@@ -303,6 +304,7 @@ class FreshnessProber:
 
     async def _push(self, start: float, results: list[CheckResult]) -> None:
         minute = format_minute(start)
+        results = without_refused(minute, results)
         counts = Counter(result.outcome for result in results)
         try:
             response = await asyncio.to_thread(self._push_payload, minute_payload(start, results))

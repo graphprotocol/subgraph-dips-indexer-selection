@@ -117,7 +117,8 @@ OUTCOME_FIELDS = {"indexer", "chain", "outcome", "reason", "detail", "deployment
 def assert_matches_contract(payload):
     """Check a pushed body against every rule CONTRACT.md sets for POST /freshness, and the
     stricter ones the service's validation adds."""
-    json.dumps(payload, allow_nan=False)
+    # The service refuses text that UTF-8 can't hold, such as half of a surrogate pair.
+    json.dumps(payload, allow_nan=False, ensure_ascii=False).encode("utf-8")
     assert set(payload) == {"minute", "outcomes"}
     assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:00Z", payload["minute"])
     minute = datetime.fromisoformat(payload["minute"])
@@ -295,6 +296,51 @@ async def test_a_pair_with_no_eligible_deployment_at_all_is_no_evidence():
 def _single_outcome(payload):
     (outcome,) = payload["outcomes"]
     return outcome["outcome"], outcome["reason"]
+
+
+async def test_an_indexers_error_text_holding_half_a_surrogate_pair_is_pushed_clean():
+    clock = FakeClock(MINUTE)
+    pair = (_indexer(1), "mainnet")
+    targets = Targets(pairs=(pair,), eligible={pair: (_deployment("A"),)})
+    body = b'{"errors": [{"message": "store error \\ud800"}]}'
+
+    def reply(arrived_at):
+        return GatewayReply(200, True, body, arrived_at)
+
+    pushed = []
+    prober = _prober(
+        targets, FakeGateway(clock, {(_deployment("A"), _indexer(1)): reply}), clock, pushed
+    )
+    prober._targets = targets
+
+    await prober.run_minute(MINUTE)
+
+    (outcome,) = pushed[0]["outcomes"]
+    assert (outcome["outcome"], outcome["reason"]) == ("fail", "indexer_error")
+    assert outcome["detail"] == "store error \\ud800"
+    assert_matches_contract(pushed[0])
+
+
+async def test_an_outcome_the_service_would_refuse_is_left_out_and_logged(caplog):
+    """The service refuses a whole push for 1 bad outcome, so the rest of the minute must still
+    get through."""
+    clock = FakeClock(MINUTE)
+    pairs = ((_indexer(1), "mainnet"), (_indexer(2), "main\n" + "x" * 60), (_indexer(3), "\ud800"))
+    pushed = []
+    prober = _prober(None, FakeGateway(clock, {}), clock, pushed)
+    prober._targets = Targets(pairs=pairs, eligible={})
+
+    with caplog.at_level(logging.ERROR):
+        await prober.run_minute(MINUTE)
+
+    assert [(o["indexer"], o["chain"]) for o in pushed[0]["outcomes"]] == [pairs[0]]
+    assert_matches_contract(pushed[0])
+    (error,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    message = error.getMessage()
+    assert "2 freshness outcomes" in message
+    assert _indexer(2) in message
+    assert "\n" not in message and "main\\n" in message
+    message.encode("utf-8")
 
 
 async def test_checks_still_waiting_when_they_could_no_longer_be_answered_are_not_sent():

@@ -1,5 +1,6 @@
 """Tests for how the freshness prober reads what to check, with every HTTP call faked."""
 
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -177,15 +178,21 @@ def _scores(*records):
     return {"computed_at": "2026-11-10T00:00:00Z", "count": len(records), "scores": list(records)}
 
 
+def _offer(indexer, chains, prices=None):
+    """A GET /scores record offering DIPs on ``chains``, each priced unless ``prices`` is given."""
+    return {
+        "indexer": indexer,
+        "dips_supported_networks": list(chains),
+        "dips_min_grt_per_30_days": dict.fromkeys(chains, 100.0) if prices is None else prices,
+    }
+
+
 def test_targets_pair_each_dips_chain_with_its_eligible_deployments():
     young = _allocation(INDEXER_A, "B", int(NOW - DAY))
     sources = _Sources(
         _scores(
-            {
-                "indexer": INDEXER_A.upper().replace("0X", "0x"),
-                "dips_supported_networks": ('["arbitrum-one", "matic"]'),
-            },
-            {"indexer": INDEXER_B, "dips_supported_networks": "[]"},
+            _offer(INDEXER_A.upper().replace("0X", "0x"), ["arbitrum-one", "matic"]),
+            _offer(INDEXER_B, []),
         ),
         [
             _allocation(INDEXER_A, "A", int(NOW - 9 * DAY)),
@@ -205,10 +212,37 @@ def test_targets_pair_each_dips_chain_with_its_eligible_deployments():
     assert sources.first_allocation_reads == [[(INDEXER_A, young.deployment_id)]]
 
 
+def test_a_chain_the_indexer_lists_without_a_price_is_not_checked():
+    sources = _Sources(
+        _scores(_offer(INDEXER_A, ["arbitrum-one", "matic"], {"arbitrum-one": 100.0})),
+        [_allocation(INDEXER_A, "A", int(NOW - 9 * DAY), chain="matic")],
+    )
+
+    assert sources.loader()().pairs == ((INDEXER_A, "arbitrum-one"),)
+
+
+def test_an_indexer_listing_150_chains_is_checked_on_100_with_a_warning(caplog):
+    """1 indexer with a low address used to fill the 50,000 pairs a push holds by itself."""
+    many = [f"chain-{n:03d}" for n in range(150)]
+    sources = _Sources(
+        _scores(_offer(INDEXER_A, many), _offer(INDEXER_B, ["mainnet"])),
+        [_allocation(INDEXER_B, "A", int(NOW - 9 * DAY), chain="mainnet")],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        targets = sources.loader()()
+
+    assert len(targets.pairs) == 101
+    assert (INDEXER_B, "mainnet") in targets.pairs
+    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert INDEXER_A in warning.getMessage()
+    assert "150" in warning.getMessage()
+
+
 def test_first_allocations_are_cached_across_refreshes():
     young = _allocation(INDEXER_A, "B", int(NOW - DAY))
     sources = _Sources(
-        _scores({"indexer": INDEXER_A, "dips_supported_networks": '["arbitrum-one"]'}),
+        _scores(_offer(INDEXER_A, ["arbitrum-one"])),
         [young],
         {(INDEXER_A, young.deployment_id): int(NOW - 2 * DAY)},
     )
@@ -228,7 +262,7 @@ def test_scores_without_records_fail_the_refresh(response):
 
 
 def test_no_dips_indexers_means_no_pairs_and_no_subgraph_read():
-    sources = _Sources(_scores({"indexer": INDEXER_A, "dips_supported_networks": "[]"}), [])
+    sources = _Sources(_scores(_offer(INDEXER_A, [])), [])
 
     assert sources.loader()() == Targets(pairs=(), eligible={})
     assert sources.allocation_reads == []

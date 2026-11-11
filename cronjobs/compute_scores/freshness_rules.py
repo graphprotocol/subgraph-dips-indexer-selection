@@ -9,6 +9,8 @@ are the ones the service's POST /freshness accepts.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -43,9 +45,10 @@ DETAIL_LIMIT = 300
 FUTURE_TOLERANCE_SECONDS = 60
 # The last second a timestamp can name and still be a date (9999-12-31T23:59:59Z).
 _MAX_BLOCK_TIMESTAMP = 253_402_300_799
-CHAIN_NAME_LIMIT = 64
 # POST /freshness accepts at most this many outcomes in 1 minute.
 MAX_PAIRS = 50_000
+# Chains checked per indexer, so 1 indexer listing thousands can't crowd out the rest.
+MAX_CHAINS_PER_INDEXER = 100
 
 # A minute points to a fault between the gateway and indexers in general when at least this
 # many indexers were asked and none answered, or at least the second number were asked and more
@@ -56,6 +59,9 @@ GENERAL_FAULT_MAJORITY_SILENT_MIN = 10
 _INDEXER_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _DEPLOYMENT_HASH = re.compile(r"^Qm[1-9A-HJ-NP-Za-km-z]{44}$")
 _DEPLOYMENT_ENTITY_ID = re.compile(r"^0x[0-9a-fA-F]{64}$")
+# Printable ASCII without spaces: every real network name fits, and a name an indexer made up
+# can't hold text the service refuses or a line break that would start a fake log line.
+_CHAIN_NAME = re.compile(r"[\x21-\x7e]{1,64}")
 
 # The error the gateway names for the indexer, after "bad indexers: {0x...: ". The address is
 # optional so a change in how the gateway lists indexers still reaches the error text.
@@ -64,6 +70,8 @@ _BAD_INDEXER_ERROR = re.compile(
 )
 # indexer-service answers 400 or 402 when it rejects the gateway's payment receipt.
 _PAYMENT_REFUSED_ERROR = re.compile(r'^BadResponse\("?40[02]\b')
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -148,7 +156,12 @@ class Targets:
 
 
 def truncate_detail(text: Optional[str]) -> Optional[str]:
-    return None if text is None else text[:DETAIL_LIMIT]
+    """Text the service accepts as ``detail``: anything UTF-8 can't hold, such as the half of a
+    surrogate pair a JSON escape like \\ud800 decodes to, is written out as its escape, then the
+    whole is cut to DETAIL_LIMIT characters."""
+    if text is None:
+        return None
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")[:DETAIL_LIMIT]
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +379,7 @@ def is_deployment_entity_id(value: object) -> TypeGuard[str]:
 
 
 def is_chain_name(value: object) -> TypeGuard[str]:
-    return isinstance(value, str) and 0 < len(value) <= CHAIN_NAME_LIMIT
+    return isinstance(value, str) and bool(_CHAIN_NAME.fullmatch(value))
 
 
 def supported_chains(value: object) -> list[str]:
@@ -384,16 +397,58 @@ def supported_chains(value: object) -> list[str]:
     return list(dict.fromkeys(chain for chain in value if is_chain_name(chain)))
 
 
-def dips_pairs(records: Iterable[object]) -> list[tuple[str, str]]:
-    """Every (indexer, chain) an indexer offers DIPs on, from GET /scores records, sorted."""
-    pairs: set[tuple[str, str]] = set()
+def _is_price(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return False
+    try:
+        price = float(value)
+    except (ValueError, OverflowError):
+        return False
+    return math.isfinite(price) and price >= 0
+
+
+def _priced_chains(value: object) -> set[str]:
+    """The chains with a usable price in a ``dips_min_grt_per_30_days`` value, an object or a
+    JSON string of one. Selection leaves an indexer out on any other chain, as the service's
+    _extract_chain_price reads a price: a finite number of at least 0, not true or false.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, RecursionError):
+            return set()
+    if not isinstance(value, dict):
+        return set()
+    return {chain for chain, price in value.items() if _is_price(price)}
+
+
+def _offered_chains(records: Iterable[object]) -> dict[str, list[str]]:
+    """Each indexer's chains from GET /scores records: those it offers DIPs on and has priced,
+    in the order it lists them, without repeats. Indexers are in lower case."""
+    chains: dict[str, dict[str, None]] = {}
     for record in records:
         if not isinstance(record, dict) or not is_indexer_address(record.get("indexer")):
             continue
-        indexer = record["indexer"].lower()
-        pairs.update(
-            (indexer, chain) for chain in supported_chains(record.get("dips_supported_networks"))
-        )
+        priced = _priced_chains(record.get("dips_min_grt_per_30_days"))
+        listed = supported_chains(record.get("dips_supported_networks"))
+        offered = chains.setdefault(record["indexer"].lower(), {})
+        offered.update((chain, None) for chain in listed if chain in priced)
+    return {indexer: list(offered) for indexer, offered in chains.items() if offered}
+
+
+def dips_pairs(records: Iterable[object]) -> list[tuple[str, str]]:
+    """Every (indexer, chain) to check from GET /scores records, sorted: of the chains an indexer
+    offers DIPs on and has priced, the first MAX_CHAINS_PER_INDEXER in the order it lists them."""
+    pairs: list[tuple[str, str]] = []
+    for indexer, chains in _offered_chains(records).items():
+        if len(chains) > MAX_CHAINS_PER_INDEXER:
+            logger.warning(
+                "Indexer %s offers DIPs on %d priced chains; checking only the first %d",
+                indexer,
+                len(chains),
+                MAX_CHAINS_PER_INDEXER,
+            )
+        pairs.extend((indexer, chain) for chain in chains[:MAX_CHAINS_PER_INDEXER])
     return sorted(pairs)
 
 
