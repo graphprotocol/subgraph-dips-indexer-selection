@@ -51,6 +51,14 @@ spec:
                   key: IISA_PUSH_TOKEN
             - name: IISA_REQUIRE_PUSH_TOKEN
               value: "true"
+            # Optional, so the service still starts without the secret: reads then need the
+            # push token, as before.
+            - name: IISA_READ_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: iisa-read-token
+                  key: IISA_READ_TOKEN
+                  optional: true
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
