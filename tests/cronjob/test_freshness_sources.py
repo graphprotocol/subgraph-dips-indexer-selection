@@ -1,0 +1,234 @@
+"""Tests for how the freshness prober reads what to check, with every HTTP call faked."""
+
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+import requests
+
+sys.path.insert(0, str(Path(__file__).parents[2] / "cronjobs" / "compute_scores"))
+
+import freshness_sources  # noqa: E402
+from freshness_rules import Allocation, Targets  # noqa: E402
+from freshness_sources import (  # noqa: E402
+    TargetLoader,
+    post_graphql,
+    read_first_allocations,
+    read_open_allocations,
+)
+from subgraph import SubgraphResponseError  # noqa: E402
+
+URL = "https://gateway.example.com/api/fake-network-key/subgraphs/id/QmNetwork"
+NOW = 1_794_345_636.0
+DAY = 86_400
+INDEXER_A = "0x" + "a" * 40
+INDEXER_B = "0x" + "b" * 40
+
+
+def _deployment(letter, network="arbitrum-one"):
+    return {
+        "id": "0x" + letter.lower() * 64,
+        "ipfsHash": "Qm" + letter * 44,
+        "manifest": None if network is None else {"network": network},
+    }
+
+
+def _raw_allocation(n, letter, created_at, network="arbitrum-one"):
+    return {
+        "id": f"0x{n:040x}",
+        "createdAt": str(int(created_at)),
+        "subgraphDeployment": (_deployment(letter, network)),
+    }
+
+
+def _reply(data):
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"data": data}
+    response.raise_for_status.return_value = None
+    return response
+
+
+@pytest.fixture
+def no_retry_wait():
+    """Skip the retry backoff, which otherwise sleeps for about 30s."""
+    with (
+        patch.object(read_open_allocations.retry, "sleep", lambda _: None),
+        patch.object(freshness_sources._read_first_allocation_chunk.retry, "sleep", lambda _: None),
+    ):
+        yield
+
+
+@patch("requests.post")
+def test_reads_open_allocations_with_their_chain(mock_post):
+    mock_post.return_value = _reply(
+        {
+            "indexers": [
+                {
+                    "id": INDEXER_A,
+                    "allocations": [
+                        _raw_allocation(1, "A", NOW - 9 * DAY),
+                        _raw_allocation(2, "B", NOW - DAY, network="mainnet"),
+                        _raw_allocation(3, "C", NOW - DAY, network=None),
+                    ],
+                }
+            ]
+        }
+    )
+
+    allocations = read_open_allocations(URL, [INDEXER_A, INDEXER_B])
+
+    assert allocations == [
+        Allocation(INDEXER_A, "arbitrum-one", "0x" + "a" * 64, "Qm" + "A" * 44, int(NOW - 9 * DAY)),
+        Allocation(INDEXER_A, "mainnet", "0x" + "b" * 64, "Qm" + "B" * 44, int(NOW - DAY)),
+    ]
+    query = mock_post.call_args.kwargs["json"]["query"]
+    assert f'id_in: ["{INDEXER_A}", "{INDEXER_B}"]' in query
+    assert "status: Active" in query
+
+
+@patch("requests.post")
+def test_pages_through_an_indexer_with_more_open_allocations_than_1_nested_page(mock_post):
+    nested = [_raw_allocation(n, "A", NOW - 9 * DAY) for n in range(1000)]
+    full = nested + [_raw_allocation(1000 + n, "B", NOW - 9 * DAY) for n in range(5)]
+    mock_post.side_effect = [
+        _reply({"indexers": [{"id": INDEXER_A, "allocations": nested}]}),
+        _reply({"allocations": full[:1000]}),
+        _reply({"allocations": full[1000:]}),
+    ]
+
+    allocations = read_open_allocations(URL, [INDEXER_A])
+
+    assert len(allocations) == 1005
+    follow_up = mock_post.call_args_list[1].kwargs["json"]["query"]
+    assert f'indexer: "{INDEXER_A}"' in follow_up
+
+
+@patch("requests.post")
+def test_no_open_allocations_for_anyone_is_a_failed_read(mock_post, no_retry_wait):
+    mock_post.return_value = _reply({"indexers": [{"id": INDEXER_A, "allocations": []}]})
+
+    with pytest.raises(SubgraphResponseError, match="no open allocations"):
+        read_open_allocations(URL, [INDEXER_A])
+
+
+@patch("requests.post")
+def test_reads_first_allocations_in_batches(mock_post, monkeypatch):
+    monkeypatch.setattr(freshness_sources, "FIRST_ALLOCATIONS_PER_QUERY", 2)
+    keys = [(INDEXER_A, "0x" + letter * 64) for letter in "abc"]
+    mock_post.side_effect = [
+        _reply({"a0": [{"createdAt": "100"}], "a1": []}),
+        _reply({"a0": [{"createdAt": "300"}]}),
+    ]
+
+    found = read_first_allocations(URL, keys)
+
+    assert found == {keys[0]: 100, keys[2]: 300}
+    first_query = mock_post.call_args_list[0].kwargs["json"]["query"]
+    assert "orderBy: createdAt, orderDirection: asc" in first_query
+    assert f'subgraphDeployment: "{keys[1][1]}"' in first_query
+
+
+@patch("requests.post")
+def test_a_failed_read_never_shows_the_network_subgraph_key(mock_post):
+    mock_post.side_effect = requests.ConnectionError(f"cannot reach {URL}")
+
+    with pytest.raises(requests.ConnectionError) as raised:
+        post_graphql(URL, "{ x }")
+
+    assert "fake-network-key" not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+class _Sources:
+    """Fake GET /scores and network subgraph reads that record what was asked."""
+
+    def __init__(self, scores, allocations, first_allocations=None):
+        self.scores = scores
+        self.allocations = allocations
+        self.first_allocations = first_allocations or {}
+        self.allocation_reads = []
+        self.first_allocation_reads = []
+
+    def loader(self, clock=lambda: NOW):
+        return TargetLoader(
+            fetch_scores=lambda: self.scores,
+            read_allocations=self._read_allocations,
+            read_first_allocations=self._read_first_allocations,
+            min_allocation_age_seconds=7 * DAY,
+            clock=clock,
+        )
+
+    def _read_allocations(self, indexers):
+        self.allocation_reads.append(list(indexers))
+        return [a for a in self.allocations if a.indexer in indexers]
+
+    def _read_first_allocations(self, keys):
+        self.first_allocation_reads.append(list(keys))
+        return {key: self.first_allocations[key] for key in keys if key in self.first_allocations}
+
+
+def _allocation(indexer, letter, created_at, chain="arbitrum-one"):
+    return Allocation(indexer, chain, "0x" + letter.lower() * 64, "Qm" + letter * 44, created_at)
+
+
+def _scores(*records):
+    return {"computed_at": "2026-11-10T00:00:00Z", "count": len(records), "scores": list(records)}
+
+
+def test_targets_pair_each_dips_chain_with_its_eligible_deployments():
+    young = _allocation(INDEXER_A, "B", int(NOW - DAY))
+    sources = _Sources(
+        _scores(
+            {
+                "indexer": INDEXER_A.upper().replace("0X", "0x"),
+                "dips_supported_networks": ('["arbitrum-one", "matic"]'),
+            },
+            {"indexer": INDEXER_B, "dips_supported_networks": "[]"},
+        ),
+        [
+            _allocation(INDEXER_A, "A", int(NOW - 9 * DAY)),
+            young,
+            _allocation(INDEXER_A, "C", int(NOW - 9 * DAY), chain="mainnet"),
+        ],
+        {(INDEXER_A, young.deployment_id): int(NOW - 40 * DAY)},
+    )
+
+    targets = sources.loader()()
+
+    assert targets == Targets(
+        pairs=((INDEXER_A, "arbitrum-one"), (INDEXER_A, "matic")),
+        eligible={(INDEXER_A, "arbitrum-one"): ("Qm" + "A" * 44, "Qm" + "B" * 44)},
+    )
+    assert sources.allocation_reads == [[INDEXER_A]]
+    assert sources.first_allocation_reads == [[(INDEXER_A, young.deployment_id)]]
+
+
+def test_first_allocations_are_cached_across_refreshes():
+    young = _allocation(INDEXER_A, "B", int(NOW - DAY))
+    sources = _Sources(
+        _scores({"indexer": INDEXER_A, "dips_supported_networks": '["arbitrum-one"]'}),
+        [young],
+        {(INDEXER_A, young.deployment_id): int(NOW - 2 * DAY)},
+    )
+    loader = sources.loader()
+
+    assert loader().eligible == {}
+    assert loader().eligible == {}
+    assert len(sources.first_allocation_reads) == 1
+
+
+@pytest.mark.parametrize("response", [{}, {"scores": []}, {"scores": "nope"}, None])
+def test_scores_without_records_fail_the_refresh(response):
+    sources = _Sources(response, [])
+
+    with pytest.raises(ValueError, match="no score records"):
+        sources.loader()()
+
+
+def test_no_dips_indexers_means_no_pairs_and_no_subgraph_read():
+    sources = _Sources(_scores({"indexer": INDEXER_A, "dips_supported_networks": "[]"}), [])
+
+    assert sources.loader()() == Targets(pairs=(), eligible={})
+    assert sources.allocation_reads == []
