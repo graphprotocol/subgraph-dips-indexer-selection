@@ -2,14 +2,15 @@
 
 Stake comes from the network subgraph, read near the end of the run, after the long replay of
 gateway queries. When that read fails the run should carry on and push its real latency,
-uptime and success scores with stake and query fees missing, rather than throw them all away
-for the fallback's equal neutral scores.
+uptime and success scores, rather than throw them all away for the fallback's equal neutral
+scores. For stake and query fees it reuses what an earlier run read, if that was less than 60
+hours ago, and otherwise sends them as missing.
 """
 
 import logging
 import os
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
@@ -22,6 +23,7 @@ sys.path.insert(0, str(jobs_path))
 
 import main  # noqa: E402
 import processing  # noqa: E402
+from iisa_client import IISAPushError  # noqa: E402
 from processing import compute_all_scores, merge_and_prepare_dataframes  # noqa: E402
 from redpanda import RedpandaProvider  # noqa: E402
 
@@ -32,6 +34,10 @@ READ_AT = "stake_read_at"
 QUALITY_COLUMNS = ["uptime_score", "success_rate", "lat_lin_reg_coefficient", "query_count"]
 STAKE = [{"id": indexer, "stakedTokens": "1000000", "lockedTokens": "0"} for indexer in INDEXERS]
 REJECTED_KEY = {"errors": [{"message": "auth error: API key not found"}]}
+WORKING = {"data": {"indexers": STAKE}}
+NOW = datetime(2026, 11, 11, 11, 30, tzinfo=timezone.utc)
+HELD_STAKE = [500_000.0, 600_000.0, 700_000.0]
+HELD_FEES = [50.0, 0.0, 70.0]
 
 
 def _queries() -> pd.DataFrame:
@@ -119,18 +125,88 @@ def _scores(stake_reply: dict[str, Any]) -> pd.DataFrame:
         ).set_index("indexer")
 
 
-def _run_job(monkeypatch: pytest.MonkeyPatch, stake_reply: dict[str, Any]) -> list[dict[str, Any]]:
-    """Run the whole job without GeoIP, the stake read answered by stake_reply; return the rows
-    it pushed to iisa.
+class FakeIisa:
+    """Stands in for iisa: keeps what the job pushes and answers GET /scores with it.
+
+    The real service renames some quality columns in that reply, but sends the stake columns
+    and their read time back exactly as they were pushed, and those are all a reuse reads.
     """
-    pushed: list[list[dict[str, Any]]] = []
+
+    def __init__(self) -> None:
+        self.held: list[dict[str, Any]] = []
+        self.failure: Optional[Exception] = None
+
+    def post(self, _url: str, _token: Optional[str], rows: list[dict[str, Any]]) -> None:
+        self.held = rows
+
+    def get(self, _url: str, _token: Optional[str]) -> dict[str, Any]:
+        if self.failure is not None:
+            raise self.failure
+        return {"computed_at": None, "count": len(self.held), "scores": self.held}
+
+
+@pytest.fixture
+def iisa(monkeypatch: pytest.MonkeyPatch) -> FakeIisa:
+    fake = FakeIisa()
+    monkeypatch.setattr("redpanda.post_scores", fake.post)
+    monkeypatch.setattr("redpanda.get_scores", fake.get, raising=False)
+    return fake
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, datetime]:
+    """The time the job sees when it reads, reuses or reports stake; move it with clock["now"]."""
+    clock = {"now": NOW}
+    for target in ("redpanda.utc_now", "main.utc_now"):
+        monkeypatch.setattr(target, lambda: clock["now"], raising=False)
+    return clock
+
+
+def _held(read_at: Optional[datetime], indexers: list[str] = INDEXERS) -> list[dict[str, Any]]:
+    """Rows as iisa holds them after an earlier run read stake at read_at: b had no fees."""
+    return [
+        {
+            "indexer": indexer,
+            "success_rate": 0.2,
+            "last_known_slashable_stake": stake,
+            "total_query_fees": fees,
+            "stake_to_fees": stake / fees if fees else None,
+            READ_AT: read_at.isoformat() if read_at else None,
+        }
+        for indexer, stake, fees in zip(INDEXERS, HELD_STAKE, HELD_FEES)
+        if indexer in indexers
+    ]
+
+
+def _held_stake(indexers: list[str] = INDEXERS) -> dict[str, list[Optional[float]]]:
+    """The stake, fees and ratio _held gives each of indexers, in STAKE_COLUMNS order."""
+    return {
+        indexer: [stake / fees if fees else None, fees, stake]
+        for indexer, stake, fees in zip(INDEXERS, HELD_STAKE, HELD_FEES)
+        if indexer in indexers
+    }
+
+
+def _pushed_stake(rows: list[dict[str, Any]]) -> dict[str, list[Optional[float]]]:
+    return {row["indexer"]: [row[column] for column in STAKE_COLUMNS] for row in rows}
+
+
+def _pushed_read_at(rows: list[dict[str, Any]]) -> dict[str, Optional[pd.Timestamp]]:
+    return {row["indexer"]: pd.Timestamp(row[READ_AT]) if row[READ_AT] else None for row in rows}
+
+
+def _run_job(
+    monkeypatch: pytest.MonkeyPatch, iisa: FakeIisa, stake_reply: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Run the whole job without GeoIP, the stake read answered by stake_reply; return the rows
+    it pushed to iisa, which iisa then holds for the next run.
+    """
     monkeypatch.setattr(main, "RedpandaProvider", _provider)
     monkeypatch.setattr(main, "validate_geoip_databases", lambda: False)
     monkeypatch.setattr(main, "discover_indexers_from_network_subgraph", lambda _url: URLS)
-    monkeypatch.setattr("redpanda.post_scores", lambda _url, _token, rows: pushed.append(rows))
     with patch("subgraph.requests.post", return_value=_subgraph_reply(stake_reply)):
         assert main.run_scoring() is True
-    return pushed[-1]
+    return iisa.held
 
 
 def _failed_stake_lookup() -> pd.DataFrame:
@@ -138,7 +214,10 @@ def _failed_stake_lookup() -> pd.DataFrame:
         return _provider().fetch_stake_to_fees()
 
 
+@pytest.mark.usefixtures("iisa")
 class TestFailedStakeLookup:
+    """With nothing to reuse, a failed lookup leaves stake missing and keeps today's scores."""
+
     @pytest.mark.parametrize("drop_missing_latency", [True, False], ids=["full", "partial"])
     def test_its_answer_goes_through_the_merge_with_stake_missing(self, drop_missing_latency):
         uptime = pd.DataFrame({"indexer": INDEXERS, "% up_x": [99.0, 95.0, 90.0]})
@@ -166,7 +245,7 @@ class TestFailedStakeLookup:
 
         assert merged.loc[INDEXERS, "% up_x"].tolist() == [99.0, 95.0, 90.0]
         assert merged.loc[INDEXERS, "average_status"].tolist() == [1.0, 0.75, 0.5]
-        assert merged.loc[INDEXERS, STAKE_COLUMNS].isna().all().all()
+        assert merged.loc[INDEXERS, [*STAKE_COLUMNS, READ_AT]].isna().all().all()
 
     @pytest.mark.usefixtures("replay")
     def test_the_run_keeps_the_quality_scores_a_working_lookup_gives(self):
@@ -181,9 +260,9 @@ class TestFailedStakeLookup:
         assert working.loc[INDEXERS, "last_known_slashable_stake"].tolist() == [1_000_000.0] * 3
 
     @pytest.mark.usefixtures("replay")
-    def test_the_job_pushes_measured_scores_with_stake_missing(self, monkeypatch, caplog):
+    def test_the_job_pushes_measured_scores_with_stake_missing(self, monkeypatch, iisa, caplog):
         with caplog.at_level("INFO"):
-            pushed = _run_job(monkeypatch, REJECTED_KEY)
+            pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
 
         assert any("mode=partial" in r.getMessage() for r in caplog.records)
         rows = {row["indexer"]: row for row in pushed}
@@ -196,6 +275,7 @@ class TestFailedStakeLookup:
         assert _first(caplog.records, "WARNING", "Scores pushed without stake data") is not None
 
 
+@pytest.mark.usefixtures("iisa")
 class TestStakeReadTime:
     """Each run records when its stake was read from the network subgraph."""
 
@@ -209,9 +289,9 @@ class TestStakeReadTime:
         assert ((read_at >= before) & (read_at <= after)).all()
 
     @pytest.mark.usefixtures("replay")
-    def test_the_pushed_scores_carry_the_read_time(self, monkeypatch):
+    def test_the_pushed_scores_carry_the_read_time(self, monkeypatch, iisa):
         before = datetime.now(timezone.utc).replace(microsecond=0)
-        pushed = _run_job(monkeypatch, {"data": {"indexers": STAKE}})
+        pushed = _run_job(monkeypatch, iisa, WORKING)
         after = datetime.now(timezone.utc)
 
         read_at = pd.to_datetime([row[READ_AT] for row in pushed], utc=True)
@@ -225,6 +305,149 @@ class TestStakeReadTime:
         scores = processing.compute_degraded_scores(URLS)
 
         assert scores[READ_AT].isna().all()
+
+
+@pytest.mark.usefixtures("replay")
+class TestReusingAnEarlierRead:
+    """A failed lookup reuses the stake iisa holds from a run that read it under 60 hours ago."""
+
+    @pytest.mark.parametrize("hours", [24, 48])
+    def test_reuses_stake_read_less_than_60_hours_ago(
+        self, monkeypatch, iisa, clock, caplog, hours
+    ):
+        read_at = NOW - timedelta(hours=hours)
+        iisa.held = _held(read_at)
+
+        with caplog.at_level("INFO"):
+            pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
+
+        assert _pushed_stake(pushed) == _held_stake()
+        assert set(_pushed_read_at(pushed).values()) == {read_at}
+        assert [row["success_rate"] for row in pushed] == [1.0, 0.75, 0.5]
+        warning = _first(caplog.records, "WARNING", "reused for 3 indexer(s)")
+        assert warning is not None and read_at.isoformat() in warning.getMessage()
+        assert "0 have none" in warning.getMessage()
+        assert _first(caplog.records, "WARNING", "Scores pushed without stake data") is None
+
+    @pytest.mark.parametrize("hours", [60, 72])
+    def test_leaves_stake_missing_once_60_hours_have_passed(
+        self, monkeypatch, iisa, clock, caplog, hours
+    ):
+        iisa.held = _held(NOW - timedelta(hours=hours))
+
+        with caplog.at_level("INFO"):
+            pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
+
+        assert _pushed_stake(pushed) == {indexer: [None] * 3 for indexer in INDEXERS}
+        assert set(_pushed_read_at(pushed).values()) == {None}
+        assert _first(caplog.records, "WARNING", "Scores pushed without stake data") is not None
+
+    def test_three_failed_days_in_a_row_reuse_twice(self, monkeypatch, iisa, clock):
+        """Day 1 reads stake; days 2 and 3 reuse it and keep its read time; day 4 has none."""
+        _run_job(monkeypatch, iisa, WORKING)
+        read_on_day_1 = _pushed_stake(iisa.held)
+        reused = []
+        for day in (2, 3, 4):
+            clock["now"] = NOW + timedelta(days=day - 1)
+            pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
+            reused.append(set(_pushed_read_at(pushed).values()) == {NOW})
+
+        assert reused == [True, True, False]
+        assert _pushed_stake(iisa.held) == {indexer: [None] * 3 for indexer in INDEXERS}
+        assert read_on_day_1[INDEXERS[0]] == [100_000.0, 10.0, 1_000_000.0]
+
+    def test_an_indexer_new_today_has_no_stake(self, monkeypatch, iisa, clock, caplog):
+        iisa.held = _held(NOW - timedelta(hours=24), indexers=INDEXERS[:2])
+
+        with caplog.at_level("INFO"):
+            pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
+
+        assert _pushed_stake(pushed) == {**_held_stake(INDEXERS[:2]), INDEXERS[2]: [None] * 3}
+        assert _pushed_read_at(pushed)[INDEXERS[2]] is None
+        warning = _first(caplog.records, "WARNING", "reused for 2 indexer(s)")
+        assert warning is not None and "1 have none" in warning.getMessage()
+
+    def test_the_fallback_snapshot_is_never_reused(self, monkeypatch, iisa, clock):
+        """The fallback sends stake and fees as 0 with a neutral score and no read time."""
+        iisa.held = [
+            {
+                "indexer": indexer,
+                "last_known_slashable_stake": 0.0,
+                "total_query_fees": 0.0,
+                "stake_to_fees": None,
+                "norm_stake_to_fees": 0.5,
+                READ_AT: None,
+            }
+            for indexer in INDEXERS
+        ]
+
+        pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
+
+        assert _pushed_stake(pushed) == {indexer: [None] * 3 for indexer in INDEXERS}
+
+    def test_scores_pushed_before_read_times_were_recorded_are_not_reused(
+        self, monkeypatch, iisa, clock
+    ):
+        iisa.held = [
+            {key: value for key, value in row.items() if key != READ_AT}
+            for row in _held(NOW - timedelta(hours=24))
+        ]
+
+        pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
+
+        assert _pushed_stake(pushed) == {indexer: [None] * 3 for indexer in INDEXERS}
+
+    @pytest.mark.parametrize(
+        "failure",
+        [IISAPushError("GET /scores failed after 10 attempts"), ValueError("not JSON")],
+        ids=["unreachable", "not-json"],
+    )
+    def test_a_failed_read_of_the_held_scores_leaves_stake_missing(
+        self, monkeypatch, iisa, clock, caplog, failure
+    ):
+        iisa.held = _held(NOW - timedelta(hours=24))
+        iisa.failure = failure
+
+        with caplog.at_level("INFO"):
+            pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
+
+        assert _pushed_stake(pushed) == {indexer: [None] * 3 for indexer in INDEXERS}
+        assert [row["success_rate"] for row in pushed] == [1.0, 0.75, 0.5]
+        assert _first(caplog.records, "WARNING", "Could not read the scores iisa holds")
+        assert any("mode=partial" in r.getMessage() for r in caplog.records)
+
+
+class TestReusableStake:
+    """Only well-formed rows read under 60 hours ago, once each, can be reused."""
+
+    @pytest.mark.parametrize(
+        "reply", [None, [], {}, {"scores": None}, {"scores": "rows"}, {"scores": []}]
+    )
+    def test_a_reply_without_rows_gives_nothing(self, reply):
+        from stake_reads import reusable_stake
+
+        assert reusable_stake(reply, NOW).empty
+
+    def test_unusable_rows_are_left_out(self):
+        from stake_reads import reusable_stake
+
+        good = _held(NOW - timedelta(hours=1))[0]
+        rows = [
+            good,
+            {**good, "indexer": INDEXERS[1], READ_AT: (NOW + timedelta(hours=1)).isoformat()},
+            {**good, "indexer": INDEXERS[2], "last_known_slashable_stake": "lots"},
+            {**good, "indexer": "0x" + "d" * 40, "total_query_fees": -1.0},
+            {**good, "indexer": "0x" + "e" * 40, READ_AT: 1_700_000_000},
+            {**good, "indexer": 7},
+            {**good, "indexer": "0x" + "f" * 40},
+            {**good, "indexer": "0x" + "f" * 40},
+            "not a row",
+        ]
+
+        answer = reusable_stake({"scores": rows}, NOW)
+
+        assert answer.index.tolist() == [INDEXERS[0]]
+        assert answer.loc[INDEXERS[0], STAKE_COLUMNS].tolist() == _held_stake()[INDEXERS[0]]
 
 
 def _first(records: list[logging.LogRecord], level: str, text: str) -> Optional[logging.LogRecord]:
