@@ -3,7 +3,8 @@
 The score job records when it read stake from the network subgraph, and on a day it cannot
 read stake it reuses an earlier reading from the scores the service holds, keeping that time.
 The service must accept the field, keep it across a restart and send it back on GET /scores,
-and score reused stake exactly as it scored the same values on the day they were read.
+and score reused stake exactly as it scored the same values on the day they were read. A run
+that can measure nothing carries quality over the same way, so that must come back whole too.
 """
 
 import json
@@ -112,6 +113,58 @@ class TestReadTimeIsKept:
         cached = json.loads(service.cache.read_text())
         assert {row["stake_read_at"] for row in cached} == {DAY_READ}
         assert set(_served_read_times(service.client).values()) == {DAY_READ}
+
+
+# The quality a score run measures, by the names the job pushes. A run that can measure nothing
+# reads these back from GET /scores to carry them over, so this list and the job's own must match.
+SERVED_UNDER_THE_PUSHED_NAME = [
+    "lat_lin_reg_coefficient",
+    "lat_coefficient_std_error",
+    "uptime_score",
+    "observed_duration_seconds",
+    "uptime_duration_seconds",
+    "org",
+    "dst_lat",
+    "dst_lon",
+    "query_count",
+    "scoring_mode",
+    "quality_measured_at",
+]
+SERVED_UNDER_THE_SELECTORS_NAME = {
+    "lat_coefficient_upper_bound": "Latency Coefficient + Error Confidence Interval",
+    "success_rate": "average_status",
+    "lat_normalized_score": "norm_lat_lin_reg_coefficient",
+}
+
+
+class TestQualityIsServedBack:
+    """The service hands quality back with its values unchanged: 3 columns under the names its
+    selector uses and the rest, with the time they were measured, under the names pushed.
+    """
+
+    @pytest.mark.parametrize("restart", [False, True], ids=["straight-away", "after-a-restart"])
+    def test_every_quality_value_comes_back(self, service, restart):
+        measured = {
+            "lat_coefficient_std_error": 0.002,
+            "observed_duration_seconds": 2_400_000.0,
+            "uptime_duration_seconds": 2_376_000.0,
+            "query_count": 40,
+            "scoring_mode": "full",
+            "quality_measured_at": DAY_READ,
+        }
+        records = [{**row, **measured} for row in _snapshot(DAY_READ)]
+        service.client.post("/scores", json=records, headers=AUTH)
+        if restart:
+            service.restart()
+
+        served = service.client.get("/scores", headers=AUTH).json()["scores"]
+
+        assert [row["indexer"] for row in served] == [row["indexer"] for row in records]
+        for pushed, back in zip(records, served):
+            for name in SERVED_UNDER_THE_PUSHED_NAME:
+                assert back[name] == pushed[name], name
+            for name, served_name in SERVED_UNDER_THE_SELECTORS_NAME.items():
+                assert back[served_name] == pushed[name], name
 
 
 def _scored(records: list[dict], fees: Optional[dict[str, float]] = None) -> pd.DataFrame:
