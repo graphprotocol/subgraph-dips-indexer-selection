@@ -34,8 +34,11 @@ MAX_REPLY_BYTES = 64 * 1024
 # A block dated up to this long after now still counts as 0 seconds old, allowing for clocks
 # that disagree a little; any later and the timestamp cannot be trusted.
 FUTURE_TOLERANCE_SECONDS = 60
-# Checks for 1 selection run side by side on this many threads; more wait their turn.
-CHECK_THREADS = 8
+# Checks run side by side on this many threads, shared by every selection in progress; more
+# wait their turn.
+CHECK_THREADS = 16
+# Sent with each query. Some gateways' front doors refuse the HTTP library's own default name.
+USER_AGENT = "iisa-sync-check"
 
 
 @dataclass(frozen=True)
@@ -61,13 +64,17 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def post_once(url: str, headers: dict[str, str], body: bytes, timeout: float) -> GatewayReply:
-    """POST body to url once and return the answer, giving up after timeout seconds in all.
+    """POST body to url once and return the answer. Connecting, and each wait for more of the
+    answer, may take up to timeout seconds, and the body must arrive within timeout of the
+    start; the caller's own time limit is what bounds the whole check.
 
     Raises an OSError, such as a timeout or a refused connection, when no answer arrives, and
     ValueError when the answer is larger than MAX_REPLY_BYTES.
     """
     deadline = time.monotonic() + timeout
-    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    request = urllib.request.Request(
+        url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method="POST"
+    )
     try:
         with _OPENER.open(request, timeout=timeout) as response:
             attested = ATTESTATION_HEADER in response.headers

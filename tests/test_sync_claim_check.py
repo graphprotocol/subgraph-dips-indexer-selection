@@ -161,10 +161,12 @@ class _Gateway(BaseHTTPRequestHandler):
 
     behaviour = "answer"
     seen: list[tuple[str, Optional[str], bytes]] = []
+    agents: list[Optional[str]] = []
 
     def do_POST(self) -> None:
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         type(self).seen.append((self.path, self.headers.get("Authorization"), body))
+        type(self).agents.append(self.headers.get("User-Agent"))
         if self.behaviour == "redirect" and self.path != "/elsewhere":
             self.send_response(307)
             self.send_header("Location", "/elsewhere")
@@ -179,7 +181,14 @@ class _Gateway(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         try:
-            self.wfile.write(payload)
+            if self.behaviour == "drip":
+                # 1 byte every 0.1s: no single read waits long, but the answer never ends in time.
+                for byte in payload:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.1)
+            else:
+                self.wfile.write(payload)
         except OSError:
             pass  # the client gave up, as the test meant it to
 
@@ -189,7 +198,7 @@ class _Gateway(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def gateway() -> Any:
-    _Gateway.behaviour, _Gateway.seen = "answer", []
+    _Gateway.behaviour, _Gateway.seen, _Gateway.agents = "answer", [], []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Gateway)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_port}"
@@ -224,6 +233,21 @@ class TestTheRequestItself:
 
         with pytest.raises(ValueError, match="over the"):
             post_once(f"{gateway}/route", self.HEADERS, b"{}", 2.0)
+
+    def test_an_answer_that_trickles_in_gives_up_at_the_time_limit(self, gateway):
+        _Gateway.behaviour = "drip"
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="did not finish"):
+            post_once(f"{gateway}/route", self.HEADERS, b"{}", 0.35)
+
+        assert time.monotonic() - started < 1.0
+
+    def test_it_names_itself_to_the_gateway(self, gateway):
+        """The library's own name is refused by some gateways' front doors."""
+        post_once(f"{gateway}/route", self.HEADERS, b"{}", 2.0)
+
+        assert _Gateway.agents == ["iisa-sync-check"]
 
     def test_a_slow_answer_gives_up_at_the_time_limit(self, gateway):
         _Gateway.behaviour = "slow"
