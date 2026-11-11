@@ -75,6 +75,32 @@ def reusable_stake(reply: Any, now: datetime) -> pd.DataFrame:
     return _stake_answer(usable) if usable else no_stake()
 
 
+def leave_out_unread(merged: pd.DataFrame, lookup_started: datetime) -> pd.DataFrame:
+    """On a run that reused an earlier stake reading, leave out the indexers that have none.
+
+    A reading stamped before this run's lookup began can only be a reused one. An indexer with
+    no reading would then go out with stake missing beside indexers with real stake, and iisa
+    scores missing stake as the best: a rank nobody measured. So it waits for a run that reads
+    its stake. When no indexer has a reading, every row is kept, as stake is then missing for
+    all alike; and when the lookup worked, nothing was reused and every row is kept too.
+    """
+    if STAKE_READ_AT not in merged.columns:
+        return merged
+    read_at = pd.to_datetime(merged[STAKE_READ_AT], utc=True)
+    unread = read_at.isna()
+    if not (read_at < lookup_started).any() or not unread.any():
+        return merged
+    left_out = merged.loc[unread, "indexer"].tolist()
+    logger.warning(
+        "Left %d indexer(s) out of today's scores: this run could not read stake and iisa holds "
+        "no reading under %.0f hours old for them: %s",
+        len(left_out),
+        STAKE_REUSE_LIMIT.total_seconds() / 3600,
+        ", ".join(left_out[:10]) + (" and others" if len(left_out) > 10 else ""),
+    )
+    return merged[~unread].reset_index(drop=True)
+
+
 def _held_rows(reply: Any) -> list[dict]:
     """The rows of a GET /scores reply, or none when the reply is not shaped like one."""
     records = reply.get("scores") if isinstance(reply, dict) else None

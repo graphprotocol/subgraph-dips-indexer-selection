@@ -157,7 +157,7 @@ def iisa(monkeypatch: pytest.MonkeyPatch) -> FakeIisa:
 def clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, datetime]:
     """The time the job sees when it reads, reuses or reports stake; move it with clock["now"]."""
     clock = {"now": NOW}
-    for target in ("redpanda.utc_now", "main.utc_now"):
+    for target in ("redpanda.utc_now", "main.utc_now", "processing.utc_now"):
         monkeypatch.setattr(target, lambda: clock["now"], raising=False)
     return clock
 
@@ -326,7 +326,7 @@ class TestReusingAnEarlierRead:
         assert [row["success_rate"] for row in pushed] == [1.0, 0.75, 0.5]
         warning = _first(caplog.records, "WARNING", "reused for 3 indexer(s)")
         assert warning is not None and read_at.isoformat() in warning.getMessage()
-        assert "0 have none" in warning.getMessage()
+        assert _first(caplog.records, "WARNING", "out of today's scores") is None
         assert _first(caplog.records, "WARNING", "Scores pushed without stake data") is None
 
     @pytest.mark.parametrize("hours", [60, 72])
@@ -356,16 +356,32 @@ class TestReusingAnEarlierRead:
         assert _pushed_stake(iisa.held) == {indexer: [None] * 3 for indexer in INDEXERS}
         assert read_on_day_1[INDEXERS[0]] == [100_000.0, 10.0, 1_000_000.0]
 
-    def test_an_indexer_new_today_has_no_stake(self, monkeypatch, iisa, clock, caplog):
+    def test_an_indexer_with_no_reading_is_left_out_beside_reused_stake(
+        self, monkeypatch, iisa, clock, caplog
+    ):
+        """c is new since the reading. Sent with stake missing beside a and b it would score
+        best on stake to fees, a rank nobody measured, so it waits for a run that reads stake.
+        """
         iisa.held = _held(NOW - timedelta(hours=24), indexers=INDEXERS[:2])
 
         with caplog.at_level("INFO"):
             pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
 
-        assert _pushed_stake(pushed) == {**_held_stake(INDEXERS[:2]), INDEXERS[2]: [None] * 3}
-        assert _pushed_read_at(pushed)[INDEXERS[2]] is None
-        warning = _first(caplog.records, "WARNING", "reused for 2 indexer(s)")
-        assert warning is not None and "1 have none" in warning.getMessage()
+        assert _pushed_stake(pushed) == _held_stake(INDEXERS[:2])
+        assert _first(caplog.records, "WARNING", "reused for 2 indexer(s)") is not None
+        left_out = _first(caplog.records, "WARNING", "Left 1 indexer(s) out of today's scores")
+        assert left_out is not None and INDEXERS[2] in left_out.getMessage()
+
+    def test_a_working_lookup_leaves_nobody_out(self, monkeypatch, iisa, clock, caplog):
+        """The subgraph answers, but without c. That is no reuse, so c stays, as it always has."""
+        without_c = {"data": {"indexers": STAKE[:2]}}
+
+        with caplog.at_level("INFO"):
+            pushed = _run_job(monkeypatch, iisa, without_c)
+
+        assert [row["indexer"] for row in pushed] == INDEXERS
+        assert _pushed_stake(pushed)[INDEXERS[2]] == [None] * 3
+        assert _first(caplog.records, "WARNING", "out of today's scores") is None
 
     def test_the_fallback_snapshot_is_never_reused(self, monkeypatch, iisa, clock):
         """The fallback sends stake and fees as 0 with a neutral score and no read time."""

@@ -32,7 +32,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from stake_reads import STAKE_READ_AT
+from stake_reads import STAKE_READ_AT, leave_out_unread, utc_now
 
 if TYPE_CHECKING:
     import aiohttp
@@ -979,6 +979,7 @@ def compute_all_scores(
     indexer_success_rate = calculate_indexer_success_rate(combined_queries)
     indexer_uptime = calculate_indexer_uptime(data_for_uptime)
 
+    stake_lookup_started = utc_now()
     stake_to_fees = provider.fetch_stake_to_fees()
 
     agg_df = aggregate_indexer_info(combined_queries)
@@ -993,6 +994,7 @@ def compute_all_scores(
         indexer_query_count,
         drop_missing_latency=geoip_available,
     )
+    merged = leave_out_unread(merged, stake_lookup_started)
 
     # DIP pricing fetched directly from indexers
     merged = _attach_dips_info(merged, indexer_urls)

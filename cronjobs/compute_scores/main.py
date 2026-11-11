@@ -213,11 +213,10 @@ def _warn_about_missing_stake(
         oldest = read_at[reused].min()
         logger.warning(
             "Stake read at %s (%.0f hours before this run) reused for %d indexer(s), as this run "
-            "could not read it; %d have none",
+            "could not read it",
             oldest.isoformat(),
             (run_started - oldest).total_seconds() / 3600,
             int(reused.sum()),
-            int(stake.isna().sum()),
         )
     elif stake.isna().all():
         logger.warning(
