@@ -7,7 +7,7 @@ Endpoints:
 - GET /health - Health check, reports if data is loaded
 - POST /scores - Push computed indexer scores from the cronjob (bearer-auth)
 - GET /scores - Return the current scores snapshot (bearer-auth)
-- GET /scores/status - Return last computed_at; lets the cronjob skip a redundant run (bearer-auth)
+- GET /scores/status - Return when the loaded scores were computed, for monitoring (bearer-auth)
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (bearer-auth)
 - GET /dips-indexers - Indexers selection would pick for a required ?chain (bearer-auth)
 - POST /sync-status - Push sync-status snapshot from the fetcher (bearer-auth)
@@ -203,8 +203,8 @@ class ScoresStatusResponse(BaseModel):
     """
     Response for the GET /scores/status endpoint.
 
-    Used by the cronjob to decide whether today's scores have already been
-    computed and pushed — lets the job skip a redundant run.
+    Says when the loaded scores were computed and how many rows they hold, so monitoring can
+    tell whether the daily push landed without fetching the whole snapshot.
     """
 
     computed_at: Optional[str] = None
@@ -707,11 +707,11 @@ def push_scores(
 def scores_status(
     authorization: Optional[str] = Header(None),
 ) -> ScoresStatusResponse:
-    """Report computed_at of the currently loaded scores.
+    """Report computed_at and the row count of the currently loaded scores.
 
-    The cronjob GETs this before running so it can skip recomputation when
-    today's scores are already pushed. Sync def for consistency with the
-    other push endpoints — no awaitable work in the body.
+    For monitoring and operators checking that the daily push landed. The score job does not
+    call it: a rerun on the same day computes and pushes again. Sync def, since the body has
+    no awaitable work.
     """
     _require_push_token(authorization)
 
