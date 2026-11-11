@@ -56,7 +56,9 @@ def _degraded_record(indexer: str, price: str = "450") -> dict[str, Any]:
     }
 
 
-def _full_record(indexer: str, stake: float, fees: float, **extra: Any) -> dict[str, Any]:
+def _full_record(
+    indexer: str, stake: Optional[float], fees: Optional[float], **extra: Any
+) -> dict[str, Any]:
     """One indexer as the full pipeline pushes it: its own stake and query fees, and no
     neutral stake-to-fees score, which only the fallback sends.
     """
@@ -69,7 +71,7 @@ def _full_record(indexer: str, stake: float, fees: float, **extra: Any) -> dict[
         "lat_normalized_score": 0.7,
         "uptime_score": 0.99,
         "success_rate": 0.98,
-        "stake_to_fees": stake / fees if fees else None,
+        "stake_to_fees": stake / fees if stake is not None and fees else None,
         "total_query_fees": fees,
         "last_known_slashable_stake": stake,
         "org": f"org-{indexer[2:4]}",
@@ -137,11 +139,12 @@ class TestSnapshotWithoutStake:
         )
         assert with_fees["weighted_score"].nunique() == 1
 
-    def test_snapshot_whose_stake_lookup_failed_scores_everyone_alike(self):
-        """The full pipeline sends stake and query fees as 0 when it cannot read stake, with no
-        neutral score, and every indexer already scores the same there without DIPs fees.
+    def test_snapshot_with_stake_and_fees_missing_scores_everyone_alike(self):
+        """A full run that could not read stake would send stake, query fees and their ratio as
+        missing for every indexer, with no neutral score. Today such a run falls back to the
+        neutral snapshot instead, but every indexer must score alike there too.
         """
-        records = [_full_record(indexer, 0.0, 0.0) for indexer in (A, B, C, D)]
+        records = [_full_record(indexer, None, None) for indexer in (A, B, C, D)]
 
         with_fees = _select(records, fees={A: 50.0, B: 900.0})
         without_fees = _select(records)
