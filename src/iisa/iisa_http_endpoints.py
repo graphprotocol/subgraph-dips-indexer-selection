@@ -42,7 +42,15 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from .freshness import Check, FreshnessStore, load_state, minute_index, minute_text
+from .freshness import (
+    HISTORY_DAYS,
+    Check,
+    Enforcement,
+    FreshnessStore,
+    load_state,
+    minute_index,
+    minute_text,
+)
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
 from .score_loader import (
     STALE_SCORES_CRITICAL_HOURS,
@@ -85,6 +93,9 @@ class Settings(BaseSettings):
     # Chains, comma-separated, on which an indexer marked stale isn't picked for new
     # agreements. Elsewhere the mark is only recorded and reported.
     freshness_enforced_chains: Annotated[frozenset[str], NoDecode] = frozenset()
+    # How many minutes behind this service's clock an enforced chain's last counted check may
+    # be. Past that its marks are too old to trust, and selection there ignores them.
+    freshness_max_age_minutes: int = Field(default=60, ge=1)
     # Bearer token for pushing scores and sync status, also accepted on every read.
     # /health and /select-indexers take no token. When it is unset, a WARNING is
     # logged at startup and the pushes accept unauthenticated requests, as do the
@@ -423,11 +434,14 @@ class FreshnessPair(BaseModel):
 
 
 class FreshnessChain(BaseModel):
-    """Freshness on 1 chain, by indexer. On an enforced chain a marked indexer isn't picked
-    for new agreements.
+    """Freshness on 1 chain, by indexer. enforced says the chain is listed as enforced, and
+    enforcing that a check there also counted recently enough for a marked indexer to be
+    left out of new agreements. last_counted_minute is null when no check there has counted.
     """
 
     enforced: bool = False
+    enforcing: bool = False
+    last_counted_minute: Optional[str] = None
     indexers: dict[str, FreshnessPair] = {}
 
 
@@ -1245,8 +1259,7 @@ def freshness_report(
 ) -> FreshnessResponse:
     """Each indexer's stale mark, last 10 minutes, latest outcome and 28-day counts, by chain."""
     _require_push_token(authorization)
-    enforced = get_settings().freshness_enforced_chains
-    return FreshnessResponse.model_validate(_state.freshness.snapshot(enforced))
+    return FreshnessResponse.model_validate(_state.freshness.snapshot(_enforcement()))
 
 
 @app.post("/get-score", response_model=ScoreResponse, responses=_documented_errors(400, 401, 503))
@@ -1819,20 +1832,51 @@ def _without_failing_members(history: pd.DataFrame, request: SelectionRequest) -
     return request.model_copy(update={"existing_indexers": kept})
 
 
+def _current_minute() -> int:
+    """This service's clock, as a minute counted from the Unix epoch."""
+    return minute_index(datetime.now(timezone.utc))
+
+
+def _enforcement() -> Enforcement:
+    settings = get_settings()
+    return Enforcement(
+        settings.freshness_enforced_chains, settings.freshness_max_age_minutes, _current_minute()
+    )
+
+
+def _checks_too_old(request: SelectionRequest, enforcement: Enforcement) -> bool:
+    """True, after a warning saying why, when the request's chain is enforced but no check
+    there counted recently enough for its marks to be trusted.
+    """
+    last_counted = _state.freshness.last_counted_minute(request.chain_id)
+    if enforcement.current(last_counted):
+        return False
+    if last_counted is None:
+        why = f"no freshness check on it has counted in the last {HISTORY_DAYS} days"
+    else:
+        why = (
+            f"its last counted check was {enforcement.now - last_counted} minutes ago, over "
+            f"the limit of {enforcement.max_age_minutes} set by IISA_FRESHNESS_MAX_AGE_MINUTES"
+        )
+    logger.warning(
+        "deployment=%s chain=%s is listed as enforced but freshness isn't enforced there, "
+        "since %s; candidates are picked as if the chain weren't listed",
+        request.deployment_id,
+        request.chain_id,
+        why,
+    )
+    return True
+
+
 def _stale_candidates(request: SelectionRequest, candidates: pd.DataFrame) -> list[str]:
     """Candidates marked stale on the request's chain, or with no freshness record there, when
-    that chain is enforced. Group members are never listed: a stale member keeps its place and
-    still counts towards each metric's scale, as members do on a chain that isn't enforced.
+    that chain is enforced and its checks are recent enough to trust. Group members are never
+    listed: a stale member keeps its place and still counts towards each metric's scale, as
+    members do on a chain that isn't enforced.
     """
-    if request.chain_id not in get_settings().freshness_enforced_chains:
+    enforcement = _enforcement()
+    if request.chain_id not in enforcement.chains or _checks_too_old(request, enforcement):
         return []
-    if _state.freshness.last_minute is None:
-        logger.warning(
-            "deployment=%s chain=%s enforces freshness but no freshness push has been applied, "
-            "so no indexer can be picked there until checks arrive",
-            request.deployment_id,
-            request.chain_id,
-        )
     members = {member.lower() for member in request.existing_indexers or []}
     ids = [ix for ix in candidates.get("indexer", pd.Series(dtype=object)) if isinstance(ix, str)]
     pickable = [ix for ix in ids if ix.lower() not in members]

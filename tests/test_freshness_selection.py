@@ -9,9 +9,10 @@ from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from iisa import iisa_http_endpoints, score_loader
-from iisa.freshness import Check, minute_index
+from iisa.freshness import Check, minute_index, minute_text
 from iisa.iisa_http_endpoints import (
     IISAState,
     SelectionRequest,
@@ -76,12 +77,40 @@ def _enforce(monkeypatch, chains: str) -> None:
     iisa_http_endpoints.get_settings.cache_clear()
 
 
-def _judge(state: IISAState, outcomes: dict[tuple[str, str], str]) -> None:
-    """Push the same outcome for each (indexer, chain) for 5 minutes, enough to judge it."""
-    now = minute_index(datetime.now(timezone.utc))
-    for minute in range(now - 10, now - 5):
+def _judge(state: IISAState, outcomes: dict[tuple[str, str], str], last: int | None = None) -> None:
+    """Push the same outcome for each (indexer, chain) for 5 minutes, enough to judge it,
+    ending at the minute ``last``, by default 6 minutes ago.
+    """
+    if last is None:
+        last = minute_index(datetime.now(timezone.utc)) - 6
+    for minute in range(last - 4, last + 1):
         checks = [Check(ix, chain, outcome) for (ix, chain), outcome in outcomes.items()]
         state.freshness.apply(minute, checks, lambda _: None)
+
+
+def _push_voids(state: IISAState, chain: str, minutes: range) -> None:
+    """Push a void outcome for every indexer on ``chain`` in each of ``minutes``."""
+    for minute in minutes:
+        checks = [Check(ix, chain, "void", reason="key_out_of_funds") for ix in (BEST, GOOD, FAIR)]
+        state.freshness.apply(minute, checks, lambda _: None)
+
+
+def _clock(monkeypatch, minute: int) -> None:
+    """Set the service's clock to ``minute``."""
+    monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: minute)
+
+
+def _not_enforced_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "isn't enforced" in r.getMessage()
+    ]
+
+
+# A fixed minute the tests that set the clock count from.
+LAST = minute_index(datetime(2026, 11, 10, 22, 0, tzinfo=timezone.utc))
+ALL_PASS_BUT_BEST = {(BEST, CHAIN): "fail", (GOOD, CHAIN): "pass", (FAIR, CHAIN): "pass"}
 
 
 def _request(chain: str, size: int, existing: list[str] | None) -> SelectionRequest:
@@ -159,13 +188,132 @@ def test_every_candidate_marked_picks_nobody_new(state, monkeypatch):
     assert _select(size=3, existing=[FAIR]) == [FAIR]
 
 
-def test_enforced_chain_with_no_push_picks_nobody_and_warns(state, monkeypatch, caplog):
-    _enforce(monkeypatch, CHAIN)
+class TestChecksTooOld:
+    """On an enforced chain the marks decide selection only while a check there counted
+    within IISA_FRESHNESS_MAX_AGE_MINUTES, 60 by default, of the service's clock.
+    """
 
-    with caplog.at_level(logging.WARNING, logger="iisa-service"):
-        assert _select(size=2) == []
+    @pytest.mark.parametrize(("age", "picked"), [(0, GOOD), (60, GOOD), (61, BEST)])
+    def test_marks_apply_up_to_and_including_the_limit(self, state, monkeypatch, age, picked):
+        _enforce(monkeypatch, CHAIN)
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+        _clock(monkeypatch, LAST + age)
 
-    assert any("no freshness push" in r.getMessage() for r in caplog.records)
+        assert _select() == [picked]
+
+    def test_marked_candidate_is_picked_with_a_warning_once_checks_are_too_old(
+        self, state, monkeypatch, caplog
+    ):
+        _enforce(monkeypatch, CHAIN)
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+        _clock(monkeypatch, LAST + 90)
+
+        with caplog.at_level(logging.INFO, logger="iisa-service"):
+            assert _select() == [BEST]
+
+        (warning,) = _not_enforced_warnings(caplog)
+        assert f"chain={CHAIN}" in warning
+        assert "last counted check was 90 minutes ago" in warning
+        assert "60" in warning
+        assert not any("as stale" in r.getMessage() for r in caplog.records)
+
+    def test_each_selection_warns(self, state, monkeypatch, caplog):
+        _enforce(monkeypatch, CHAIN)
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+        _clock(monkeypatch, LAST + 90)
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            _select()
+            _select()
+
+        assert len(_not_enforced_warnings(caplog)) == 2
+
+    def test_pushes_holding_only_voids_stop_enforcement_after_the_limit(
+        self, state, monkeypatch, caplog
+    ):
+        """The prober keeps pushing, but its gateway key is out of funds, so every check is
+        void and the marks stop changing.
+        """
+        _enforce(monkeypatch, CHAIN)
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+        _push_voids(state, CHAIN, range(LAST + 1, LAST + 61))
+        _clock(monkeypatch, LAST + 60)
+        assert _select() == [GOOD]
+
+        _push_voids(state, CHAIN, range(LAST + 61, LAST + 62))
+        _clock(monkeypatch, LAST + 61)
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            assert _select() == [BEST]
+
+        assert state.freshness.last_minute == LAST + 61
+        assert "61 minutes ago" in _not_enforced_warnings(caplog)[0]
+
+    def test_counted_checks_arriving_again_bring_enforcement_back(self, state, monkeypatch):
+        _enforce(monkeypatch, CHAIN)
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+        _clock(monkeypatch, LAST + 120)
+        assert _select() == [BEST]
+
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST + 119)
+
+        assert _select() == [GOOD]
+
+    @pytest.mark.parametrize("pushes", ["none", "only-voids"])
+    def test_chain_that_never_had_a_counted_check_is_not_enforced_and_warns(
+        self, state, monkeypatch, caplog, pushes
+    ):
+        _enforce(monkeypatch, CHAIN)
+        if pushes == "only-voids":
+            _push_voids(state, CHAIN, range(LAST - 9, LAST + 1))
+        _clock(monkeypatch, LAST)
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            assert _select(size=2) == [BEST, GOOD]
+
+        (warning,) = _not_enforced_warnings(caplog)
+        assert "no freshness check on it has counted" in warning
+
+    def test_second_enforced_chain_with_current_checks_stays_enforced(
+        self, state, monkeypatch, caplog
+    ):
+        _enforce(monkeypatch, f"{CHAIN},{OTHER_CHAIN}")
+        outcomes = {**ALL_PASS_BUT_BEST}
+        outcomes.update({(ix, OTHER_CHAIN): o for (ix, _), o in ALL_PASS_BUT_BEST.items()})
+        _judge(state, outcomes, last=LAST)
+        state.freshness.apply(
+            LAST + 1,
+            [Check(GOOD, OTHER_CHAIN, "pass"), Check(GOOD, CHAIN, "void")],
+            lambda _: None,
+        )
+        _clock(monkeypatch, LAST + 61)
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            assert _select(chain=CHAIN) == [BEST]
+            assert _select(chain=OTHER_CHAIN) == [GOOD]
+
+        (warning,) = _not_enforced_warnings(caplog)
+        assert f"chain={CHAIN} " in warning
+
+    def test_limit_comes_from_the_setting(self, state, monkeypatch, caplog):
+        monkeypatch.setenv("IISA_FRESHNESS_MAX_AGE_MINUTES", "5")
+        _enforce(monkeypatch, CHAIN)
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+        _clock(monkeypatch, LAST + 5)
+        assert _select() == [GOOD]
+
+        _clock(monkeypatch, LAST + 6)
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            assert _select() == [BEST]
+
+        assert "6 minutes ago" in _not_enforced_warnings(caplog)[0]
+
+    def test_chain_not_listed_never_warns(self, state, monkeypatch, caplog):
+        _clock(monkeypatch, LAST)
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            assert _select() == [BEST]
+
+        assert _not_enforced_warnings(caplog) == []
 
 
 def test_other_chains_are_unaffected(state, monkeypatch):
@@ -232,6 +380,25 @@ class TestEnforcedChainsSetting:
         assert Settings().freshness_enforced_chains == frozenset()
 
 
+class TestMaxAgeSetting:
+    def test_defaults_to_60_minutes(self, monkeypatch):
+        monkeypatch.delenv("IISA_FRESHNESS_MAX_AGE_MINUTES", raising=False)
+
+        assert Settings().freshness_max_age_minutes == 60
+
+    def test_reads_the_environment(self, monkeypatch):
+        monkeypatch.setenv("IISA_FRESHNESS_MAX_AGE_MINUTES", "15")
+
+        assert Settings().freshness_max_age_minutes == 15
+
+    @pytest.mark.parametrize("value", ["0", "-5", "1.5", "an hour"])
+    def test_refuses_anything_but_a_whole_number_of_at_least_1(self, monkeypatch, value):
+        monkeypatch.setenv("IISA_FRESHNESS_MAX_AGE_MINUTES", value)
+
+        with pytest.raises(ValidationError):
+            Settings()
+
+
 class TestReportedEnforcement:
     def test_each_chain_says_whether_it_is_enforced(self, state, monkeypatch):
         _enforce(monkeypatch, f"{CHAIN}, amoy")
@@ -251,4 +418,33 @@ class TestReportedEnforcement:
 
         body = TestClient(app).get("/freshness").json()
 
-        assert body == {"last_minute": None, "chains": {"amoy": {"enforced": True, "indexers": {}}}}
+        assert body == {
+            "last_minute": None,
+            "chains": {
+                "amoy": {
+                    "enforced": True,
+                    "enforcing": False,
+                    "last_counted_minute": None,
+                    "indexers": {},
+                }
+            },
+        }
+
+    def test_each_chain_says_whether_it_is_enforcing_and_when_a_check_last_counted(
+        self, state, monkeypatch
+    ):
+        _enforce(monkeypatch, f"{CHAIN},{OTHER_CHAIN},amoy")
+        _judge(state, {(BEST, CHAIN): "pass", (BEST, OTHER_CHAIN): "pass"}, last=LAST)
+        state.freshness.apply(LAST + 1, [Check(BEST, CHAIN, "pass")], lambda _: None)
+        _clock(monkeypatch, LAST + 61)
+
+        chains = TestClient(app).get("/freshness").json()["chains"]
+
+        assert {
+            chain: (body["enforced"], body["enforcing"], body["last_counted_minute"])
+            for chain, body in chains.items()
+        } == {
+            CHAIN: (True, True, minute_text(LAST + 1)),
+            OTHER_CHAIN: (True, False, minute_text(LAST)),
+            "amoy": (True, False, None),
+        }
