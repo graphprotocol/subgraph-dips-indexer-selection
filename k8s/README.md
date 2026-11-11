@@ -22,9 +22,11 @@ POSTs them to the IISA service.
 
 The sync-status fetcher runs all the time, from the CronJob's image. Every hour it reads
 indexer URLs from the Graph Network subgraph, asks each indexer's `/status` which
-deployments it has synced, and POSTs that snapshot to the service the same way. The
-service uses it to prefer indexers that have already synced a deployment. Nothing is
-shared on disk between them.
+deployments it has synced, keeps only the deployments the indexer also holds an active
+allocation on, read from the same subgraph, and POSTs that snapshot to the service the
+same way. If it cannot read the allocations it pushes nothing that hour. The service uses
+the snapshot to prefer indexers that have already synced a deployment. Nothing is shared
+on disk between them.
 
 The IISA service answers indexer-selection requests. On startup it loads the last
 scores and sync status from its own cache volume, so a restart serves the most
@@ -61,7 +63,9 @@ pushes in a row fail, and the liveness probe then restarts it. A restart fixes a
 inside the pod, such as a rotated push token. If IISA or the network subgraph stays
 unreachable instead, each restarted container fails its first push and then its startup
 probe, so the pod shows CrashLoopBackOff and retries every 15 to 20 minutes until the cause clears. It has no readiness probe, since nothing
-sends it traffic.
+sends it traffic. A rollout stops the old fetcher pod before starting the new one too:
+otherwise the old pod, running the old code, would keep pushing every hour for as long as
+the new one could not make its first push.
 
 ## Prerequisites
 

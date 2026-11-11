@@ -93,6 +93,9 @@ def test_a_successful_cycle_records_the_push_time(monkeypatch):
         return {"0xAAA": {"deployments": ["QmDeploy1"], "fetched_at": "2026-03-24T00:00:00+00:00"}}
 
     monkeypatch.setattr(sync_status_fetcher, "_fetch_all_statuses", fake_fetch)
+    monkeypatch.setattr(
+        sync_status_fetcher, "read_active_allocations", lambda _url: {"0xaaa": {"QmDeploy1"}}
+    )
     monkeypatch.setattr(sync_status_fetcher, "_push_sync_status", lambda _data: None)
 
     before = datetime.now(timezone.utc)

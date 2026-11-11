@@ -2,8 +2,14 @@
 
 Long-running service that periodically polls each indexer's /status
 endpoint to discover which deployments they have synced and healthy.
+Keeps only the deployments each indexer also holds an active allocation on,
+read from the network subgraph, since a /status reply is the indexer's own
+word; when the allocations can't be read, the cycle pushes nothing.
 Pushes the resulting snapshot directly to the iisa HTTP service via
 iisa_client.post_sync_status; no shared filesystem is involved.
+
+When FRESHNESS_PROBE_ENABLED is true it also runs the freshness prober (freshness_prober.py)
+on its own thread.
 
 HTTP endpoints:
   GET /health  -- healthcheck (503 until the first push, and again once the
@@ -23,11 +29,17 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 if TYPE_CHECKING:
     import aiohttp
+    from freshness_prober import FreshnessProber
 
 from escaping import error_for_log, url_for_log
+from freshness_config import FreshnessConfig, load_freshness_config
 from iisa_client import IISAPushError, get_push_token, post_sync_status
 from reply_body import read_reply_body
-from subgraph import discover_indexers_from_network_subgraph, subgraph_url_problem
+from subgraph import (
+    discover_indexers_from_network_subgraph,
+    read_active_allocations,
+    subgraph_url_problem,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +79,7 @@ JSON_CONTENT_TYPE = "application/json"
 # Service state
 _last_write_time: Optional[datetime] = None
 _stop_event = threading.Event()
+_freshness_prober: Optional["FreshnessProber"] = None
 
 
 class NoIndexerRespondedError(RuntimeError):
@@ -184,6 +197,51 @@ async def _fetch_all_statuses(
     return output
 
 
+# The most indexers named in the line that reports dropped claims, so 1 line covers any count.
+_MAX_INDEXERS_NAMED = 10
+
+
+def _keep_allocated_claims(
+    data: dict[str, dict], allocated: dict[str, set[str]]
+) -> dict[str, dict]:
+    """Keep only the claimed deployments each indexer has an active allocation on.
+
+    A claim to be synced is the indexer's own word, and selection prefers a synced indexer at any
+    score, so a claim counts only where an on-chain allocation backs it. An indexer left with no
+    claim is left out, as one that answered with none already is.
+    """
+    kept: dict[str, dict] = {}
+    dropped: dict[str, int] = {}
+    for indexer, entry in data.items():
+        backed = allocated.get(indexer.lower(), set())
+        deployments = [deployment for deployment in entry["deployments"] if deployment in backed]
+        if len(deployments) < len(entry["deployments"]):
+            dropped[indexer] = len(entry["deployments"]) - len(deployments)
+        if deployments:
+            kept[indexer] = {**entry, "deployments": deployments}
+    if dropped:
+        _log_dropped_claims(dropped)
+    return kept
+
+
+def _log_dropped_claims(dropped: dict[str, int]) -> None:
+    """Report dropped claims on 1 line: the count, and the indexers that dropped the most.
+
+    The claimed deployment names are text an indexer wrote, so they are never logged. Indexer
+    addresses come from the network subgraph and are quoted and cut short all the same.
+    """
+    most = sorted(dropped.items(), key=lambda item: item[1], reverse=True)[:_MAX_INDEXERS_NAMED]
+    named = ", ".join(f"{indexer[:42]!r}: {count:,}" for indexer, count in most)
+    more = len(dropped) - len(most)
+    logger.info(
+        "Dropped %s sync claims with no active allocation behind them, from %d indexers: %s%s",
+        f"{sum(dropped.values()):,}",
+        len(dropped),
+        named,
+        f" and {more:,} more" if more else "",
+    )
+
+
 def _push_sync_status(data: dict) -> None:
     """Push sync status to iisa. Raises IISAPushError on failure after retries."""
     post_sync_status(IISA_API_URL, IISA_PUSH_TOKEN, data)
@@ -204,6 +262,9 @@ def run_fetch_cycle() -> bool:
         # IISA's sync status, so skip it and let the health check go stale if it persists.
         logger.error("Not pushing sync status: %s", e)
         return False
+
+    # A failed read raises like the indexer read above, so unchecked claims are never pushed.
+    data = _keep_allocated_claims(data, read_active_allocations(GRAPH_NETWORK_SUBGRAPH_URL))
 
     total_deployments = sum(len(entry["deployments"]) for entry in data.values())
     logger.info(
@@ -229,6 +290,15 @@ def run_fetch_cycle() -> bool:
 
 
 def _health(now: datetime) -> tuple[int, dict]:
+    """The sync-status health, plus the freshness prober's last push when it runs; the
+    prober never changes the status code."""
+    code, body = _sync_status_health(now)
+    if _freshness_prober is not None:
+        body["freshness"] = _freshness_prober.health(now)
+    return code, body
+
+
+def _sync_status_health(now: datetime) -> tuple[int, dict]:
     """Return the /health status code and body: healthy only while the last push is recent."""
     if _last_write_time is None:
         return 503, {"status": "not_ready"}
@@ -264,12 +334,31 @@ class HealthHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 
+def _start_freshness_prober(config: FreshnessConfig) -> threading.Thread:
+    """Start the prober, imported only now so a fetcher without it loads nothing new."""
+    global _freshness_prober
+    from freshness_prober import start_freshness_prober
+
+    _freshness_prober, thread = start_freshness_prober(
+        config,
+        _stop_event,
+        iisa_api_url=IISA_API_URL,
+        token=IISA_PUSH_TOKEN,
+        subgraph_url=GRAPH_NETWORK_SUBGRAPH_URL,
+    )
+    return thread
+
+
 def main() -> int:
     """Fetch every FETCH_INTERVAL until told to stop; return the process exit code."""
     # Without a usable URL every cycle fails, so refuse to start rather than fail every hour.
     url_problem = subgraph_url_problem(GRAPH_NETWORK_SUBGRAPH_URL)
     if url_problem:
         logger.critical("GRAPH_NETWORK_SUBGRAPH_URL %s; refusing to start", url_problem)
+        return 1
+    freshness, freshness_problem = load_freshness_config(os.environ)
+    if freshness_problem:
+        logger.critical("Freshness prober: %s; refusing to start", freshness_problem)
         return 1
 
     def handle_signal(signum, _frame):
@@ -293,6 +382,7 @@ def main() -> int:
     server_thread.daemon = True
     server_thread.start()
     logger.info("Healthcheck server on port %d", HTTP_PORT)
+    prober_thread = _start_freshness_prober(freshness) if freshness else None
 
     # Run first cycle immediately
     try:
@@ -311,6 +401,8 @@ def main() -> int:
             logger.exception("Fetch cycle failed")
 
     server.shutdown()
+    if prober_thread is not None:
+        prober_thread.join(timeout=10)
     logger.info("Sync status fetcher stopped")
     return 0
 
