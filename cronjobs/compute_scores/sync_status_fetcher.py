@@ -2,6 +2,9 @@
 
 Long-running service that periodically polls each indexer's /status
 endpoint to discover which deployments they have synced and healthy.
+Keeps only the deployments each indexer also holds an active allocation on,
+read from the network subgraph, since a /status reply is the indexer's own
+word; when the allocations can't be read, the cycle pushes nothing.
 Pushes the resulting snapshot directly to the iisa HTTP service via
 iisa_client.post_sync_status; no shared filesystem is involved.
 
@@ -26,7 +29,11 @@ if TYPE_CHECKING:
 
 from escaping import error_for_log, url_for_log
 from iisa_client import IISAPushError, get_push_token, post_sync_status
-from subgraph import discover_indexers_from_network_subgraph, subgraph_url_problem
+from subgraph import (
+    discover_indexers_from_network_subgraph,
+    read_active_allocations,
+    subgraph_url_problem,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -174,6 +181,51 @@ async def _fetch_all_statuses(
     return output
 
 
+# The most indexers named in the line that reports dropped claims, so 1 line covers any count.
+_MAX_INDEXERS_NAMED = 10
+
+
+def _keep_allocated_claims(
+    data: dict[str, dict], allocated: dict[str, set[str]]
+) -> dict[str, dict]:
+    """Keep only the claimed deployments each indexer has an active allocation on.
+
+    A claim to be synced is the indexer's own word, and selection prefers a synced indexer at any
+    score, so a claim counts only where an on-chain allocation backs it. An indexer left with no
+    claim is left out, as one that answered with none already is.
+    """
+    kept: dict[str, dict] = {}
+    dropped: dict[str, int] = {}
+    for indexer, entry in data.items():
+        backed = allocated.get(indexer.lower(), set())
+        deployments = [deployment for deployment in entry["deployments"] if deployment in backed]
+        if len(deployments) < len(entry["deployments"]):
+            dropped[indexer] = len(entry["deployments"]) - len(deployments)
+        if deployments:
+            kept[indexer] = {**entry, "deployments": deployments}
+    if dropped:
+        _log_dropped_claims(dropped)
+    return kept
+
+
+def _log_dropped_claims(dropped: dict[str, int]) -> None:
+    """Report dropped claims on 1 line: the count, and the indexers that dropped the most.
+
+    The claimed deployment names are text an indexer wrote, so they are never logged. Indexer
+    addresses come from the network subgraph and are quoted and cut short all the same.
+    """
+    most = sorted(dropped.items(), key=lambda item: item[1], reverse=True)[:_MAX_INDEXERS_NAMED]
+    named = ", ".join(f"{indexer[:42]!r}: {count:,}" for indexer, count in most)
+    more = len(dropped) - len(most)
+    logger.info(
+        "Dropped %s sync claims with no active allocation behind them, from %d indexers: %s%s",
+        f"{sum(dropped.values()):,}",
+        len(dropped),
+        named,
+        f" and {more:,} more" if more else "",
+    )
+
+
 def _push_sync_status(data: dict) -> None:
     """Push sync status to iisa. Raises IISAPushError on failure after retries."""
     post_sync_status(IISA_API_URL, IISA_PUSH_TOKEN, data)
@@ -194,6 +246,9 @@ def run_fetch_cycle() -> bool:
         # IISA's sync status, so skip it and let the health check go stale if it persists.
         logger.error("Not pushing sync status: %s", e)
         return False
+
+    # A failed read raises like the indexer read above, so unchecked claims are never pushed.
+    data = _keep_allocated_claims(data, read_active_allocations(GRAPH_NETWORK_SUBGRAPH_URL))
 
     total_deployments = sum(len(entry["deployments"]) for entry in data.values())
     logger.info(
