@@ -1719,6 +1719,24 @@ def merge_and_prepare_dataframes(
     return merged
 
 
+def compute_carried_over_scores(
+    indexer_urls: Dict[str, str], carried: pd.DataFrame
+) -> pd.DataFrame:
+    """Scores for a day the run measured nothing: the quality, stake and fees in `carried`,
+    which an earlier run measured, with each indexer's URL, DIPs price and graph-node version
+    read today. `carried` is carry_over.carried_over's answer for today's indexers.
+
+    No neutral stake-to-fees score is sent, so iisa works the score out from the carried stake
+    and fees as it does for a run that measured them.
+    """
+    scores = carried.copy()
+    scores.insert(1, "url", scores["indexer"].map(indexer_urls))
+    scores = _attach_dips_info(scores, indexer_urls)
+    scores = fetch_and_filter_graph_node_versions(scores, indexer_urls)
+    scores["computed_at"] = datetime.now(timezone.utc)
+    return scores
+
+
 def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     """Equal quality metrics for every indexer, real per-indexer pricing from /dips/info.
 
