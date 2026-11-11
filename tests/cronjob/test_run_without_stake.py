@@ -31,6 +31,7 @@ INDEXERS = ["0x" + c * 40 for c in "abc"]
 URLS = {indexer: f"https://{indexer[2:8]}.example/" for indexer in INDEXERS}
 STAKE_COLUMNS = ["stake_to_fees", "total_query_fees", "last_known_slashable_stake"]
 READ_AT = "stake_read_at"
+MEASURED_AT = "quality_measured_at"
 QUALITY_COLUMNS = ["uptime_score", "success_rate", "lat_lin_reg_coefficient", "query_count"]
 STAKE = [{"id": indexer, "stakedTokens": "1000000", "lockedTokens": "0"} for indexer in INDEXERS]
 REJECTED_KEY = {"errors": [{"message": "auth error: API key not found"}]}
@@ -305,6 +306,37 @@ class TestStakeReadTime:
         scores = processing.compute_degraded_scores(URLS)
 
         assert scores[READ_AT].isna().all()
+
+
+@pytest.mark.usefixtures("iisa")
+class TestQualityMeasureTime:
+    """Each run records when it measured latency, uptime and success from the replay."""
+
+    @pytest.mark.usefixtures("replay")
+    def test_a_run_stamps_its_quality_as_measured_now(self, monkeypatch, iisa, clock):
+        pushed = _run_job(monkeypatch, iisa, WORKING)
+
+        assert {pd.Timestamp(row[MEASURED_AT]) for row in pushed} == {NOW}
+
+    @pytest.mark.usefixtures("replay")
+    def test_a_run_that_reuses_stake_still_measured_its_quality_today(
+        self, monkeypatch, iisa, clock
+    ):
+        iisa.held = _held(NOW - timedelta(hours=24))
+
+        pushed = _run_job(monkeypatch, iisa, REJECTED_KEY)
+
+        assert {pd.Timestamp(row[MEASURED_AT]) for row in pushed} == {NOW}
+        assert set(_pushed_read_at(pushed).values()) == {NOW - timedelta(hours=24)}
+
+    def test_the_fallback_scores_have_no_measure_time(self, monkeypatch):
+        """The fallback measures nothing, so its equal scores can never pass for a measurement."""
+        monkeypatch.setattr(processing, "fetch_dips_info", _pricing)
+        monkeypatch.setattr(processing, "fetch_and_filter_graph_node_versions", lambda df, _u: df)
+
+        scores = processing.compute_degraded_scores(URLS)
+
+        assert scores[MEASURED_AT].isna().all()
 
 
 @pytest.mark.usefixtures("replay")

@@ -23,6 +23,7 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
+from carry_over import QUALITY_MEASURED_AT
 from escaping import error_for_log, url_for_log
 from escaping import for_log as _for_log
 from numpy.linalg import pinv
@@ -1006,6 +1007,7 @@ def compute_all_scores(
     # Transform to indexer_scores schema
     scores_df = transform_to_scores_schema(merged)
     scores_df["scoring_mode"] = "full" if geoip_available else "partial_no_geoip"
+    scores_df[QUALITY_MEASURED_AT] = pd.Timestamp(utc_now())
 
     mode = "full" if geoip_available else "partial"
     logger.info(
@@ -1751,6 +1753,8 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["last_known_slashable_stake"] = 0.0
     # Never read from the network, so a later run can never take these zeros for stake.
     scores[STAKE_READ_AT] = None
+    # Nor measured from the replay, so these equal scores can never pass for a measurement.
+    scores[QUALITY_MEASURED_AT] = None
     scores["computed_at"] = now
     scores["query_count"] = 0
 
