@@ -18,7 +18,11 @@ its daily score-computation job and its hourly sync-status fetcher.
 
 The CronJob runs once a day. It replays gateway query data from Redpanda and reads
 indexer stake from the Graph Network subgraph, computes each indexer's scores, and
-POSTs them to the IISA service.
+POSTs them to the IISA service. When the stake read fails, it reads the scores the
+service holds and reuses each indexer's stake and fees from them if they were read
+less than 60 hours ago, so 2 failed days in a row can reuse a reading and a third
+cannot. The scores record when each indexer's stake was read, and the run's log ends
+with a warning saying what it reused.
 
 The sync-status fetcher runs all the time, from the CronJob's image. Every hour it reads
 indexer URLs from the Graph Network subgraph, asks each indexer's `/status` which
