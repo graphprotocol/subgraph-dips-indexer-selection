@@ -25,14 +25,14 @@ from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache, partial
-from typing import Annotated, Any, NamedTuple, Optional, cast
+from typing import Annotated, Any, NamedTuple, Optional, Union, cast
 
 import pandas as pd
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
@@ -42,6 +42,7 @@ from .score_loader import (
     FileScoreLoader,
     ScoresPayloadError,
 )
+from .sync_check import SyncClaimChecker
 from .sync_status_loader import SyncStatusData
 
 __all__ = ["app", "Settings", "get_settings"]
@@ -86,8 +87,20 @@ class Settings(BaseSettings):
     # read accept it as well as push_token; POST /scores and POST /sync-status accept only
     # push_token. Unset, reads need push_token as before.
     read_token: Optional[str] = None
+    # Optional check, through the gateway, of an indexer's claim to have synced a deployment,
+    # made before selection relies on the claim. It is on when the gateway's address and an API
+    # key are both set, and each check is 1 paid query on that key. See sync_check.py.
+    sync_check_gateway_url: Optional[str] = None
+    sync_check_gateway_api_key: Optional[str] = None
+    # How long 1 round of checks may take. A selection makes at most 2 rounds and dipper waits
+    # 30 seconds for its answer, hence the upper limit.
+    sync_check_timeout_seconds: float = Field(default=5.0, gt=0, le=10)
+    # The oldest a deployment's latest block may be for a claim to be confirmed.
+    sync_check_bar_seconds: float = Field(default=36.0, gt=0)
 
-    @field_validator("push_token", "read_token")
+    @field_validator(
+        "push_token", "read_token", "sync_check_gateway_url", "sync_check_gateway_api_key"
+    )
     @classmethod
     def _strip_token(cls, token: Optional[str]) -> Optional[str]:
         """Drop whitespace around a configured token; 1 of only whitespace counts as unset.
@@ -99,6 +112,21 @@ class Settings(BaseSettings):
             return None
         return token.strip() or None
 
+    @model_validator(mode="after")
+    def _sync_check_settings_are_whole(self) -> "Settings":
+        """Refuse a gateway address without its API key, or the reverse, and an address that is
+        not a web address, so a half-configured check stops the service at startup.
+        """
+        url, key = self.sync_check_gateway_url, self.sync_check_gateway_api_key
+        if (url is None) != (key is None):
+            raise ValueError(
+                "IISA_SYNC_CHECK_GATEWAY_URL and IISA_SYNC_CHECK_GATEWAY_API_KEY must be set "
+                "together"
+            )
+        if url is not None and not url.startswith(("http://", "https://")):
+            raise ValueError("IISA_SYNC_CHECK_GATEWAY_URL must start with http:// or https://")
+        return self
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -108,6 +136,16 @@ def get_settings() -> Settings:
     Settings are loaded once and cached for the lifetime of the process.
     """
     return Settings()
+
+
+def sync_claim_checker(settings: Settings) -> Optional[SyncClaimChecker]:
+    """The checker of synced claims these settings ask for, or None when the check is off."""
+    url, key = settings.sync_check_gateway_url, settings.sync_check_gateway_api_key
+    if url is None or key is None:
+        return None
+    return SyncClaimChecker(
+        url, key, settings.sync_check_timeout_seconds, settings.sync_check_bar_seconds
+    )
 
 
 # =============================================================================
@@ -330,6 +368,7 @@ class IISAState:
         self.data_manager: Optional[DataManager] = None
         self._history: Optional[pd.DataFrame] = None
         self._sync_status: Optional["SyncStatusData"] = None
+        self.sync_checker: Optional[SyncClaimChecker] = None
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -340,6 +379,11 @@ class IISAState:
         to random selection mode.
         """
         self.settings = settings
+        self.sync_checker = sync_claim_checker(settings)
+        logger.info(
+            "Synced claims are %s before selection relies on them",
+            "checked through the gateway" if self.sync_checker else "not checked",
+        )
 
         try:
             logger.info("Initializing IISA providers...")
@@ -1098,7 +1142,7 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     )
 
     try:
-        response = _select_with_processor(request)
+        response = await _select_checking_sync_claims(request)
         indexer_ids = [i.id for i in response.indexers]
         logger.info(
             "Selected %d indexers for deployment %s: %s",
@@ -1600,12 +1644,19 @@ def _without_failing_members(history: pd.DataFrame, request: SelectionRequest) -
     return request.model_copy(update={"existing_indexers": kept})
 
 
-def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
-    """Run IndexerSelector and return a SelectionResponse for the deployment.
+class _Selection(NamedTuple):
+    """A selection ready to score: the request without its failing members, the candidates'
+    history with this chain's prices, and the indexers that say they have synced the deployment.
+    """
 
-    The selector weights stake-to-fees, base price, latency, uptime,
-    success rate, and price-per-entity; lower is better for prices and
-    latency, higher for the rest.
+    request: SelectionRequest
+    history: pd.DataFrame
+    synced: set[str]
+
+
+def _prepare_selection(request: SelectionRequest) -> Union[_Selection, SelectionResponse]:
+    """Everything a selection needs before scoring, or the answer itself when there is nothing
+    to score: no scores loaded, or no candidate within the price limits.
     """
     if _state.history is None:
         return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
@@ -1625,21 +1676,108 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
     # Enrich with chain-specific price columns for normalization
     enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
-    synced_indexers = _synced_indexers_for(request.deployment_id)
-    processor = _build_selector(request, enriched_history, synced_indexers)
+    return _Selection(request, enriched_history, _synced_indexers_for(request.deployment_id))
+
+
+def _selection_response(selection: _Selection, processor: IndexerSelector) -> SelectionResponse:
+    """The answer for the group the selector settled on, with each member's pricing."""
+    request = selection.request
     _log_selection_reasoning(processor, request.deployment_id)
-
-    # Build response with pricing info
     selected = _build_selected_indexers(
-        list(processor.current_group),
-        enriched_history,
-        request.chain_id,
+        list(processor.current_group), selection.history, request.chain_id
     )
+    return SelectionResponse(deployment_id=request.deployment_id, indexers=selected)
 
-    return SelectionResponse(
-        deployment_id=request.deployment_id,
-        indexers=selected,
+
+def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
+    """Run IndexerSelector and return a SelectionResponse for the deployment.
+
+    The selector weights stake-to-fees, base price, latency, uptime,
+    success rate, and price-per-entity; lower is better for prices and
+    latency, higher for the rest.
+    """
+    selection = _prepare_selection(request)
+    if isinstance(selection, SelectionResponse):
+        return selection
+    processor = _build_selector(selection.request, selection.history, selection.synced)
+    return _selection_response(selection, processor)
+
+
+async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionResponse:
+    """_select_with_processor, with the synced claim behind each new pick checked through the
+    gateway first when the check is switched on.
+    """
+    selection = _prepare_selection(request)
+    if isinstance(selection, SelectionResponse):
+        return selection
+    processor = _build_selector(selection.request, selection.history, selection.synced)
+    if _state.sync_checker is not None:
+        processor = await _with_claims_checked(selection, processor, _state.sync_checker)
+    return _selection_response(selection, processor)
+
+
+# A selection checks claims in at most this many rounds, which bounds how long dipper waits.
+_SYNC_CHECK_ROUNDS = 2
+
+
+async def _with_claims_checked(
+    selection: _Selection, processor: IndexerSelector, checker: SyncClaimChecker
+) -> IndexerSelector:
+    """Check the synced claim of each indexer the selection newly picked, and select again
+    without any claim that was not confirmed, so that indexer competes on its score alone.
+
+    Only a newly picked indexer's claim is checked, since each check is a paid query. Setting a
+    claim aside can bring another claimant forward, which is checked in the next round. After
+    _SYNC_CHECK_ROUNDS rounds nothing more is checked and only confirmed claims still count.
+    """
+    request = selection.request
+    synced = {indexer.lower() for indexer in selection.synced}
+    confirmed: set[str] = set()
+    for _ in range(_SYNC_CHECK_ROUNDS):
+        claims = _picked_on_a_claim(processor, synced) - confirmed
+        if not claims:
+            return processor
+        unconfirmed = await checker.unconfirmed(request.deployment_id, claims)
+        confirmed |= claims - unconfirmed.keys()
+        _log_claim_checks(request.deployment_id, claims, unconfirmed)
+        if not unconfirmed:
+            return processor
+        synced -= unconfirmed.keys()
+        processor = _build_selector(request, selection.history, synced)
+    if _picked_on_a_claim(processor, synced) - confirmed:
+        logger.info(
+            "deployment=%s another unchecked synced claim came forward after %d rounds of "
+            "checks; only confirmed claims count from here",
+            request.deployment_id,
+            _SYNC_CHECK_ROUNDS,
+        )
+        processor = _build_selector(request, selection.history, synced & confirmed)
+    return processor
+
+
+def _picked_on_a_claim(processor: IndexerSelector, synced: set[str]) -> set[str]:
+    """The indexers a selection newly picked that say they have synced the deployment."""
+    picked = {indexer.lower() for indexer in processor.current_group}
+    already_in = {indexer.lower() for indexer in processor.initial_group}
+    return (picked - already_in) & synced
+
+
+def _log_claim_checks(deployment_id: str, claims: set[str], unconfirmed: dict[str, str]) -> None:
+    """Log how a round of checks went, with a warning for each claim that was not confirmed."""
+    logger.info(
+        "deployment=%s checked %d synced claim(s) through the gateway: %d confirmed",
+        deployment_id,
+        len(claims),
+        len(claims) - len(unconfirmed),
     )
+    for indexer, reason in sorted(unconfirmed.items()):
+        logger.warning(
+            "deployment=%s indexer %s says it has synced this deployment, but the gateway "
+            "check did not confirm it: %s. Its claim is set aside for this selection.",
+            deployment_id,
+            indexer,
+            reason,
+        )
 
 
 if __name__ == "__main__":
