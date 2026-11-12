@@ -11,11 +11,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from iisa import iisa_http_endpoints
-from iisa.iisa_http_endpoints import IISAState, Settings, app
+from iisa.iisa_http_endpoints import IISAState, Settings, _log_safe, app
 
 INDEXER = "0x" + "a1" * 20
 OTHER = "0x" + "b2" * 20
 CHAIN = "arbitrum-one"
+OTHER_CHAIN = "matic"
 TOKEN = "fake-freshness-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -90,6 +91,7 @@ class TestPush:
             "minute": minute,
             "applied": True,
             "pairs": 2,
+            "refused": 0,
         }
         assert json.loads(freshness_file.read_text())["version"] == 1
 
@@ -157,20 +159,51 @@ class TestPush:
         assert response.status_code == 503
 
 
-class TestPushValidation:
-    @pytest.mark.parametrize(
-        "body",
-        [
-            _push(_minute(), _outcome(), _outcome(outcome="fail")),
-            _push(_minute(), _outcome(), _outcome(indexer=INDEXER.replace("a", "A"))),
-        ],
-        ids=["same-pair", "same-pair-other-case"],
-    )
-    def test_duplicate_pair_is_a_422(self, client, body):
-        response = client.post("/freshness", json=body)
+def _post_raw(client: TestClient, body: dict[str, Any], placeholder: str, raw: bytes) -> Any:
+    """Post ``body`` as JSON with ``placeholder`` swapped for ``raw``, for values json.dumps
+    won't write, such as NaN or half of a UTF-16 surrogate pair.
+    """
+    content = json.dumps(body).encode().replace(placeholder.encode(), raw)
+    return client.post("/freshness", content=content, headers={"Content-Type": "application/json"})
 
-        assert response.status_code == 422
-        assert "more than once" in response.text
+
+def _refused_alone(response: Any, client: TestClient) -> None:
+    """The push was answered 200 with OTHER's good outcome applied and the bad 1 refused."""
+    assert response.status_code == 200, response.text
+    assert (response.json()["pairs"], response.json()["refused"]) == (1, 1)
+    assert list(client.get("/freshness").json()["chains"][CHAIN]["indexers"]) == [OTHER]
+
+
+class TestRefusedOutcomes:
+    """Each outcome is checked on its own. 1 that breaks the rules is left out and counted in
+    refused, and the rest of the minute still counts.
+    """
+
+    def test_bad_outcome_among_good_ones_is_refused_and_the_rest_applied(self, client):
+        minute = _minute()
+        response = client.post(
+            "/freshness",
+            json=_push(
+                minute,
+                _outcome(),
+                _outcome(indexer=OTHER, outcome="stale"),
+                _outcome(chain=OTHER_CHAIN),
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "status": "success",
+            "minute": minute,
+            "applied": True,
+            "pairs": 2,
+            "refused": 1,
+        }
+        chains = client.get("/freshness").json()["chains"]
+        assert {chain: list(body["indexers"]) for chain, body in chains.items()} == {
+            CHAIN: [INDEXER],
+            OTHER_CHAIN: [INDEXER],
+        }
 
     @pytest.mark.parametrize(
         "overrides",
@@ -182,6 +215,7 @@ class TestPushValidation:
             {"age_seconds": True},
             {"indexer": "0x1234"},
             {"indexer": "not an address"},
+            {"indexer": None},
             {"chain": ""},
             {"chain": "c" * 65},
             {"reason": "Not Snake Case"},
@@ -192,21 +226,174 @@ class TestPushValidation:
         ],
         ids=lambda overrides: next(iter(overrides)) + "=" + repr(next(iter(overrides.values()))),
     )
-    def test_malformed_outcome_is_a_422(self, client, overrides):
-        response = client.post("/freshness", json=_push(_minute(), _outcome(**overrides)))
-
-        assert response.status_code == 422, response.text
-
-    @pytest.mark.parametrize("age", [b"NaN", b"Infinity", b"-Infinity", b"1e999"])
-    def test_non_finite_age_is_a_422(self, client, age):
-        body = json.dumps(_push(_minute(), _outcome(age_seconds=0.5))).replace("0.5", "AGE")
+    def test_malformed_outcome_is_refused_on_its_own(self, client, overrides):
         response = client.post(
             "/freshness",
-            content=body.encode().replace(b"AGE", age),
-            headers={"Content-Type": "application/json"},
+            json=_push(_minute(), _outcome(**overrides), _outcome(indexer=OTHER)),
         )
 
-        assert response.status_code == 422, response.text
+        _refused_alone(response, client)
+
+    def test_outcome_missing_a_required_field_is_refused(self, client):
+        bare = {key: value for key, value in _outcome().items() if key != "outcome"}
+
+        response = client.post("/freshness", json=_push(_minute(), bare, _outcome(indexer=OTHER)))
+
+        _refused_alone(response, client)
+
+    @pytest.mark.parametrize("item", [7, "pass", None, True, [], [_outcome()]], ids=repr)
+    def test_item_that_is_not_an_object_is_refused(self, client, item):
+        response = client.post("/freshness", json=_push(_minute(), item, _outcome(indexer=OTHER)))
+
+        _refused_alone(response, client)
+
+    @pytest.mark.parametrize("age", [b"NaN", b"Infinity", b"-Infinity", b"1e999"])
+    def test_non_finite_age_is_refused(self, client, age):
+        body = _push(_minute(), _outcome(age_seconds=0.5), _outcome(indexer=OTHER))
+
+        _refused_alone(_post_raw(client, body, "0.5", age), client)
+
+    @pytest.mark.parametrize("field", ["chain", "detail", "deployment"])
+    def test_half_a_surrogate_pair_is_refused_and_not_stored(self, client, field):
+        """Stored, such text could never be written out as UTF-8, and every later GET
+        /freshness would fail.
+        """
+        body = _push(_minute(), _outcome(**{field: "x-HALF"}), _outcome(indexer=OTHER))
+
+        _refused_alone(_post_raw(client, body, "-HALF", b"\\ud800"), client)
+
+    def test_repeated_pair_keeps_the_first_and_refuses_the_rest(self, client):
+        response = client.post(
+            "/freshness",
+            json=_push(
+                _minute(),
+                _outcome(),
+                _outcome(outcome="fail"),
+                _outcome(indexer=INDEXER.upper().replace("0X", "0x"), outcome="fail"),
+            ),
+        )
+
+        assert (response.json()["pairs"], response.json()["refused"]) == (1, 2)
+        pair = client.get("/freshness").json()["chains"][CHAIN]["indexers"][INDEXER]
+        assert (pair["last"]["outcome"], pair["counted_28d"]) == ("pass", 1)
+
+    def test_repeat_of_a_refused_outcome_is_applied(self, client):
+        response = client.post(
+            "/freshness",
+            json=_push(_minute(), _outcome(age_seconds=-1), _outcome(outcome="fail")),
+        )
+
+        assert (response.json()["pairs"], response.json()["refused"]) == (1, 1)
+        pair = client.get("/freshness").json()["chains"][CHAIN]["indexers"][INDEXER]
+        assert pair["last"]["outcome"] == "fail"
+
+    def test_every_outcome_refused_still_counts_the_minute_as_received(self, client):
+        """OTHER's first outcome comes a minute after the refused push. Its window counting 2
+        minutes, the refused one as not passed, shows that minute was received.
+        """
+        now = _now_minute()
+        refused = client.post(
+            "/freshness",
+            json=_push(_minute(3, now), _outcome(outcome="stale"), _outcome(indexer="0x12")),
+        )
+        client.post("/freshness", json=_push(_minute(2, now), _outcome(indexer=OTHER)))
+
+        assert refused.status_code == 200, refused.text
+        assert refused.json() == {
+            "status": "success",
+            "minute": _minute(3, now),
+            "applied": True,
+            "pairs": 0,
+            "refused": 2,
+        }
+        pair = client.get("/freshness").json()["chains"][CHAIN]["indexers"][OTHER]
+        assert (pair["window_passed"], pair["window_counted"]) == (1, 2)
+
+    def test_ignored_minute_still_reports_what_was_refused(self, client):
+        now = _now_minute()
+        client.post("/freshness", json=_push(_minute(2, now), _outcome()))
+
+        repeated = client.post(
+            "/freshness",
+            json=_push(_minute(2, now), _outcome(), _outcome(outcome="stale")),
+        )
+
+        assert repeated.status_code == 200
+        assert (repeated.json()["applied"], repeated.json()["pairs"]) == (False, 0)
+        assert repeated.json()["refused"] == 1
+
+
+class TestRefusalWarning:
+    @staticmethod
+    def _warnings(caplog: Any) -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_1_warning_names_the_minute_count_and_first_refusal(self, client, caplog):
+        minute = _minute()
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            client.post(
+                "/freshness",
+                json=_push(
+                    minute,
+                    _outcome(indexer=OTHER),
+                    _outcome(age_seconds=-1),
+                    _outcome(outcome="stale"),
+                    _outcome(indexer=OTHER),
+                ),
+            )
+
+        (warning,) = self._warnings(caplog)
+        message = warning.getMessage()
+        assert minute in message
+        assert "3 of 4" in message
+        assert "outcomes[1]" in message and "age_seconds" in message
+
+    def test_repeat_is_named_with_the_outcome_it_repeats(self, client, caplog):
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            client.post("/freshness", json=_push(_minute(), _outcome(), _outcome()))
+
+        (warning,) = self._warnings(caplog)
+        assert "outcomes[1] repeats the indexer and chain of outcomes[0]" in warning.getMessage()
+
+    @pytest.mark.parametrize(
+        "name",
+        ["sur\nprise", "sur\r\nprise", "sur\u2028prise", "x" * 10_000],
+        ids=["newline", "crlf", "line-separator", "long"],
+    )
+    def test_text_from_the_request_stays_on_1_short_line(self, client, caplog, name):
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            client.post("/freshness", json=_push(_minute(), {**_outcome(), name: 1}))
+
+        (warning,) = self._warnings(caplog)
+        message = warning.getMessage()
+        assert len(message.splitlines()) == 1
+        assert len(message) < 400
+
+    def test_half_a_surrogate_pair_in_a_field_name_can_be_written_out(self, client, caplog):
+        body = _push(_minute(), {**_outcome(), "x-HALF": 1})
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            _post_raw(client, body, "-HALF", b"\\ud800")
+
+        (warning,) = self._warnings(caplog)
+        warning.getMessage().encode("utf-8")
+
+    def test_request_text_is_escaped_and_cut(self):
+        assert (
+            _log_safe("a\nb\r\t\x1b\u2028\ud800\xe9\\") == "a\\nb\\r\\t\\x1b\\u2028\\ud800\\xe9\\\\"
+        )
+        assert _log_safe("x" * 201) == "x" * 200 + "..."
+        assert _log_safe("x" * 200) == "x" * 200
+
+    def test_no_warning_when_nothing_is_refused(self, client, caplog):
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            client.post("/freshness", json=_push(_minute(), _outcome()))
+
+        assert self._warnings(caplog) == []
+
+
+class TestPushValidation:
+    """What makes the whole push a 422: anything wrong outside the outcomes themselves."""
 
     @pytest.mark.parametrize(
         "minute",
@@ -235,37 +422,78 @@ class TestPushValidation:
 
     @pytest.mark.parametrize(
         "body",
-        [{"outcomes": []}, {"minute": _minute()}, {**_push(_minute()), "extra": True}, []],
-        ids=["no-minute", "no-outcomes", "unknown-field", "not-an-object"],
+        [
+            {"outcomes": []},
+            {"minute": _minute()},
+            {**_push(_minute()), "extra": True},
+            [],
+            "text",
+            {"minute": _minute(), "outcomes": {"0": _outcome()}},
+            {"minute": _minute(), "outcomes": "outcomes"},
+            {"minute": _minute(), "outcomes": None},
+        ],
+        ids=[
+            "no-minute",
+            "no-outcomes",
+            "unknown-field",
+            "not-an-object",
+            "text",
+            "outcomes-an-object",
+            "outcomes-text",
+            "outcomes-null",
+        ],
     )
     def test_malformed_push_is_a_422(self, client, body):
         response = client.post("/freshness", json=body)
 
         assert response.status_code == 422, response.text
+        assert client.get("/freshness").json()["last_minute"] is None
+
+    def test_more_than_50_000_outcomes_is_a_422(self, client):
+        response = client.post("/freshness", json={"minute": _minute(), "outcomes": [0] * 50_001})
+
+        assert response.status_code == 422
+        assert "too_long" in response.text
+        assert client.get("/freshness").json()["last_minute"] is None
+
+    def test_half_a_surrogate_pair_in_a_top_level_field_name_is_a_422(self, client):
+        body = {**_push(_minute()), "x-HALF": 1}
+
+        response = _post_raw(client, body, "-HALF", b"\\ud800")
+
+        assert response.status_code == 422, response.text
 
 
-class TestUnencodableText:
-    """Text holding half of a UTF-16 surrogate pair can't be written out as UTF-8."""
+class TestSchema:
+    def test_documents_an_outcome_while_accepting_any_item(self):
+        """Any item is accepted and only refused later, so the schema says so, while still
+        describing the outcome that gets applied.
+        """
+        schemas = app.openapi()["components"]["schemas"]
+        outcomes = schemas["FreshnessPush"]["properties"]["outcomes"]
 
-    @staticmethod
-    def _post(client: TestClient, body: dict[str, Any]) -> Any:
-        content = json.dumps(body).replace("-HALF", "\\ud800").encode()
-        return client.post(
-            "/freshness", content=content, headers={"Content-Type": "application/json"}
+        assert (outcomes["type"], outcomes["maxItems"]) == ("array", 50_000)
+        outcome, anything = outcomes["items"]["anyOf"]
+        assert anything == {}
+        assert set(outcome["properties"]) == {
+            "indexer",
+            "chain",
+            "outcome",
+            "reason",
+            "detail",
+            "deployment",
+            "age_seconds",
+        }
+        assert (outcome["required"], outcome["additionalProperties"]) == (
+            ["indexer", "chain", "outcome"],
+            False,
         )
 
-    @pytest.mark.parametrize("field", ["chain", "detail", "deployment"])
-    def test_lone_surrogate_is_a_422_and_nothing_is_stored(self, client, field):
-        response = self._post(client, _push(_minute(), _outcome(**{field: "x-HALF"})))
+    def test_response_lists_the_refused_count(self):
+        response = app.openapi()["components"]["schemas"]["FreshnessAcceptedResponse"]
 
-        assert response.status_code == 422, response.text
-        assert "ud800" in response.text
-        assert client.get("/freshness").json()["chains"] == {}
-
-    def test_lone_surrogate_in_a_field_name_is_a_422(self, client):
-        response = self._post(client, {**_push(_minute()), "x-HALF": 1})
-
-        assert response.status_code == 422, response.text
+        assert response["properties"]["refused"]["type"] == "integer"
+        assert "refused" in response["required"]
 
 
 class TestRead:

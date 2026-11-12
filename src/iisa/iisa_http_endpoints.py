@@ -37,6 +37,9 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    PrivateAttr,
+    ValidationError,
+    WithJsonSchema,
     field_validator,
     model_validator,
 )
@@ -373,38 +376,87 @@ class FreshnessOutcome(BaseModel):
     age_seconds: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
 
 
+def _check_outcome(item: Any) -> FreshnessOutcome | str:
+    """``item`` read as an outcome, or why it can't be, naming the field at fault."""
+    try:
+        return FreshnessOutcome.model_validate(item)
+    except ValidationError as e:
+        first = e.errors(include_url=False, include_input=False)[0]
+        where = ".".join(str(part) for part in first["loc"])
+        return f"breaks a rule{f' at {where}' if where else ''}: {first['msg']}"
+
+
+def _log_safe(text: str, limit: int = 200) -> str:
+    """``text`` fit for 1 log line: line breaks, other control characters and anything outside
+    ASCII escaped, then cut to ``limit`` characters.
+    """
+    escaped = text.encode("unicode_escape").decode("ascii")
+    return escaped if len(escaped) <= limit else escaped[:limit] + "..."
+
+
+# Outcomes are checked 1 by 1 once the push is read, so any item is accepted here and refused
+# later. The schema says so while still describing the outcome that gets applied.
+_OutcomeItem = Annotated[Any, WithJsonSchema({"anyOf": [FreshnessOutcome.model_json_schema(), {}]})]
+
+
 class FreshnessPush(BaseModel):
-    """Body of POST /freshness: every outcome for the checks sent in 1 minute."""
+    """Body of POST /freshness: every outcome for the checks sent in 1 minute. Each outcome is
+    checked on its own, and 1 that breaks FreshnessOutcome's rules or repeats an indexer and
+    chain earlier in the push is refused and counted, so it can't cost the rest of the minute.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     minute: Annotated[datetime, BeforeValidator(_whole_utc_minute)]
-    outcomes: list[FreshnessOutcome] = Field(max_length=50_000)
+    outcomes: list[_OutcomeItem] = Field(max_length=50_000)
+    _accepted: list[FreshnessOutcome] = PrivateAttr(default_factory=list)
+    _refused: int = PrivateAttr(default=0)
+    _first_refusal: Optional[str] = PrivateAttr(default=None)
 
     @model_validator(mode="after")
-    def _one_outcome_per_pair(self) -> Self:
-        seen: set[tuple[str, str]] = set()
-        repeated: set[tuple[str, str]] = set()
-        for outcome in self.outcomes:
-            pair = (outcome.indexer, outcome.chain)
-            (repeated if pair in seen else seen).add(pair)
-        if repeated:
-            raise ValueError(
-                f"{len(repeated)} (indexer, chain) pairs appear more than once in outcomes, "
-                f"such as {sorted(repeated)[0]}"
-            )
+    def _check_each_outcome(self) -> Self:
+        first_at: dict[tuple[str, str], int] = {}
+        for position, item in enumerate(self.outcomes):
+            checked = _check_outcome(item)
+            if isinstance(checked, FreshnessOutcome):
+                pair = (checked.indexer, checked.chain)
+                if pair not in first_at:
+                    first_at[pair] = position
+                    self._accepted.append(checked)
+                    continue
+                checked = f"repeats the indexer and chain of outcomes[{first_at[pair]}]"
+            self._refused += 1
+            if self._first_refusal is None:
+                self._first_refusal = f"outcomes[{position}] {checked}"
         return self
+
+    @property
+    def accepted(self) -> list[FreshnessOutcome]:
+        """The outcomes that passed their checks, in the order sent."""
+        return self._accepted
+
+    @property
+    def refused(self) -> int:
+        """How many outcomes were left out."""
+        return self._refused
+
+    @property
+    def first_refusal(self) -> Optional[str]:
+        """Which outcome was the first left out and why, holding text from the request."""
+        return self._first_refusal
 
 
 class FreshnessAcceptedResponse(BaseModel):
-    """Response to POST /freshness. applied is false for a minute at or before the last one
-    applied, which changes nothing.
+    """Response to POST /freshness. pairs is how many outcomes were applied, and refused how
+    many were left out for breaking the rules or repeating an indexer and chain. applied is
+    false for a minute at or before the last one applied, which changes nothing.
     """
 
     status: str
     minute: str
     applied: bool
     pairs: int
+    refused: int
 
 
 class FreshnessLastCheck(BaseModel):
@@ -620,10 +672,12 @@ class IISAState:
         return self.freshness.last_minute is not None
 
     def apply_freshness(self, push: FreshnessPush) -> bool:
-        """Apply a freshness push and save the state. False when the minute was ignored."""
+        """Apply a freshness push's accepted outcomes and save the state. False when the
+        minute was ignored.
+        """
         if self.settings is None:
             raise RuntimeError("Settings not initialized")
-        checks = [Check(**outcome.model_dump()) for outcome in push.outcomes]
+        checks = [Check(**outcome.model_dump()) for outcome in push.accepted]
         save = partial(_atomic_write_json, self.settings.freshness_file_path)
         return self.freshness.apply(minute_index(push.minute), checks, save)
 
@@ -1228,9 +1282,9 @@ def push_freshness(
 ) -> FreshnessAcceptedResponse:
     """Accept 1 minute of freshness outcomes from the prober and recompute every stale mark.
 
-    A minute at or before the last one applied is answered with applied false and changes
-    nothing, so a retried push can't count twice. Sync def so the file write runs on the
-    threadpool.
+    Each outcome is checked on its own, and a bad or repeated one is refused and counted. A
+    minute at or before the last one applied changes nothing, so a retry can't count twice.
+    Sync def so the file write runs on the threadpool.
     """
     _require_push_token(authorization)
 
@@ -1238,6 +1292,14 @@ def push_freshness(
         raise HTTPException(status_code=503, detail="IISA service not initialized")
 
     minute = minute_text(minute_index(push.minute))
+    if push.refused:
+        logger.warning(
+            "Refused %d of %d freshness outcomes for minute %s, such as %s",
+            push.refused,
+            len(push.outcomes),
+            minute,
+            _log_safe(push.first_refusal or ""),
+        )
     try:
         applied = _state.apply_freshness(push)
     except Exception:
@@ -1246,11 +1308,16 @@ def push_freshness(
         raise HTTPException(status_code=500, detail="Failed to apply or save freshness")
 
     if applied:
-        logger.info("Applied freshness for minute %s: %d pairs", minute, len(push.outcomes))
+        logger.info("Applied freshness for minute %s: %d pairs", minute, len(push.accepted))
     else:
         logger.info("Ignored freshness for minute %s: at or before the last applied", minute)
-    pairs = len(push.outcomes) if applied else 0
-    return FreshnessAcceptedResponse(status="success", minute=minute, applied=applied, pairs=pairs)
+    return FreshnessAcceptedResponse(
+        status="success",
+        minute=minute,
+        applied=applied,
+        pairs=len(push.accepted) if applied else 0,
+        refused=push.refused,
+    )
 
 
 @app.get("/freshness", response_model=FreshnessResponse, responses=_documented_errors(401))
