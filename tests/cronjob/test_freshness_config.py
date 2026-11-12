@@ -65,6 +65,44 @@ def test_every_setting_can_be_changed():
     )
 
 
+def test_the_networks_registry_defaults_to_the_graphs_own_copy_and_no_extra_names():
+    config, _ = load_freshness_config(ENABLED)
+
+    assert config.networks_registry_url == (
+        "https://networks-registry.thegraph.com/TheGraphNetworksRegistry_v0_7_x.json"
+    )
+    assert config.additional_networks == ()
+
+
+def test_the_networks_registry_and_extra_names_can_be_set():
+    config, problem = load_freshness_config(
+        {
+            **ENABLED,
+            "FRESHNESS_NETWORKS_REGISTRY_URL": " https://registry.example.com/networks.json ",
+            "FRESHNESS_ADDITIONAL_NETWORKS": " hardhat, ,local-test,hardhat ",
+        }
+    )
+
+    assert problem is None
+    assert config.networks_registry_url == "https://registry.example.com/networks.json"
+    assert config.additional_networks == ("hardhat", "local-test")
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ({"FRESHNESS_NETWORKS_REGISTRY_URL": "registry"}, "FRESHNESS_NETWORKS_REGISTRY_URL must"),
+        ({"FRESHNESS_ADDITIONAL_NETWORKS": "hardhat,réseau"}, "FRESHNESS_ADDITIONAL_NETWORKS must"),
+        ({"FRESHNESS_ADDITIONAL_NETWORKS": "x" * 65}, "FRESHNESS_ADDITIONAL_NETWORKS must"),
+    ],
+)
+def test_an_unusable_registry_address_or_extra_name_is_a_problem(change, expected):
+    config, problem = load_freshness_config({**ENABLED, **change})
+
+    assert config is None
+    assert problem.startswith(expected)
+
+
 @pytest.mark.parametrize(
     ("change", "expected"),
     [

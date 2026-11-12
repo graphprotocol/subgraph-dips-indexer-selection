@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
+from freshness_rules import is_chain_name
 from subgraph import subgraph_url_problem
 
 # Each minute's outcomes are pushed this long after the minute ends, so every check, sent at
@@ -18,6 +19,15 @@ PUSH_DELAY_SECONDS = 30
 
 _TRUE = ("true", "1", "yes")
 _FALSE = ("false", "0", "no", "")
+
+# The Graph's networks registry, at the 2 addresses dipper reads it from, in that order.
+DEFAULT_NETWORKS_REGISTRY_URL = (
+    "https://networks-registry.thegraph.com/TheGraphNetworksRegistry_v0_7_x.json"
+)
+FALLBACK_NETWORKS_REGISTRY_URL = (
+    "https://raw.githubusercontent.com/graphprotocol/networks-registry/refs/heads/main/public/"
+    "TheGraphNetworksRegistry_v0_7_x.json"
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +38,9 @@ class FreshnessConfig:
     min_allocation_age_days: float = 7.0
     refresh_interval: float = 900.0
     request_timeout: float = 25.0
+    # Only chains named here are checked: the registry's network ids plus these extra names.
+    networks_registry_url: str = DEFAULT_NETWORKS_REGISTRY_URL
+    additional_networks: tuple[str, ...] = ()
     max_concurrency: int = 50
 
     @property
@@ -61,6 +74,25 @@ def _enabled(environ: Mapping[str, str]) -> bool:
     raise _ConfigProblem("FRESHNESS_PROBE_ENABLED must be true or false")
 
 
+def _registry_url(environ: Mapping[str, str]) -> str:
+    url = environ.get("FRESHNESS_NETWORKS_REGISTRY_URL", "").strip()
+    url_problem = subgraph_url_problem(url) if url else None
+    if url_problem:
+        raise _ConfigProblem(f"FRESHNESS_NETWORKS_REGISTRY_URL {url_problem}")
+    return url or DEFAULT_NETWORKS_REGISTRY_URL
+
+
+def _additional_networks(environ: Mapping[str, str]) -> tuple[str, ...]:
+    entries = environ.get("FRESHNESS_ADDITIONAL_NETWORKS", "").split(",")
+    names = [entry.strip() for entry in entries if entry.strip()]
+    if not all(is_chain_name(name) for name in names):
+        raise _ConfigProblem(
+            "FRESHNESS_ADDITIONAL_NETWORKS must be chain names of 1 to 64 printable characters "
+            "without spaces, separated by commas"
+        )
+    return tuple(dict.fromkeys(names))
+
+
 def _read(environ: Mapping[str, str]) -> FreshnessConfig:
     gateway_url = environ.get("FRESHNESS_GATEWAY_URL", "").strip()
     url_problem = subgraph_url_problem(gateway_url)
@@ -85,6 +117,8 @@ def _read(environ: Mapping[str, str]) -> FreshnessConfig:
         ),
         refresh_interval=_number(environ, "FRESHNESS_REFRESH_INTERVAL", 900.0, at_least=60),
         request_timeout=request_timeout,
+        networks_registry_url=_registry_url(environ),
+        additional_networks=_additional_networks(environ),
         max_concurrency=int(_number(environ, "FRESHNESS_MAX_CONCURRENCY", 50, at_least=1)),
     )
 

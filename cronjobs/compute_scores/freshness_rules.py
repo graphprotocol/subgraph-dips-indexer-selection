@@ -13,7 +13,7 @@ import math
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping, Optional, Sequence, TypeGuard, Union
+from typing import Any, Collection, Iterable, Mapping, Optional, Sequence, TypeGuard, Union
 
 PASS = "pass"
 FAIL = "fail"
@@ -46,8 +46,6 @@ FUTURE_TOLERANCE_SECONDS = 60
 _MAX_BLOCK_TIMESTAMP = 253_402_300_799
 # POST /freshness accepts at most this many outcomes in 1 minute.
 MAX_PAIRS = 50_000
-# Chains checked per indexer, so 1 indexer listing thousands can't crowd out the rest.
-MAX_CHAINS_PER_INDEXER = 100
 
 # A minute points to a fault between the gateway and indexers in general when at least this
 # many indexers were asked and none answered, or at least the second number were asked and more
@@ -384,14 +382,12 @@ class LeftOut:
     """What dips_pairs left out of GET /scores records, for the caller to log once per refresh
     rather than once per item."""
 
-    # (indexer, the entry it listed) for each listed chain name that isn't a usable one
+    # (indexer, the entry it listed) for each listed chain that isn't a known network
     refused_names: list[tuple[str, object]] = field(default_factory=list)
     # Indexers whose price field is there but can't be read
     unreadable_prices: list[str] = field(default_factory=list)
     # Listed chains without a price, which selection can't pick an indexer on anyway
     unpriced: int = 0
-    # Indexers offering more than MAX_CHAINS_PER_INDEXER chains, with how many they offer
-    over_limit: dict[str, int] = field(default_factory=dict)
     # No record had a price field, so every listed chain was paired, as selection then does
     no_price_field: bool = False
 
@@ -441,10 +437,18 @@ def _priced_chains(value: object) -> Optional[set[str]]:
     return {chain for chain, price in value.items() if _is_price(price)}
 
 
-def _chains_of(indexer: str, record: Mapping[str, Any], left_out: LeftOut) -> list[str]:
+def _is_known(entry: object, networks: Collection[str]) -> bool:
+    return is_chain_name(entry) and entry in networks
+
+
+def _chains_of(
+    indexer: str, record: Mapping[str, Any], networks: Collection[str], left_out: LeftOut
+) -> list[str]:
     entries = _listed(record.get("dips_supported_networks"))
-    left_out.refused_names.extend((indexer, entry) for entry in entries if not is_chain_name(entry))
-    listed = supported_chains(entries)
+    left_out.refused_names.extend(
+        (indexer, entry) for entry in entries if not _is_known(entry, networks)
+    )
+    listed = [chain for chain in supported_chains(entries) if chain in networks]
     if left_out.no_price_field:
         return listed
     priced = _priced_chains(record.get("dips_min_grt_per_30_days"))
@@ -456,10 +460,12 @@ def _chains_of(indexer: str, record: Mapping[str, Any], left_out: LeftOut) -> li
     return kept
 
 
-def _offered_chains(records: Iterable[object], left_out: LeftOut) -> dict[str, list[str]]:
-    """Each indexer's chains from GET /scores records: those it offers DIPs on and has priced,
-    or all it offers when no record has a price field, in the order it lists them, without
-    repeats. Indexers are in lower case."""
+def _offered_chains(
+    records: Iterable[object], networks: Collection[str], left_out: LeftOut
+) -> dict[str, list[str]]:
+    """Each indexer's chains from GET /scores records: those in ``networks`` that it offers DIPs
+    on and has priced, or all such chains when no record has a price field, in the order it
+    lists them, without repeats. Indexers are in lower case."""
     usable = [r for r in records if isinstance(r, dict) and is_indexer_address(r.get("indexer"))]
     # The service applies no price filter when its scores have no price column at all.
     left_out.no_price_field = bool(usable) and not any(
@@ -469,23 +475,19 @@ def _offered_chains(records: Iterable[object], left_out: LeftOut) -> dict[str, l
     for record in usable:
         indexer = record["indexer"].lower()
         offered = chains.setdefault(indexer, {})
-        offered.update(dict.fromkeys(_chains_of(indexer, record, left_out)))
+        offered.update(dict.fromkeys(_chains_of(indexer, record, networks, left_out)))
     return {indexer: list(offered) for indexer, offered in chains.items() if offered}
 
 
 def dips_pairs(
-    records: Iterable[object], left_out: Optional[LeftOut] = None
+    records: Iterable[object], networks: Collection[str], left_out: Optional[LeftOut] = None
 ) -> list[tuple[str, str]]:
-    """Every (indexer, chain) to check from GET /scores records, sorted: of the chains an indexer
-    offers DIPs on and has priced, the first MAX_CHAINS_PER_INDEXER in the order it lists them.
-    What is left out is added to ``left_out`` when it is given."""
+    """Every (indexer, chain) to check from GET /scores records, sorted: each chain in
+    ``networks`` that an indexer offers DIPs on and has priced. What is left out is added to
+    ``left_out`` when it is given."""
     left_out = LeftOut() if left_out is None else left_out
-    pairs: list[tuple[str, str]] = []
-    for indexer, chains in _offered_chains(records, left_out).items():
-        if len(chains) > MAX_CHAINS_PER_INDEXER:
-            left_out.over_limit[indexer] = len(chains)
-        pairs.extend((indexer, chain) for chain in chains[:MAX_CHAINS_PER_INDEXER])
-    return sorted(pairs)
+    offered = _offered_chains(records, networks, left_out)
+    return sorted((indexer, chain) for indexer, chains in offered.items() for chain in chains)
 
 
 def format_minute(minute_start: float) -> str:

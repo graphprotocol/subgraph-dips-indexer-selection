@@ -481,6 +481,9 @@ def test_a_chain_name_of_64_printable_characters_is_kept():
     assert supported_chains(["!" + "x" * 62 + "~"]) == ["!" + "x" * 62 + "~"]
 
 
+NETWORKS = frozenset({"mainnet", "base", "matic", "arbitrum-one"})
+
+
 def _offer(indexer, chains, prices):
     return {
         "indexer": indexer,
@@ -507,13 +510,14 @@ def test_an_indexer_is_paired_only_with_chains_it_has_priced_as_the_service_read
 ):
     """Selection can't pick an indexer on a chain without a finite price of at least 0, so
     checking it there is wasted."""
+    listed = ["mainnet", "base", "a", "b", "c", "d", "e", "f", "g"]
     record = {
         "indexer": INDEXER,
-        "dips_supported_networks": ["mainnet", "base", "a", "b", "c", "d", "e", "f", "g"],
+        "dips_supported_networks": listed,
         "dips_min_grt_per_30_days": prices,
     }
 
-    assert {chain for _, chain in dips_pairs([record])} == priced
+    assert {chain for _, chain in dips_pairs([record], set(listed))} == priced
 
 
 def test_without_a_price_field_in_any_record_every_listed_chain_is_paired():
@@ -523,7 +527,7 @@ def test_without_a_price_field_in_any_record_every_listed_chain_is_paired():
         {"indexer": "0x" + "b" * 40, "dips_supported_networks": '["matic"]'},
     ]
 
-    assert dips_pairs(records) == [
+    assert dips_pairs(records, NETWORKS) == [
         (INDEXER, "base"),
         (INDEXER, "mainnet"),
         ("0x" + "b" * 40, "matic"),
@@ -536,31 +540,30 @@ def test_with_a_price_field_in_some_records_a_record_without_one_has_no_priced_c
         _offer("0x" + "b" * 40, ["matic"], {"matic": 1}),
     ]
 
-    assert dips_pairs(records) == [("0x" + "b" * 40, "matic")]
+    assert dips_pairs(records, NETWORKS) == [("0x" + "b" * 40, "matic")]
 
 
 def test_an_indexers_chains_keep_their_order_without_repeats():
     record = _offer(INDEXER, ["mainnet", "base", "matic", "mainnet"], {"matic": 5, "mainnet": 10})
 
-    assert dips_pairs([record]) == [(INDEXER, "mainnet"), (INDEXER, "matic")]
+    assert dips_pairs([record], NETWORKS) == [(INDEXER, "mainnet"), (INDEXER, "matic")]
 
 
-def test_an_indexer_listing_150_chains_is_checked_on_the_first_100_it_lists():
-    chains = [f"chain-{n:03d}" for n in reversed(range(150))]
+def test_a_chain_that_isnt_a_known_network_is_never_paired():
+    """Only those chain names can ever be selected, and made-up ones are free to list."""
+    chains = ["mainnet", "made-up", "base"]
 
-    pairs = dips_pairs([_offer(INDEXER, chains, dict.fromkeys(chains, 1))])
+    pairs = dips_pairs([_offer(INDEXER, chains, dict.fromkeys(chains, 1))], NETWORKS)
 
-    assert {chain for _, chain in pairs} == set(chains[:100])
+    assert pairs == [(INDEXER, "base"), (INDEXER, "mainnet")]
 
 
-def test_the_100_chain_limit_counts_only_usable_chains():
-    chains = ["\ud800", "unpriced", *(f"chain-{n:03d}" for n in range(100))]
-    prices = {chain: 1 for chain in chains if chain != "unpriced"}
+def test_an_indexer_listing_150_known_networks_is_paired_with_all_of_them():
+    chains = [f"chain-{n:03d}" for n in range(150)]
 
-    pairs = dips_pairs([_offer(INDEXER, chains, prices)])
+    pairs = dips_pairs([_offer(INDEXER, chains, dict.fromkeys(chains, 1))], set(chains))
 
-    assert len(pairs) == 100
-    assert (INDEXER, "chain-099") in pairs
+    assert len(pairs) == 150
 
 
 def test_dips_pairs_lowercases_indexers_and_skips_records_without_an_address():
@@ -573,7 +576,10 @@ def test_dips_pairs_lowercases_indexers_and_skips_records_without_an_address():
         "not a record",
     ]
 
-    assert dips_pairs(records) == [("0x" + "b" * 40, "base"), ("0x" + "b" * 40, "mainnet")]
+    assert dips_pairs(records, NETWORKS) == [
+        ("0x" + "b" * 40, "base"),
+        ("0x" + "b" * 40, "mainnet"),
+    ]
 
 
 def test_minute_payload_has_the_contract_shape():

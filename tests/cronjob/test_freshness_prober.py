@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 import freshness_prober  # noqa: E402
 from freshness_config import FreshnessConfig  # noqa: E402
 from freshness_prober import FreshnessProber  # noqa: E402
+from freshness_registry import NetworksRegistry, RegistryUnavailable  # noqa: E402
 from freshness_rules import CheckResult, GatewayReply, GatewayUnreachable, Targets  # noqa: E402
 from iisa_client import IISAPushError  # noqa: E402
 
@@ -491,6 +492,40 @@ def test_a_prober_thread_that_ends_on_an_error_is_marked_stopped(caplog):
     assert prober.stopped is True
     assert prober.health(datetime.fromtimestamp(MINUTE, timezone.utc))["stopped"] is True
     assert "Freshness prober stopped unexpectedly" in caplog.text
+
+
+def test_health_shows_when_the_networks_registry_loaded_and_how_many_networks_it_holds():
+    clock = FakeClock(MINUTE)
+    prober = _prober(None, FakeGateway(clock, {}), clock, [])
+    prober._registry = NetworksRegistry(
+        "https://registry.example.com/networks.json",
+        fetch=lambda url: {"networks": [{"id": "mainnet"}, {"id": "base"}]},
+        clock=clock,
+    )
+    prober._registry.networks()
+
+    fields = prober.health(datetime.fromtimestamp(MINUTE, timezone.utc))
+
+    assert fields["networks_registry_loaded_at"] == "2026-11-10T22:31:00+00:00"
+    assert fields["networks_registry_networks"] == 2
+
+
+async def test_with_no_copy_of_the_networks_registry_a_refresh_logs_an_error_and_checks_nothing(
+    caplog,
+):
+    clock = FakeClock(MINUTE)
+
+    def load():
+        raise RegistryUnavailable("no copy of the networks registry has loaded yet: refused")
+
+    pushed = []
+    prober = _prober(None, FakeGateway(clock, {}), clock, pushed, load_targets=load)
+
+    with caplog.at_level(logging.ERROR, logger="freshness_prober"):
+        await prober.refresh()
+
+    assert prober._targets is None
+    assert "no copy of the networks registry" in caplog.text
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).parents[2] / "cronjobs" / "compute_scores"))
 
 import freshness_sources  # noqa: E402
+from freshness_registry import NetworksRegistry, RegistryUnavailable  # noqa: E402
 from freshness_rules import Allocation, Targets  # noqa: E402
 from freshness_sources import (  # noqa: E402
     TargetLoader,
@@ -151,9 +152,11 @@ class _Sources:
         self.first_allocations = first_allocations or {}
         self.allocation_reads = []
         self.first_allocation_reads = []
+        self.networks = lambda: frozenset({"arbitrum-one", "matic", "mainnet", "base"})
 
     def loader(self, clock=lambda: NOW):
         return TargetLoader(
+            networks=lambda: self.networks(),
             fetch_scores=lambda: self.scores,
             read_allocations=self._read_allocations,
             read_first_allocations=self._read_first_allocations,
@@ -221,22 +224,17 @@ def test_a_chain_the_indexer_lists_without_a_price_is_not_checked():
     assert sources.loader()().pairs == ((INDEXER_A, "arbitrum-one"),)
 
 
-def test_an_indexer_listing_150_chains_is_checked_on_100_with_a_warning(caplog):
-    """1 indexer with a low address used to fill the 50,000 pairs a push holds by itself."""
+def test_an_indexer_listing_150_known_networks_is_checked_on_all_of_them(caplog):
+    """Made-up chain names can't crowd out real ones, so no indexer needs a cap."""
     many = [f"chain-{n:03d}" for n in range(150)]
-    sources = _Sources(
-        _scores(_offer(INDEXER_A, many), _offer(INDEXER_B, ["mainnet"])),
-        [_allocation(INDEXER_B, "A", int(NOW - 9 * DAY), chain="mainnet")],
-    )
+    sources = _Sources(_scores(_offer(INDEXER_A, many), _offer(INDEXER_B, ["mainnet"])), [])
+    sources.networks = lambda: frozenset([*many, "mainnet"])
 
     with caplog.at_level(logging.WARNING):
         targets = sources.loader()()
 
-    assert len(targets.pairs) == 101
-    assert (INDEXER_B, "mainnet") in targets.pairs
-    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert INDEXER_A in warning.getMessage()
-    assert "150" in warning.getMessage()
+    assert len(targets.pairs) == 151
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 def _warnings(caplog):
@@ -248,7 +246,7 @@ def test_refused_chain_names_get_1_warning_per_refresh(caplog):
     sources = _Sources(
         _scores(
             _offer(INDEXER_A, ["mainnet", "bad\nname", 7]),
-            _offer(INDEXER_B, ["\ud800", "base"]),
+            _offer(INDEXER_B, ["\ud800", "base", "made-up"]),
         ),
         [],
     )
@@ -258,7 +256,8 @@ def test_refused_chain_names_get_1_warning_per_refresh(caplog):
 
     assert targets.pairs == ((INDEXER_A, "mainnet"), (INDEXER_B, "base"))
     (warning,) = _warnings(caplog)
-    assert "3 chain names" in warning and "listed by 2 indexers" in warning
+    assert "4 chain names" in warning and "listed by 2 indexers" in warning
+    assert "networks registry" in warning
     assert INDEXER_A in warning and "bad\\nname" in warning and "\n" not in warning
 
 
@@ -305,6 +304,35 @@ def test_scores_without_a_price_field_check_every_listed_chain_with_a_warning(ca
     assert targets.pairs == ((INDEXER_A, "base"), (INDEXER_A, "mainnet"))
     (warning,) = _warnings(caplog)
     assert "dips_min_grt_per_30_days" in warning
+
+
+def _registry(document_or_error, additional=()):
+    def fetch(url):
+        if isinstance(document_or_error, Exception):
+            raise document_or_error
+        return document_or_error
+
+    return NetworksRegistry(
+        "https://registry.example.com/networks.json", additional, fetch=fetch, clock=lambda: NOW
+    )
+
+
+def test_a_chain_from_the_additional_networks_setting_is_checked():
+    sources = _Sources(_scores(_offer(INDEXER_A, ["mainnet", "hardhat", "made-up"])), [])
+    sources.networks = _registry({"networks": [{"id": "mainnet"}]}, ["hardhat"]).networks
+
+    targets = sources.loader()()
+
+    assert targets.pairs == ((INDEXER_A, "hardhat"), (INDEXER_A, "mainnet"))
+
+
+def test_before_any_registry_copy_has_loaded_a_refresh_fails_without_reading_the_scores():
+    """The prober logs the failed refresh as an error and checks nothing until a copy loads."""
+    sources = _Sources(None, [])
+    sources.networks = _registry(requests.ConnectionError("refused")).networks
+
+    with pytest.raises(RegistryUnavailable, match="refused"):
+        sources.loader()()
 
 
 def test_first_allocations_are_cached_across_refreshes():
