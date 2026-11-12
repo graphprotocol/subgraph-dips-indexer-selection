@@ -5,7 +5,7 @@ indexer's own word, so before such a pick goes back to dipper the service can as
 through the gateway for the deployment's latest block, as a paying customer would. The claim
 counts only if the indexer signed the answer and the block is recent. A claim that is not
 confirmed, for whatever reason, loses the preference and the indexer competes on its score.
-Every candidate's claim is checked at once, so 1 false claim cannot cost an honest one its place.
+Every claim a selection weighs is checked at once: each candidate's and each group member's.
 """
 
 import json
@@ -29,7 +29,7 @@ from iisa.sync_check import GatewayReply, SyncClaimChecker, post_once
 
 CHAIN = "arbitrum-one"
 DEPLOYMENT = "QmSyncClaimCheck"
-A, B, C, D = ("0x" + pair * 20 for pair in ("a1", "b2", "c3", "d4"))
+A, B, C, D, M, X = ("0x" + pair * 20 for pair in ("a1", "b2", "c3", "d4", "e5", "f6"))
 NOW = 1_794_400_000.0
 API_KEY = "gateway-key-123"
 
@@ -336,6 +336,17 @@ def _record(indexer: str, success_rate: float, **changes: Any) -> dict[str, Any]
 # By score alone D is the best pick, then C, then B; A is the worst. The rates sit close
 # together because a success rate under 97% of the best scores 0, which would tie A, B and C.
 RECORDS = [_record(A, 0.970), _record(B, 0.975), _record(C, 0.980), _record(D, 0.990)]
+# M is a weak indexer scoring about 0.41: under the 0.60 a synced candidate needs once the group
+# has a synced member, and not enough to replace anyone. X is a failing one scoring about 0.03,
+# which selection replaces when a candidate beats it by more than 0.50.
+_WEAK = {"uptime_score": 0.5, "stake_to_fees": 0.0001}
+_FAILING = {
+    **_WEAK,
+    "lat_normalized_score": 0.0,
+    "dips_min_grt_per_30_days": f'{{"{CHAIN}": "100000"}}',
+}
+WITH_WEAK = RECORDS + [_record(M, 0.5, **_WEAK)]
+WITH_WEAK_AND_FAILING = WITH_WEAK + [_record(X, 0.5, **_FAILING)]
 
 
 class FakeChecker:
@@ -350,27 +361,36 @@ class FakeChecker:
         return {indexer: "latest block is 900s old" for indexer in indexers if indexer in self.fail}
 
 
-def _state(claimed: set[str], checker: Optional[FakeChecker]) -> SimpleNamespace:
+def _state(
+    claimed: set[str],
+    checker: Optional[FakeChecker],
+    records: Optional[list[dict[str, Any]]] = None,
+) -> SimpleNamespace:
     """A loaded service in which the indexers in `claimed` say they have synced DEPLOYMENT."""
-    history = DataManager(MagicMock()).transform_scores_df(pd.DataFrame(RECORDS))
+    history = DataManager(MagicMock()).transform_scores_df(pd.DataFrame(records or RECORDS))
     sync_status = SimpleNamespace(synced_indexers_for=lambda _deployment: set(claimed))
     return SimpleNamespace(
         history=history, sync_status=sync_status, sync_checker=checker, is_ready=True
     )
 
 
-async def _pick(claimed: set[str], checker: Optional[FakeChecker], **request: Any) -> list[str]:
+async def _pick(
+    claimed: set[str],
+    checker: Optional[FakeChecker],
+    records: Optional[list[dict[str, Any]]] = None,
+    **request: Any,
+) -> list[str]:
     """The indexers selection answers with; 1 is asked for unless the request says otherwise."""
     selection = SelectionRequest(
         **{"deployment_id": DEPLOYMENT, "chain_id": CHAIN, "num_candidates": 1, **request}
     )
-    with patch.object(endpoints, "_state", _state(claimed, checker)):
+    with patch.object(endpoints, "_state", _state(claimed, checker, records)):
         response = await _select_checking_sync_claims(selection)
     return [indexer.id for indexer in response.indexers]
 
 
 class TestSelection:
-    """When a pick rests on a synced claim, every candidate's claim is checked at once, and
+    """When selection weighs a synced claim, every claim it weighed is checked at once, and
     selection then counts only the claims that were confirmed.
     """
 
@@ -418,12 +438,23 @@ class TestSelection:
         assert await _pick({A, B, C}, checker) == [D]
         assert len(checker.asked) == 1
 
-    async def test_an_indexer_already_in_the_group_is_not_checked(self):
-        checker = FakeChecker(fail=(A,))
+    async def test_a_group_that_needs_nobody_new_costs_no_check(self):
+        """A already fills the 1 place and is doing well, so selection never looks at the
+        candidates and no claim, A's or B's, is weighed.
+        """
+        checker = FakeChecker(fail=(A, B))
 
-        picked = await _pick({A}, checker, existing_indexers=[A])
+        picked = await _pick({A, B}, checker, existing_indexers=[A])
 
         assert picked == [A] and checker.asked == []
+
+    async def test_a_members_claim_alone_costs_no_check(self):
+        """A place is open but no candidate claims, so D's claim has nothing to decide."""
+        checker = FakeChecker(fail=(D,))
+
+        picked = await _pick({D}, checker, existing_indexers=[D], num_candidates=2)
+
+        assert picked == [D, C] and checker.asked == []
 
     async def test_a_failed_claim_gives_way_in_a_group_that_already_has_a_member(self):
         """D is serving and 1 more is wanted. A leads on a claim that fails the check, so the
@@ -438,6 +469,35 @@ class TestSelection:
         checker = FakeChecker(fail=(B,))
 
         assert await _pick({A, B}, checker, existing_indexers=[D], num_candidates=2) == [D, A]
+
+    async def test_a_claim_that_blocks_a_swap_is_checked_though_nobody_is_picked_on_it(self):
+        """X is failing and D should replace it. M says it is synced, so it is tried first, and
+        M is too small an improvement, so on trust X would stay. M's claim fails, D replaces X.
+        """
+        checker = FakeChecker(fail=(M,))
+
+        picked = await _pick({M}, checker, WITH_WEAK_AND_FAILING, existing_indexers=[X])
+
+        assert picked == [D] and checker.asked == [(DEPLOYMENT, [M])]
+
+    async def test_a_members_claim_is_checked_when_it_is_weighed(self):
+        """D is in the group and says it is synced, so M, a weak candidate that says so too,
+        would need a score of 0.60 and C would get the place. D's claim fails the check, which
+        makes M the first synced indexer, and the first gets in at any score.
+        """
+        checker = FakeChecker(fail=(D,))
+
+        picked = await _pick({D, M}, checker, WITH_WEAK, existing_indexers=[D], num_candidates=2)
+
+        assert picked == [D, M] and checker.asked == [(DEPLOYMENT, [D, M])]
+
+    async def test_a_member_being_replaced_is_asked_as_a_member(self):
+        """X fails and is replaced, but its claim was weighed first, so it is asked too."""
+        checker = FakeChecker()
+
+        picked = await _pick({X, D}, checker, WITH_WEAK_AND_FAILING, existing_indexers=[X])
+
+        assert picked == [D] and checker.asked == [(DEPLOYMENT, [X, D])]
 
     async def test_a_claimant_that_cannot_be_picked_is_not_checked(self):
         """B is blocked by the caller, so its claim can win nothing and costs no query."""

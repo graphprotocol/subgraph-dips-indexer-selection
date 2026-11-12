@@ -1707,8 +1707,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
 
 async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionResponse:
-    """_select_with_processor, with the candidates' synced claims checked through the gateway
-    first, when the check is switched on and a new pick rests on such a claim.
+    """_select_with_processor, with the synced claims the selection weighs checked through
+    the gateway first, when the check is switched on.
     """
     selection = _prepare_selection(request)
     if isinstance(selection, SelectionResponse):
@@ -1722,19 +1722,21 @@ async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionRe
 async def _with_claims_checked(
     selection: _Selection, processor: IndexerSelector, checker: SyncClaimChecker
 ) -> IndexerSelector:
-    """When a new pick rests on a synced claim, check every candidate's claim through the
+    """When the selection weighed a synced claim, check every claim it weighed through the
     gateway at once, and select again counting only the claims that were confirmed.
 
-    Nothing is checked when no new pick rests on a claim, since the claims then decided
-    nothing. Otherwise every candidate that claims is checked, not only the one picked, so a
-    false claim that led cannot cost an honest claimant behind it the preference. An indexer
-    whose claim is set aside still competes on its score.
+    A selection weighs claims each time it looks for an indexer to add or swap in and a
+    candidate makes the claim, whether or not that candidate is the one picked. Every claim
+    weighed is then checked: each candidate's, and each group member's, since a synced member
+    makes a synced candidate need a minimum score. Nothing is checked for a group that needs
+    nobody new, or when no candidate makes the claim. Beyond MAX_CHECKS_PER_SELECTION claims,
+    members come first, then candidates by score, and the rest are set aside unchecked. An
+    indexer whose claim is set aside still competes on its score.
     """
     request = selection.request
-    synced = {indexer.lower() for indexer in selection.synced}
-    if not _picked_on_a_claim(processor, synced):
+    claimants = list(dict.fromkeys(indexer.lower() for indexer in processor.claims_weighed()))
+    if not claimants:
         return processor
-    claimants = [indexer.lower() for indexer in processor.synced_candidates()]
     asked = claimants[:MAX_CHECKS_PER_SELECTION]
     not_asked = claimants[MAX_CHECKS_PER_SELECTION:]
     unconfirmed = await checker.unconfirmed(request.deployment_id, asked)
@@ -1742,14 +1744,8 @@ async def _with_claims_checked(
     set_aside = unconfirmed.keys() | set(not_asked)
     if not set_aside:
         return processor
+    synced = {indexer.lower() for indexer in selection.synced}
     return _build_selector(request, selection.history, synced - set_aside)
-
-
-def _picked_on_a_claim(processor: IndexerSelector, synced: set[str]) -> set[str]:
-    """The indexers a selection newly picked that say they have synced the deployment."""
-    picked = {indexer.lower() for indexer in processor.current_group}
-    already_in = {indexer.lower() for indexer in processor.initial_group}
-    return (picked - already_in) & synced
 
 
 def _log_claim_checks(

@@ -123,6 +123,8 @@ class IndexerSelector:
         self.synced_indexers = {s.lower() for s in synced_indexers} if synced_indexers else set()
         self.current_group: list[IndexerId] = []
         self.initial_group: list[IndexerId] = []
+        # Set once the preference for synced candidates had a candidate to apply to.
+        self._weighed_a_claim = False
 
         self._process_data()
 
@@ -541,27 +543,36 @@ class IndexerSelector:
         """Indexers this request can't pick: already in the group, on the denylist, with a
         pending (unaccepted) agreement on any subgraph, or that declined this subgraph.
         """
+        return set(self.current_group) | self._barred_indexers()
+
+    def _barred_indexers(self) -> set[IndexerId]:
+        """Indexers the caller rules out: on the denylist, with a pending (unaccepted)
+        agreement on any subgraph, or that declined this subgraph.
+        """
         return set(
-            self.current_group
-            + self.indexer_denylist
+            self.indexer_denylist
             + [indexer for pending in self.pending_agreements.values() for indexer in pending]
             + self.declined_indexers.get(self.deployment_id, [])
         )
 
-    def synced_candidates(self) -> list[IndexerId]:
-        """Every indexer counted as synced that this selection picked or could have picked,
-        best score first: the scored indexers outside the starting group that are not denied,
-        pending or declined.
+    def claims_weighed(self) -> list[IndexerId]:
+        """Every indexer whose synced claim this selection weighed, or [] when it weighed none.
+
+        Claims are weighed each time the selection looks for an indexer to add or swap in and
+        a candidate makes the claim, whether or not that candidate is then picked. Listed
+        first are the members of the starting group that make it, since a synced member makes
+        every synced candidate need MIN_SYNCED_THRESHOLD; then the candidates that make it,
+        best score first. Candidates are the scored indexers outside the starting group that
+        are not denied, pending or declined.
         """
-        if "weighted_score" not in self.data.columns:
+        if not self._weighed_a_claim:
             return []
-        newly_picked = set(self.current_group) - set(self.initial_group)
-        out_of_reach = set(self._unpickable_indexers()) - newly_picked
+        members = [m for m in self.initial_group if m.lower() in self.synced_indexers]
+        out_of_reach = set(self.initial_group) | self._barred_indexers()
         within_reach = ~self.data["indexer"].isin(out_of_reach)
         synced = self.data["indexer"].str.lower().isin(self.synced_indexers)
-        candidates = self.data[within_reach & synced]
-        ranked = candidates.sort_values(by="weighted_score", ascending=False)
-        return cast(list[IndexerId], ranked["indexer"].tolist())
+        ranked = self.data[within_reach & synced].sort_values(by="weighted_score", ascending=False)
+        return members + cast(list[IndexerId], ranked["indexer"].tolist())
 
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None
@@ -647,6 +658,8 @@ class IndexerSelector:
         all_synced_candidates = candidates[
             candidates["indexer"].str.lower().isin(self.synced_indexers)
         ]
+        if not all_synced_candidates.empty:
+            self._weighed_a_claim = True
 
         if group_has_synced:
             # Already have a synced indexer — threshold applies
