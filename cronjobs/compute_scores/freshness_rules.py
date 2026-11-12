@@ -9,10 +9,11 @@ are the ones the service's POST /freshness accepts.
 from __future__ import annotations
 
 import json
+import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping, Optional, Sequence, TypeGuard, Union
+from typing import Any, Collection, Iterable, Mapping, Optional, Sequence, TypeGuard, Union
 
 PASS = "pass"
 FAIL = "fail"
@@ -43,7 +44,6 @@ DETAIL_LIMIT = 300
 FUTURE_TOLERANCE_SECONDS = 60
 # The last second a timestamp can name and still be a date (9999-12-31T23:59:59Z).
 _MAX_BLOCK_TIMESTAMP = 253_402_300_799
-CHAIN_NAME_LIMIT = 64
 # POST /freshness accepts at most this many outcomes in 1 minute.
 MAX_PAIRS = 50_000
 
@@ -56,6 +56,9 @@ GENERAL_FAULT_MAJORITY_SILENT_MIN = 10
 _INDEXER_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _DEPLOYMENT_HASH = re.compile(r"^Qm[1-9A-HJ-NP-Za-km-z]{44}$")
 _DEPLOYMENT_ENTITY_ID = re.compile(r"^0x[0-9a-fA-F]{64}$")
+# Printable ASCII without spaces: every real network name fits, and a name an indexer made up
+# can't hold text the service refuses or a line break that would start a fake log line.
+_CHAIN_NAME = re.compile(r"[\x21-\x7e]{1,64}")
 
 # The error the gateway names for the indexer, after "bad indexers: {0x...: ". The address is
 # optional so a change in how the gateway lists indexers still reaches the error text.
@@ -148,7 +151,12 @@ class Targets:
 
 
 def truncate_detail(text: Optional[str]) -> Optional[str]:
-    return None if text is None else text[:DETAIL_LIMIT]
+    """Text the service accepts as ``detail``: anything UTF-8 can't hold, such as the half of a
+    surrogate pair a JSON escape like \\ud800 decodes to, is written out as its escape, then the
+    whole is cut to DETAIL_LIMIT characters."""
+    if text is None:
+        return None
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")[:DETAIL_LIMIT]
 
 
 # ---------------------------------------------------------------------------
@@ -354,19 +362,43 @@ def eligible_deployments(
 
 
 def is_indexer_address(value: object) -> TypeGuard[str]:
-    return isinstance(value, str) and bool(_INDEXER_ADDRESS.match(value))
+    return isinstance(value, str) and bool(_INDEXER_ADDRESS.fullmatch(value))
 
 
 def is_deployment_hash(value: object) -> TypeGuard[str]:
-    return isinstance(value, str) and bool(_DEPLOYMENT_HASH.match(value))
+    return isinstance(value, str) and bool(_DEPLOYMENT_HASH.fullmatch(value))
 
 
 def is_deployment_entity_id(value: object) -> TypeGuard[str]:
-    return isinstance(value, str) and bool(_DEPLOYMENT_ENTITY_ID.match(value))
+    return isinstance(value, str) and bool(_DEPLOYMENT_ENTITY_ID.fullmatch(value))
 
 
 def is_chain_name(value: object) -> TypeGuard[str]:
-    return isinstance(value, str) and 0 < len(value) <= CHAIN_NAME_LIMIT
+    return isinstance(value, str) and bool(_CHAIN_NAME.fullmatch(value))
+
+
+@dataclass
+class LeftOut:
+    """What dips_pairs left out of GET /scores records, for the caller to log once per refresh
+    rather than once per item."""
+
+    # (indexer, the entry it listed) for each listed chain that isn't a known network
+    refused_names: list[tuple[str, object]] = field(default_factory=list)
+    # Indexers whose price field is there but can't be read
+    unreadable_prices: list[str] = field(default_factory=list)
+    # Listed chains without a price, which selection can't pick an indexer on anyway
+    unpriced: int = 0
+    # No record had a price field, so every listed chain was paired, as selection then does
+    no_price_field: bool = False
+
+
+def _listed(value: object) -> list[object]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, RecursionError):
+            return []
+    return value if isinstance(value, list) else []
 
 
 def supported_chains(value: object) -> list[str]:
@@ -374,27 +406,88 @@ def supported_chains(value: object) -> list[str]:
 
     Anything unreadable gives no chains, as the service's own parser does.
     """
+    return list(dict.fromkeys(chain for chain in _listed(value) if is_chain_name(chain)))
+
+
+def _is_price(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return False
+    try:
+        price = float(value)
+    except (ValueError, OverflowError):
+        return False
+    return math.isfinite(price) and price >= 0
+
+
+def _priced_chains(value: object) -> Optional[set[str]]:
+    """The chains with a usable price in a ``dips_min_grt_per_30_days`` value, an object or a
+    JSON string of one, or None when the value is there but can't be read. Selection leaves an
+    indexer out on any other chain, as the service's _extract_chain_price reads a price: a finite
+    number of at least 0, not true or false.
+    """
+    if value is None:
+        return set()
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except (ValueError, RecursionError):
-            return []
-    if not isinstance(value, list):
-        return []
-    return list(dict.fromkeys(chain for chain in value if is_chain_name(chain)))
+            return None
+    if not isinstance(value, dict):
+        return None
+    return {chain for chain, price in value.items() if _is_price(price)}
 
 
-def dips_pairs(records: Iterable[object]) -> list[tuple[str, str]]:
-    """Every (indexer, chain) an indexer offers DIPs on, from GET /scores records, sorted."""
-    pairs: set[tuple[str, str]] = set()
-    for record in records:
-        if not isinstance(record, dict) or not is_indexer_address(record.get("indexer")):
-            continue
+def _is_known(entry: object, networks: Collection[str]) -> bool:
+    return is_chain_name(entry) and entry in networks
+
+
+def _chains_of(
+    indexer: str, record: Mapping[str, Any], networks: Collection[str], left_out: LeftOut
+) -> list[str]:
+    entries = _listed(record.get("dips_supported_networks"))
+    left_out.refused_names.extend(
+        (indexer, entry) for entry in entries if not _is_known(entry, networks)
+    )
+    listed = [chain for chain in supported_chains(entries) if chain in networks]
+    if left_out.no_price_field:
+        return listed
+    priced = _priced_chains(record.get("dips_min_grt_per_30_days"))
+    if priced is None:
+        left_out.unreadable_prices.append(indexer)
+        priced = set()
+    kept = [chain for chain in listed if chain in priced]
+    left_out.unpriced += len(listed) - len(kept)
+    return kept
+
+
+def _offered_chains(
+    records: Iterable[object], networks: Collection[str], left_out: LeftOut
+) -> dict[str, list[str]]:
+    """Each indexer's chains from GET /scores records: those in ``networks`` that it offers DIPs
+    on and has priced, or all such chains when no record has a price field, in the order it
+    lists them, without repeats. Indexers are in lower case."""
+    usable = [r for r in records if isinstance(r, dict) and is_indexer_address(r.get("indexer"))]
+    # The service applies no price filter when its scores have no price column at all.
+    left_out.no_price_field = bool(usable) and not any(
+        "dips_min_grt_per_30_days" in record for record in usable
+    )
+    chains: dict[str, dict[str, None]] = {}
+    for record in usable:
         indexer = record["indexer"].lower()
-        pairs.update(
-            (indexer, chain) for chain in supported_chains(record.get("dips_supported_networks"))
-        )
-    return sorted(pairs)
+        offered = chains.setdefault(indexer, {})
+        offered.update(dict.fromkeys(_chains_of(indexer, record, networks, left_out)))
+    return {indexer: list(offered) for indexer, offered in chains.items() if offered}
+
+
+def dips_pairs(
+    records: Iterable[object], networks: Collection[str], left_out: Optional[LeftOut] = None
+) -> list[tuple[str, str]]:
+    """Every (indexer, chain) to check from GET /scores records, sorted: each chain in
+    ``networks`` that an indexer offers DIPs on and has priced. What is left out is added to
+    ``left_out`` when it is given."""
+    left_out = LeftOut() if left_out is None else left_out
+    offered = _offered_chains(records, networks, left_out)
+    return sorted((indexer, chain) for indexer, chains in offered.items() for chain in chains)
 
 
 def format_minute(minute_start: float) -> str:

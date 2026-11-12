@@ -65,9 +65,10 @@ spec:
             capabilities:
               drop:
                 - ALL
-          # /health is 503 until the first push and again once 2 pushes in a row fail, so a stuck
-          # fetcher is restarted (which also picks up a rotated token). The first cycle probes every
-          # indexer, so it gets 15 minutes. No readiness probe: nothing sends this pod traffic.
+          # /health is 503 until the first push, again once 2 pushes in a row fail, and once the
+          # freshness prober has stopped, so a stuck fetcher is restarted (which also picks up a
+          # rotated token). The first cycle probes every indexer, so it gets 15 minutes. No
+          # readiness probe: nothing sends this pod traffic.
           startupProbe:
             httpGet:
               path: /health

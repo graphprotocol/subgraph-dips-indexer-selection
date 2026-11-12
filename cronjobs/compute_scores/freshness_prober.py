@@ -21,7 +21,9 @@ from urllib.parse import urlparse
 
 import requests
 from freshness_config import PUSH_DELAY_SECONDS, FreshnessConfig
+from freshness_contract import without_refused
 from freshness_gateway import GatewayClient
+from freshness_registry import NetworksRegistry
 from freshness_rules import (
     KEY_OUT_OF_FUNDS,
     NO_ELIGIBLE_SUBGRAPH,
@@ -104,6 +106,7 @@ class FreshnessProber:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rng: Optional[random.Random] = None,
+        registry: Optional[NetworksRegistry] = None,
     ) -> None:
         self._config = config
         self._load_targets = load_targets
@@ -120,14 +123,20 @@ class FreshnessProber:
         self._refreshing = False
         self.last_push: Optional[datetime] = None
         self.running = False
+        # Set once the prober's thread has ended, for whatever reason; the fetcher's /health
+        # fails on it unless the fetcher is shutting down.
+        self.stopped = False
+        self._registry = registry
 
     def health(self, now: datetime) -> dict[str, Any]:
         """Fields for the fetcher's /health body."""
         last = self.last_push
         return {
             "running": self.running,
+            "stopped": self.stopped,
             "last_push": last.isoformat() if last else None,
             "last_push_age_seconds": int((now - last).total_seconds()) if last else None,
+            **(self._registry.health() if self._registry else {}),
         }
 
     # -- the loop ----------------------------------------------------------
@@ -303,9 +312,11 @@ class FreshnessProber:
 
     async def _push(self, start: float, results: list[CheckResult]) -> None:
         minute = format_minute(start)
-        counts = Counter(result.outcome for result in results)
+        payload = minute_payload(start, results)
+        payload["outcomes"] = without_refused(minute, payload["outcomes"])
+        counts = Counter(outcome["outcome"] for outcome in payload["outcomes"])
         try:
-            response = await asyncio.to_thread(self._push_payload, minute_payload(start, results))
+            response = await asyncio.to_thread(self._push_payload, payload)
         except (IISAPushError, ValueError) as e:
             logger.error("Failed to push freshness minute %s (%s): %s", minute, dict(counts), e)
             return
@@ -324,9 +335,11 @@ def _run_in_thread(prober: FreshnessProber, gateway: GatewayClient, stop: thread
         asyncio.run(main())
     except Exception:
         logger.critical(
-            "Freshness prober stopped unexpectedly; no freshness pushes until a restart",
+            "Freshness prober stopped unexpectedly; /health now fails so the pod is restarted",
             exc_info=True,
         )
+    finally:
+        prober.stopped = True
 
 
 def start_freshness_prober(
@@ -339,7 +352,9 @@ def start_freshness_prober(
 ) -> tuple[FreshnessProber, threading.Thread]:
     """Start the prober on a daemon thread that ends once ``stop`` is set."""
     gateway = GatewayClient(config.gateway_url, config.api_key, config.request_timeout)
+    registry = NetworksRegistry(config.networks_registry_url, config.additional_networks)
     loader = TargetLoader(
+        networks=registry.networks,
         fetch_scores=partial(get_scores, iisa_api_url, token),
         read_allocations=partial(read_open_allocations, subgraph_url),
         read_first_allocations=partial(read_first_allocations, subgraph_url),
@@ -347,6 +362,7 @@ def start_freshness_prober(
     )
     prober = FreshnessProber(
         config,
+        registry=registry,
         load_targets=loader,
         ask=gateway.ask,
         push=partial(post_freshness, iisa_api_url, token, timeout=PUSH_TIMEOUT_SECONDS),
