@@ -123,7 +123,8 @@ class IndexerSelector:
         self.synced_indexers = {s.lower() for s in synced_indexers} if synced_indexers else set()
         self.current_group: list[IndexerId] = []
         self.initial_group: list[IndexerId] = []
-        # Every candidate put ahead of the rest, at any point, because it says it has synced.
+        # Every candidate that could, at some pick, have been chosen ahead of the rest because
+        # it says it has synced.
         self._preferred_on_a_claim: set[IndexerId] = set()
 
         self._process_data()
@@ -551,19 +552,40 @@ class IndexerSelector:
         )
 
     def preferred_on_a_claim(self) -> list[IndexerId]:
-        """Every candidate this selection put ahead of the rest because it says it has synced
-        the deployment, best score first, whether or not it was then picked. Empty when the
-        selection never looked for an indexer to add or swap in.
-
-        While no group member says it has synced, that is every candidate making the claim,
-        since the first synced indexer gets in at any score. Once a member does, it is only
-        the candidates scoring at least MIN_SYNCED_THRESHOLD. Members of the starting group are
-        never listed.
+        """Every candidate that this selection could have picked ahead of the rest because it
+        says it has synced the deployment, best score first, whether or not it was picked.
+        Empty when the selection never looked for an indexer to add or swap in. See
+        _note_claims_that_could_win for which candidates those are. Members of the starting
+        group are never listed, even one that left the group and was weighed as a candidate.
         """
         listed = self._preferred_on_a_claim - set(self.initial_group)
         rows = self.data[self.data["indexer"].isin(listed)]
         ranked = rows.sort_values(by="weighted_score", ascending=False)
         return cast(list[IndexerId], list(dict.fromkeys(ranked["indexer"])))
+
+    def _note_claims_that_could_win(
+        self, candidates: pd.DataFrame, replacing_indexer: Optional[IndexerId]
+    ) -> None:
+        """Record the candidates that this pick could choose because they say they have synced.
+
+        They are the candidates drawn from first (see _synced_first) that would also leave the
+        group meeting the decentralisation requirements and, when a member is being replaced,
+        beat it by more than REPLACEMENT_MARGIN. Any other candidate can only be picked on its
+        score, so whether its claim is true changes nothing here.
+        """
+        if not self.synced_indexers:
+            return
+        ahead = self._synced_first(candidates)
+        if replacing_indexer is not None:
+            replaced_score = self._score_of(replacing_indexer)
+            if replaced_score is None:
+                return
+            ahead = ahead[ahead["weighted_score"] > replaced_score + REPLACEMENT_MARGIN]
+        self._preferred_on_a_claim.update(
+            indexer
+            for indexer in ahead["indexer"]
+            if self._meets_decentralization_requirements(indexer, replacing_indexer)
+        )
 
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None
@@ -589,6 +611,7 @@ class IndexerSelector:
 
         # Sort the candidates by weighted score, highest score first
         candidates = candidates.sort_values(by="weighted_score", ascending=False)
+        self._note_claims_that_could_win(candidates, replacing_indexer)
         logger.debug(
             "deployment=%s candidates: %d eligible out of %d total (excluded %d unpickable)",
             self.deployment_id,
@@ -644,31 +667,33 @@ class IndexerSelector:
         if not self.synced_indexers:
             return [("all", candidates)]
 
-        group_lower = {i.lower() for i in self.current_group}
-        group_has_synced = bool(group_lower & self.synced_indexers)
-        all_synced_candidates = candidates[
-            candidates["indexer"].str.lower().isin(self.synced_indexers)
-        ]
-
-        if group_has_synced:
-            # Already have a synced indexer — threshold applies
-            synced = all_synced_candidates[
-                all_synced_candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD
-            ]
-        else:
-            # No synced indexer yet — first one gets in at any score
-            synced = all_synced_candidates
-
-        self._preferred_on_a_claim.update(synced["indexer"])
+        synced = self._synced_first(candidates)
         unsynced = candidates[~candidates["indexer"].isin(synced["indexer"])]
         logger.info(
             "deployment=%s candidates: %d synced eligible, %d unsynced (group_has_synced=%s)",
             self.deployment_id,
             len(synced),
             len(unsynced),
-            group_has_synced,
+            self._group_has_synced(),
         )
         return [("synced", synced), ("unsynced", unsynced)]
+
+    def _group_has_synced(self) -> bool:
+        """Whether anyone in the group as it stands, earlier picks included, says it has synced."""
+        return bool({i.lower() for i in self.current_group} & self.synced_indexers)
+
+    def _synced_first(self, candidates: pd.DataFrame) -> pd.DataFrame:
+        """The candidates drawn from first because they say they have synced the deployment."""
+        all_synced_candidates = candidates[
+            candidates["indexer"].str.lower().isin(self.synced_indexers)
+        ]
+        if self._group_has_synced():
+            # Already have a synced indexer: threshold applies
+            return all_synced_candidates[
+                all_synced_candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD
+            ]
+        # No synced indexer yet: first one gets in at any score
+        return all_synced_candidates
 
 
 # Norm columns the CronJob ships already normalised and the selector keeps: latency, and

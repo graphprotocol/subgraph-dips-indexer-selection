@@ -1,11 +1,12 @@
-"""An indexer's claim to have synced a deployment is checked before selection relies on it.
+"""A candidate's claim to have synced a deployment is checked before it can win it a place.
 
-Selection prefers an indexer that says it has already synced the deployment. That is the
-indexer's own word, so before such a pick goes back to dipper the service can ask the indexer
-through the gateway for the deployment's latest block, as a paying customer would. The claim
-counts only if the indexer signed the answer and the block is recent. A claim that is not
-confirmed, for whatever reason, loses the preference and the indexer competes on its score.
-Every candidate whose claim could win it a place is asked at once; group members never are.
+Selection prefers a candidate that says it has already synced the deployment. That is the
+candidate's own word, so before the answer goes back to dipper the service can ask it, through
+the gateway, for the deployment's latest block, as a paying customer would. The claim counts
+only if the indexer signed the answer and the block is recent. A claim that is not confirmed,
+for whatever reason, loses the preference and the indexer competes on its score. Every
+candidate that could be picked ahead of the rest on its claim is asked at once. Group members
+are never asked: their claims count as given.
 """
 
 import json
@@ -29,7 +30,7 @@ from iisa.sync_check import GatewayReply, SyncClaimChecker, post_once
 
 CHAIN = "arbitrum-one"
 DEPLOYMENT = "QmSyncClaimCheck"
-A, B, C, D, M, X = ("0x" + pair * 20 for pair in ("a1", "b2", "c3", "d4", "e5", "f6"))
+A, B, C, D, M, X, T = ("0x" + pair * 20 for pair in ("a1", "b2", "c3", "d4", "e5", "f6", "07"))
 NOW = 1_794_400_000.0
 API_KEY = "gateway-key-123"
 
@@ -391,8 +392,9 @@ async def _pick(
 
 
 class TestSelection:
-    """When a claim puts candidates ahead, each of them is asked at once, and selection then
-    counts only the claims that were confirmed. Group members are never asked.
+    """Each candidate that could be picked ahead of the rest on its claim is asked, all at
+    once, and if any claim is not confirmed selection decides again counting only the group
+    members' claims and the confirmed ones. Group members are never asked.
     """
 
     async def test_with_no_checker_the_claim_is_taken_on_trust_as_before(self):
@@ -471,13 +473,35 @@ class TestSelection:
 
         assert await _pick({A, B}, checker, existing_indexers=[D], num_candidates=2) == [D, A]
 
-    async def test_a_claim_that_blocks_a_swap_is_checked_though_nobody_is_picked_on_it(self):
-        """X is failing and D should replace it. M says it is synced, so it is tried first, and
-        M is too small an improvement, so on trust X would stay. M's claim fails, D replaces X.
+    async def test_a_claimant_that_gains_too_little_to_replace_anyone_is_not_asked(self):
+        """X is failing, and a candidate must beat it by more than 0.50 to replace it. M says
+        it is synced but gains less than that, so its claim cannot win it X's place and costs
+        no query, however often this group is looked at again.
         """
-        checker = FakeChecker(fail=(M,))
+        checker = FakeChecker()
 
-        assert await _pick({M}, checker, WITH_WEAK_AND_FAILING, existing_indexers=[X]) == [D]
+        await _pick({M}, checker, WITH_WEAK_AND_FAILING, existing_indexers=[X])
+
+        assert checker.asked == []
+
+    async def test_in_a_replacement_only_claimants_that_gain_enough_are_asked(self):
+        """A and M both say they are synced. Only A beats the failing X by more than 0.50."""
+        checker = FakeChecker()
+
+        picked = await _pick({A, M}, checker, WITH_WEAK_AND_FAILING, existing_indexers=[X])
+
+        assert picked == [A] and checker.asked == [(DEPLOYMENT, [A])]
+
+    async def test_a_claimant_that_would_leave_the_group_in_1_place_is_not_asked(self):
+        """T has the best score and says it is synced, but shares D's operator and location, so
+        its claim cannot put it ahead: selection wants 2 of each. Only A's claim is asked.
+        """
+        twin = _record(T, 0.995, org=f"org-{D[2:4]}", dst_lat=int(D[2:4], 16) / 4)
+        checker = FakeChecker()
+        group = {"existing_indexers": [D], "num_candidates": 2}
+
+        assert await _pick({T, A}, checker, [*RECORDS, twin], **group) == [D, A]
+        assert checker.asked == [(DEPLOYMENT, [A])]
 
     async def test_a_group_member_is_never_asked(self):
         """D is in the group and says it is synced. That is taken as given, even here where
@@ -496,6 +520,22 @@ class TestSelection:
         picked = await _pick({X, D}, checker, WITH_WEAK_AND_FAILING, existing_indexers=[X])
 
         assert picked == [D] and checker.asked == [(DEPLOYMENT, [D])]
+
+    def test_a_starting_member_is_never_listed_even_if_it_came_back_as_a_candidate(self):
+        """A member that leaves the group during a selection can be weighed again as a
+        candidate. It is still a member to the check, and is left off the list to ask.
+        """
+        request = SelectionRequest(
+            deployment_id=DEPLOYMENT, chain_id=CHAIN, num_candidates=2, existing_indexers=[D]
+        )
+        with patch.object(endpoints, "_state", _state({A, D}, None)):
+            selection = endpoints._prepare_selection(request)
+            selector = endpoints._build_selector(
+                selection.request, selection.history, selection.synced
+            )
+        selector._preferred_on_a_claim.update({A, D})
+
+        assert selector.preferred_on_a_claim() == [A]
 
     async def test_a_claim_too_weak_to_count_is_not_asked(self):
         """With D, a synced member, in the group, a synced candidate needs a score of 0.60 to
