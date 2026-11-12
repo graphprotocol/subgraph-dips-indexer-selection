@@ -45,9 +45,9 @@ spec:
               limits:
                 memory: "50Gi"
                 cpu: "8"
-            # Each environment names the Redpanda topic and gateway IDs to score in this ConfigMap.
-            # Optional so a missing map fails the run visibly (the job refuses to start without
-            # REDPANDA_TOPIC) instead of leaving the pod waiting and blocking later runs.
+            # Each environment names the Redpanda topic and gateway IDs to score here, and the
+            # sync-status fetcher's FRESHNESS_* settings. Optional so a missing map fails the run
+            # visibly, as the job needs REDPANDA_TOPIC, instead of leaving later runs blocked.
             envFrom:
             - configMapRef:
                 name: iisa-redpanda-config

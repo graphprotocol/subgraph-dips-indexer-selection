@@ -120,8 +120,12 @@ than falling back to the mainnet `gateway_queries` topic.
 
 The sync-status fetcher loads the same ConfigMap when it exists, for the freshness prober's
 `FRESHNESS_*` settings other than its API key, because the gateway and the address it pays
-indexers from differ between networks. Without `FRESHNESS_PROBE_ENABLED: "true"` there, the
-prober stays off.
+indexers from differ between networks. The prober runs only when `FRESHNESS_PROBE_ENABLED`
+is `true`, `1` or `yes`, and stays off when it is unset, `false`, `0` or `no`. Any other
+value, or a prober switched on with a setting missing or out of range, stops the fetcher
+from starting, and with it the sync-status pushes, so check the fetcher's log after a
+change. A pod reads the ConfigMap and the secret only when it starts, so a change takes
+effect after `kubectl rollout restart deployment/sync-status-fetcher` in that namespace.
 
 Geo-location data uses MaxMind GeoLite2, downloaded into the CronJob image at build
 time, so no geo API key is needed at runtime.
