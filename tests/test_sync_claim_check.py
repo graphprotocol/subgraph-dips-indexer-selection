@@ -22,7 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from iisa import DataManager
+from iisa import DataManager, sync_check
 from iisa import iisa_http_endpoints as endpoints
 from iisa.iisa_http_endpoints import SelectionRequest, Settings, _select_checking_sync_claims
 from iisa.sync_check import GatewayReply, SyncClaimChecker, post_once
@@ -115,7 +115,7 @@ class TestOneCheck:
 
 
 class TestSeveralChecks:
-    """Checks for 1 selection run side by side and never outlast the time limit."""
+    """Checks for 1 selection all start at once and never outlast the time limit."""
 
     async def test_each_unconfirmed_claim_comes_back_with_its_reason(self):
         replies = {A: _reply(), B: _reply(age=90.0), C: _reply(attested=False)}
@@ -123,7 +123,7 @@ class TestSeveralChecks:
         def send(url: str, *_a: Any) -> GatewayReply:
             return replies[url.rsplit("/", 1)[1]]
 
-        unconfirmed = await _checker(send).unconfirmed(DEPLOYMENT, {A, B, C})
+        unconfirmed = await _checker(send).unconfirmed(DEPLOYMENT, [A, B, C])
 
         assert sorted(unconfirmed) == [B, C]
         assert "90s old" in unconfirmed[B] and "not signed" in unconfirmed[C]
@@ -134,7 +134,7 @@ class TestSeveralChecks:
         def send(*_a: Any) -> GatewayReply:
             raise RuntimeError("a fault nobody planned for")
 
-        unconfirmed = await _checker(send).unconfirmed(DEPLOYMENT, {A})
+        unconfirmed = await _checker(send).unconfirmed(DEPLOYMENT, [A])
 
         assert unconfirmed == {A: "the check itself failed"}
         assert any(r.levelname == "ERROR" and r.exc_info for r in caplog.records)
@@ -148,12 +148,59 @@ class TestSeveralChecks:
             return _reply()
 
         started = time.monotonic()
-        unconfirmed = await _checker(send, timeout_seconds=0.2).unconfirmed(DEPLOYMENT, {A, B})
+        unconfirmed = await _checker(send, timeout_seconds=0.2).unconfirmed(DEPLOYMENT, [A, B])
         waited = time.monotonic() - started
         release.set()
 
         assert list(unconfirmed) == [B] and "no answer within 0.2s" in unconfirmed[B]
         assert waited < 2
+
+    async def test_every_check_1_selection_may_make_starts_at_once(self):
+        """Each check here waits until all 50 are under way, so they only finish, and confirm
+        their claims, if none of them had to wait for another to end first.
+        """
+        indexers = [f"0x{n:040x}" for n in range(sync_check.MAX_CHECKS_PER_SELECTION)]
+        all_started = threading.Barrier(len(indexers), timeout=3)
+
+        def send(*_a: Any) -> GatewayReply:
+            all_started.wait()
+            return _reply()
+
+        assert await _checker(send).unconfirmed(DEPLOYMENT, indexers) == {}
+
+    async def test_checks_are_sent_in_the_order_given(self, monkeypatch):
+        """The caller lists the best scores first, and that is the order they are sent in when
+        the service is too busy to start them all together.
+        """
+        monkeypatch.setattr(sync_check, "CHECK_THREADS", 1)
+        sent: list[str] = []
+
+        def send(url: str, *_a: Any) -> GatewayReply:
+            sent.append(url.rsplit("/", 1)[1])
+            return _reply()
+
+        assert await _checker(send).unconfirmed(DEPLOYMENT, [C, A, B]) == {}
+        assert sent == [C, A, B]
+
+    async def test_a_check_that_never_started_is_reported_as_not_sent(self, monkeypatch):
+        """With every thread busy the second check is never sent, and its reason says so
+        instead of blaming the indexer for not answering.
+        """
+        monkeypatch.setattr(sync_check, "CHECK_THREADS", 1)
+        release = threading.Event()
+        sent: list[str] = []
+
+        def send(url: str, *_a: Any) -> GatewayReply:
+            sent.append(url.rsplit("/", 1)[1])
+            release.wait(5)
+            return _reply()
+
+        unconfirmed = await _checker(send, timeout_seconds=0.2).unconfirmed(DEPLOYMENT, [A, B])
+        release.set()
+
+        assert sent == [A]
+        assert "no answer within 0.2s" in unconfirmed[A]
+        assert "was not sent" in unconfirmed[B]
 
 
 class _Gateway(BaseHTTPRequestHandler):
@@ -296,10 +343,10 @@ class FakeChecker:
 
     def __init__(self, fail: tuple[str, ...] = ()) -> None:
         self.fail = set(fail)
-        self.asked: list[tuple[str, set[str]]] = []
+        self.asked: list[tuple[str, list[str]]] = []
 
-    async def unconfirmed(self, deployment_id: str, indexers: set[str]) -> dict[str, str]:
-        self.asked.append((deployment_id, set(indexers)))
+    async def unconfirmed(self, deployment_id: str, indexers: list[str]) -> dict[str, str]:
+        self.asked.append((deployment_id, list(indexers)))
         return {indexer: "latest block is 900s old" for indexer in indexers if indexer in self.fail}
 
 
@@ -334,14 +381,14 @@ class TestSelection:
         checker = FakeChecker()
 
         assert await _pick({A}, checker) == [A]
-        assert checker.asked == [(DEPLOYMENT, {A})]
+        assert checker.asked == [(DEPLOYMENT, [A])]
 
     async def test_an_unconfirmed_claim_loses_the_preference(self):
         """A only led because of its claim; without it the best score, D, is picked."""
         checker = FakeChecker(fail=(A,))
 
         assert await _pick({A}, checker) == [D]
-        assert checker.asked == [(DEPLOYMENT, {A})]
+        assert checker.asked == [(DEPLOYMENT, [A])]
 
     async def test_with_no_claim_in_play_nothing_is_checked(self):
         checker = FakeChecker()
@@ -350,18 +397,20 @@ class TestSelection:
         assert checker.asked == []
 
     async def test_every_claim_is_checked_together_in_1_round(self):
-        """C leads on its claim, so A, B and C are all asked at once, not only C."""
+        """C leads on its claim, so A, B and C are all asked at once, not only C, listed with
+        the best score first.
+        """
         checker = FakeChecker()
 
         assert await _pick({A, B, C}, checker) == [C]
-        assert checker.asked == [(DEPLOYMENT, {A, B, C})]
+        assert checker.asked == [(DEPLOYMENT, [C, B, A])]
 
     async def test_the_best_confirmed_claim_wins_when_better_ones_fail(self):
         """C and B both claim falsely. A's claim is true, so A still gets its head start."""
         checker = FakeChecker(fail=(B, C))
 
         assert await _pick({A, B, C}, checker) == [A]
-        assert checker.asked == [(DEPLOYMENT, {A, B, C})]
+        assert checker.asked == [(DEPLOYMENT, [C, B, A])]
 
     async def test_when_every_claim_fails_the_best_score_wins(self):
         checker = FakeChecker(fail=(A, B, C))
@@ -395,17 +444,17 @@ class TestSelection:
         checker = FakeChecker()
 
         assert await _pick({A, B}, checker, blocklist=[B]) == [A]
-        assert checker.asked == [(DEPLOYMENT, {A})]
+        assert checker.asked == [(DEPLOYMENT, [A])]
 
     async def test_no_more_than_the_limit_are_checked_best_scores_first(self, monkeypatch):
         """With a limit of 2, the 2 best-scoring claimants are asked; A's claim is left out
         unchecked, so it counts for nothing.
         """
-        monkeypatch.setattr(endpoints, "MAX_SYNC_CHECKS_PER_SELECTION", 2)
+        monkeypatch.setattr(endpoints, "MAX_CHECKS_PER_SELECTION", 2)
         checker = FakeChecker(fail=(B, C))
 
         assert await _pick({A, B, C}, checker) == [D]
-        assert checker.asked == [(DEPLOYMENT, {B, C})]
+        assert checker.asked == [(DEPLOYMENT, [C, B])]
 
     async def test_a_failed_check_is_logged_with_its_reason(self, caplog):
         with caplog.at_level("INFO"):

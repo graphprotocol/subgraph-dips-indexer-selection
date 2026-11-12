@@ -42,7 +42,7 @@ from .score_loader import (
     FileScoreLoader,
     ScoresPayloadError,
 )
-from .sync_check import SyncClaimChecker
+from .sync_check import MAX_CHECKS_PER_SELECTION, SyncClaimChecker
 from .sync_status_loader import SyncStatusData
 
 __all__ = ["app", "Settings", "get_settings"]
@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     # key are both set, and each check is 1 paid query on that key. See sync_check.py.
     sync_check_gateway_url: Optional[str] = None
     sync_check_gateway_api_key: Optional[str] = None
-    # How long the checks for 1 selection may take; they all run at once. Dipper waits 30
+    # How long the checks for 1 selection may take; they all start at once. Dipper waits 30
     # seconds for its answer, hence the upper limit.
     sync_check_timeout_seconds: float = Field(default=5.0, gt=0, le=10)
     # The oldest a deployment's latest block may be for a claim to be confirmed.
@@ -1719,11 +1719,6 @@ async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionRe
     return _selection_response(selection, processor)
 
 
-# The most claims 1 selection will pay to check. Beyond it the best-scoring claimants are
-# checked and the rest are set aside unchecked, so a flood of claims cannot run up the bill.
-MAX_SYNC_CHECKS_PER_SELECTION = 50
-
-
 async def _with_claims_checked(
     selection: _Selection, processor: IndexerSelector, checker: SyncClaimChecker
 ) -> IndexerSelector:
@@ -1740,9 +1735,9 @@ async def _with_claims_checked(
     if not _picked_on_a_claim(processor, synced):
         return processor
     claimants = [indexer.lower() for indexer in processor.synced_candidates()]
-    asked = claimants[:MAX_SYNC_CHECKS_PER_SELECTION]
-    not_asked = claimants[MAX_SYNC_CHECKS_PER_SELECTION:]
-    unconfirmed = await checker.unconfirmed(request.deployment_id, set(asked))
+    asked = claimants[:MAX_CHECKS_PER_SELECTION]
+    not_asked = claimants[MAX_CHECKS_PER_SELECTION:]
+    unconfirmed = await checker.unconfirmed(request.deployment_id, asked)
     _log_claim_checks(request.deployment_id, asked, unconfirmed, not_asked)
     set_aside = unconfirmed.keys() | set(not_asked)
     if not set_aside:
@@ -1781,7 +1776,7 @@ def _log_claim_checks(
             "were not checked and are set aside",
             deployment_id,
             len(not_asked),
-            MAX_SYNC_CHECKS_PER_SELECTION,
+            MAX_CHECKS_PER_SELECTION,
         )
 
 

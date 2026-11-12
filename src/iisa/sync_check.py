@@ -18,7 +18,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http.client import HTTPException
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Optional, Sequence
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
@@ -34,9 +34,12 @@ MAX_REPLY_BYTES = 64 * 1024
 # A block dated up to this long after now still counts as 0 seconds old, allowing for clocks
 # that disagree a little; any later and the timestamp cannot be trusted.
 FUTURE_TOLERANCE_SECONDS = 60
-# Checks run side by side on this many threads, shared by every selection in progress; more
-# wait their turn.
-CHECK_THREADS = 16
+# The most claims 1 selection will pay to check. Beyond it the first listed are checked and the
+# rest are set aside unchecked, so a flood of claims cannot run up the bill.
+MAX_CHECKS_PER_SELECTION = 50
+# Enough threads for every check 1 selection may make, so they all start at once. Selections in
+# progress at the same moment share them, and a check that finds none free waits its turn.
+CHECK_THREADS = MAX_CHECKS_PER_SELECTION
 # Sent with each query. Some gateways' front doors refuse the HTTP library's own default name.
 USER_AGENT = "iisa-sync-check"
 
@@ -119,26 +122,35 @@ class SyncClaimChecker:
         self._clock = clock
         self._threads = ThreadPoolExecutor(CHECK_THREADS, thread_name_prefix="sync-check")
 
-    async def unconfirmed(self, deployment_id: str, indexers: Iterable[str]) -> dict[str, str]:
-        """Check each indexer's claim on deployment_id at once; return each one that was not
-        confirmed with the reason. A check still unanswered after the time limit is given up,
-        so this never waits much longer than that limit however many indexers are asked.
+    async def unconfirmed(self, deployment_id: str, indexers: Sequence[str]) -> dict[str, str]:
+        """Check each indexer's claim on deployment_id, all at once, and return each one that
+        was not confirmed with the reason. A check still unanswered after the time limit is
+        given up, so this never waits much longer than that limit however many are asked.
+
+        The checks are handed over in the order given. When other selections hold some of the
+        threads, the first listed start first, and one that never got to start says so.
         """
-        asked = sorted(indexers)
-        loop = asyncio.get_running_loop()
-        checks = [
-            loop.run_in_executor(self._threads, self.why_not_confirmed, deployment_id, indexer)
+        asked = list(dict.fromkeys(indexers))
+        if not asked:
+            return {}
+        sent = [
+            self._threads.submit(self.why_not_confirmed, deployment_id, indexer)
             for indexer in asked
         ]
-        if not checks:
-            return {}
-        _done, late = await asyncio.wait(checks, timeout=self._timeout)
+        answers = [asyncio.wrap_future(check) for check in sent]
+        _done, late = await asyncio.wait(answers, timeout=self._timeout)
         reasons: dict[str, str] = {}
-        for indexer, check in zip(asked, checks):
-            if check in late:
-                check.cancel()
-                reasons[indexer] = f"no answer within {self._timeout:g}s"
-            elif (reason := self._outcome(check, deployment_id, indexer)) is not None:
+        for indexer, check, answer in zip(asked, sent, answers):
+            if answer in late:
+                # Cancelling only succeeds for a check that had not started.
+                never_started = check.cancel()
+                answer.cancel()
+                reasons[indexer] = (
+                    f"the check was not sent, the service was busy for {self._timeout:g}s"
+                    if never_started
+                    else f"no answer within {self._timeout:g}s"
+                )
+            elif (reason := self._outcome(answer, deployment_id, indexer)) is not None:
                 reasons[indexer] = reason
         return reasons
 
