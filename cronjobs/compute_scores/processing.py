@@ -23,6 +23,7 @@ import geoip2.database
 import geoip2.errors
 import numpy as np
 import pandas as pd
+from carry_over import QUALITY_MEASURED_AT
 from escaping import error_for_log, url_for_log
 from escaping import for_log as _for_log
 from numpy.linalg import pinv
@@ -33,7 +34,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from stake_reads import STAKE_READ_AT
+from stake_reads import STAKE_READ_AT, leave_out_unread, utc_now
 
 if TYPE_CHECKING:
     import aiohttp
@@ -989,6 +990,7 @@ def compute_all_scores(
     indexer_success_rate = calculate_indexer_success_rate(combined_queries)
     indexer_uptime = calculate_indexer_uptime(data_for_uptime)
 
+    stake_lookup_started = utc_now()
     stake_to_fees = provider.fetch_stake_to_fees()
 
     agg_df = aggregate_indexer_info(combined_queries)
@@ -1003,6 +1005,7 @@ def compute_all_scores(
         indexer_query_count,
         drop_missing_latency=geoip_available,
     )
+    merged = leave_out_unread(merged, stake_lookup_started)
 
     # DIP pricing fetched directly from indexers
     merged = _attach_dips_info(merged, indexer_urls)
@@ -1014,6 +1017,7 @@ def compute_all_scores(
     # Transform to indexer_scores schema
     scores_df = transform_to_scores_schema(merged)
     scores_df["scoring_mode"] = "full" if geoip_available else "partial_no_geoip"
+    scores_df[QUALITY_MEASURED_AT] = pd.Timestamp(utc_now())
 
     mode = "full" if geoip_available else "partial"
     logger.info(
@@ -1725,6 +1729,24 @@ def merge_and_prepare_dataframes(
     return merged
 
 
+def compute_carried_over_scores(
+    indexer_urls: Dict[str, str], carried: pd.DataFrame
+) -> pd.DataFrame:
+    """Scores for a day the run measured nothing: the quality, stake and fees in `carried`,
+    which an earlier run measured, with each indexer's URL, DIPs price and graph-node version
+    read today. `carried` is carry_over.carried_over's answer for today's indexers.
+
+    No neutral stake-to-fees score is sent, so iisa works the score out from the carried stake
+    and fees as it does for a run that measured them.
+    """
+    scores = carried.copy()
+    scores.insert(1, "url", scores["indexer"].map(indexer_urls))
+    scores = _attach_dips_info(scores, indexer_urls)
+    scores = fetch_and_filter_graph_node_versions(scores, indexer_urls)
+    scores["computed_at"] = datetime.now(timezone.utc)
+    return scores
+
+
 def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     """Equal quality metrics for every indexer, real per-indexer pricing from /dips/info.
 
@@ -1759,6 +1781,8 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["last_known_slashable_stake"] = 0.0
     # Never read from the network, so a later run can never take these zeros for stake.
     scores[STAKE_READ_AT] = None
+    # Nor measured from the replay, so these equal scores can never pass for a measurement.
+    scores[QUALITY_MEASURED_AT] = None
     scores["computed_at"] = now
     scores["query_count"] = 0
 

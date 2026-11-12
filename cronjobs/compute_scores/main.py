@@ -15,9 +15,11 @@ from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 
 import pandas as pd
+from carry_over import QUALITY_MEASURED_AT, carried_over
 from iisa_client import IISAPushError, get_push_token
 from processing import (
     compute_all_scores,
+    compute_carried_over_scores,
     compute_degraded_scores,
     validate_geoip_databases,
 )
@@ -45,6 +47,7 @@ class ConfigurationError(Exception):
 
 MODE_FULL = "full"
 MODE_PARTIAL = "partial"
+MODE_CARRIED_OVER = "carried_over"
 MODE_DEGRADED = "degraded"
 MODE_FAILED = "failed"
 
@@ -153,6 +156,34 @@ def _run_full_pipeline(
         return None, MODE_FAILED
 
 
+def _run_carried_over_pipeline(
+    provider: RedpandaProvider, indexer_urls: Dict[str, str]
+) -> tuple[Optional[pd.DataFrame], str]:
+    """For a run that measured nothing: today's prices with the quality, stake and fees an
+    earlier run measured, taken from the scores iisa holds where they are recent enough.
+
+    Returns (None, MODE_FAILED) when nothing can be carried over, so the caller falls back to
+    degraded scoring.
+    """
+    logger.info("Carrying over what an earlier run measured, with today's prices")
+    try:
+        held = provider.held_scores()
+        if held is None:
+            return None, MODE_FAILED
+        carried = carried_over(held, indexer_urls, utc_now())
+        if carried.empty:
+            logger.warning("iisa holds nothing recent enough to carry over")
+            return None, MODE_FAILED
+        scores_df = compute_carried_over_scores(indexer_urls, carried)
+    except Exception as e:
+        logger.exception("Carrying scores over failed: %s", e)
+        return None, MODE_FAILED
+
+    if scores_df.empty:
+        return None, MODE_FAILED
+    return scores_df, MODE_CARRIED_OVER
+
+
 def _run_degraded_pipeline(indexer_urls: Dict[str, str]) -> tuple[Optional[pd.DataFrame], str]:
     """Fallback scoring: equal quality metrics plus real pricing, no Redpanda data needed."""
     logger.info("Running degraded scoring (equal quality + real pricing)")
@@ -189,6 +220,11 @@ def _warn_about_mode(mode: str) -> None:
             "Scoring ran without GeoIP — latency scores are neutral (0.5). "
             "Install MaxMind GeoLite2 databases for full scoring."
         )
+    elif mode == MODE_CARRIED_OVER:
+        logger.warning(
+            "Scoring carried over — full pipeline unavailable, pushed today's prices with the "
+            "quality, stake and fees an earlier run measured."
+        )
     elif mode == MODE_DEGRADED:
         logger.warning("Scoring degraded — full pipeline unavailable, pushed real pricing only.")
     elif mode == MODE_FAILED:
@@ -213,17 +249,39 @@ def _warn_about_missing_stake(
         oldest = read_at[reused].min()
         logger.warning(
             "Stake read at %s (%.0f hours before this run) reused for %d indexer(s), as this run "
-            "could not read it; %d have none",
+            "could not read it",
             oldest.isoformat(),
             (run_started - oldest).total_seconds() / 3600,
             int(reused.sum()),
-            int(stake.isna().sum()),
         )
     elif stake.isna().all():
         logger.warning(
             "Scores pushed without stake data: no indexer has stake or query fees in this "
             "run, so stake-to-fees scores every indexer the same until a run reads stake."
         )
+
+
+def _warn_about_carried_over(
+    scores_df: Optional[pd.DataFrame], mode: str, listed_today: int, run_started: datetime
+) -> None:
+    """Tell operators how old the oldest carried-over quality and stake are and how many of
+    today's indexers went out with them; the rest have no score until a run measures them.
+    """
+    if scores_df is None or mode != MODE_CARRIED_OVER:
+        return
+    measured = pd.to_datetime(scores_df[QUALITY_MEASURED_AT], utc=True).min()
+    read = pd.to_datetime(scores_df[STAKE_READ_AT], utc=True).min()
+    logger.warning(
+        "Quality measured at %s (%.0f hours before this run) and stake read at %s (%.0f hours "
+        "before this run) carried over for %d of today's %d indexer(s), as this run could "
+        "measure nothing; the rest are left out",
+        measured.isoformat(),
+        (run_started - measured).total_seconds() / 3600,
+        read.isoformat(),
+        (run_started - read).total_seconds() / 3600,
+        len(scores_df),
+        listed_today,
+    )
 
 
 def run_scoring() -> bool:
@@ -250,6 +308,8 @@ def run_scoring() -> bool:
     else:
         scores_df, mode = _run_full_pipeline(provider, geoip_available, seed, indexer_urls)
         if scores_df is None:
+            scores_df, mode = _run_carried_over_pipeline(provider, indexer_urls)
+        if scores_df is None:
             scores_df, mode = _run_degraded_pipeline(indexer_urls)
 
     elapsed = time.time() - pipeline_start
@@ -261,6 +321,7 @@ def run_scoring() -> bool:
 
     _warn_about_mode(mode)
     _warn_about_missing_stake(scores_df, mode, run_started)
+    _warn_about_carried_over(scores_df, mode, len(indexer_urls or {}), run_started)
 
     logger.info(
         "Scoring complete: mode=%s, indexers=%d, elapsed=%.1fs, peak_memory=%.0fMB",

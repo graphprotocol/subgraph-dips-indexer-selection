@@ -23,11 +23,11 @@ STAKE_COLUMNS = ["stake_to_fees", "total_query_fees", "last_known_slashable_stak
 # stake the run does not have, and in the fallback scores, which never read stake.
 STAKE_READ_AT = "stake_read_at"
 
-# A reading may be reused while it is less than this old. The job runs daily at 09:00 UTC, so a
-# failed run finds stake about 24 hours old, the next about 48 and the next about 72. 60 sits
-# halfway between the 2nd and 3rd, so exactly 2 runs in a row can reuse a reading and a slow
-# or late run does not change which ones do.
-STAKE_REUSE_LIMIT = timedelta(hours=60)
+# A stake reading or a quality measurement may be reused while it is less than this old. The
+# job runs daily at 09:00 UTC, so a failed run finds one about 24 hours old, the next about 48
+# and the next about 72. 60 sits halfway between the 2nd and 3rd, so exactly 2 runs in a row
+# can reuse it and a slow or late run does not change which ones do.
+REUSE_LIMIT = timedelta(hours=60)
 
 
 def utc_now() -> datetime:
@@ -53,13 +53,13 @@ def stake_to_fees(stake: pd.Series, fees: pd.Series) -> pd.Series:
 def reusable_stake(reply: Any, now: datetime) -> pd.DataFrame:
     """The stake in iisa's GET /scores reply that may still be reused at now, as a stake answer.
 
-    A row counts only with a read time less than STAKE_REUSE_LIMIT before now, so neither the
+    A row counts only with a read time less than REUSE_LIMIT before now, so neither the
     fallback scores, which never read stake, nor scores pushed before read times were recorded
     are reused. A reused row keeps its original read time, so reuse cannot chain for ever. Its
     stake and fees must be numbers of at least 0, and their ratio is worked out again from them.
     An indexer listed more than once is left out, since its rows could disagree.
     """
-    rows = _held_rows(reply)
+    rows = held_rows(reply)
     checked = [_check_row(row, now) for row in rows]
     usable = [row for row in checked if isinstance(row, dict)]
     listed = Counter(row["indexer"] for row in usable)
@@ -75,7 +75,33 @@ def reusable_stake(reply: Any, now: datetime) -> pd.DataFrame:
     return _stake_answer(usable) if usable else no_stake()
 
 
-def _held_rows(reply: Any) -> list[dict]:
+def leave_out_unread(merged: pd.DataFrame, lookup_started: datetime) -> pd.DataFrame:
+    """On a run that reused an earlier stake reading, leave out the indexers that have none.
+
+    A reading stamped before this run's lookup began can only be a reused one. An indexer with
+    no reading would then go out with stake missing beside indexers with real stake, and iisa
+    scores missing stake as the best: a rank nobody measured. So it waits for a run that reads
+    its stake. When no indexer has a reading, every row is kept, as stake is then missing for
+    all alike; and when the lookup worked, nothing was reused and every row is kept too.
+    """
+    if STAKE_READ_AT not in merged.columns:
+        return merged
+    read_at = pd.to_datetime(merged[STAKE_READ_AT], utc=True)
+    unread = read_at.isna()
+    if not (read_at < lookup_started).any() or not unread.any():
+        return merged
+    left_out = merged.loc[unread, "indexer"].tolist()
+    logger.warning(
+        "Left %d indexer(s) out of today's scores: this run could not read stake and iisa holds "
+        "no reading under %.0f hours old for them: %s",
+        len(left_out),
+        REUSE_LIMIT.total_seconds() / 3600,
+        ", ".join(left_out[:10]) + (" and others" if len(left_out) > 10 else ""),
+    )
+    return merged[~unread].reset_index(drop=True)
+
+
+def held_rows(reply: Any) -> list[dict]:
     """The rows of a GET /scores reply, or none when the reply is not shaped like one."""
     records = reply.get("scores") if isinstance(reply, dict) else None
     if not isinstance(records, list):
@@ -97,12 +123,12 @@ def _stake_answer(rows: list[dict]) -> pd.DataFrame:
 def _check_row(row: dict, now: datetime) -> Union[dict, str]:
     """The parts of 1 held row a run may reuse, or why it may not."""
     indexer = row.get("indexer")
-    read_at = _read_time(row.get(STAKE_READ_AT))
+    read_at = read_time(row.get(STAKE_READ_AT))
     stake = _amount(row.get("last_known_slashable_stake"))
     fees = _amount(row.get("total_query_fees"))
     if read_at is None:
         return "without a read time"
-    if not timedelta(0) <= now - read_at < STAKE_REUSE_LIMIT:
+    if not timedelta(0) <= now - read_at < REUSE_LIMIT:
         return "read too long ago or in the future"
     if not isinstance(indexer, str) or stake is None or fees is None:
         return "with an unreadable indexer, stake or fees"
@@ -114,7 +140,7 @@ def _check_row(row: dict, now: datetime) -> Union[dict, str]:
     }
 
 
-def _read_time(value: Any) -> Optional[datetime]:
+def read_time(value: Any) -> Optional[datetime]:
     """A read time as the job writes it, ISO text; anything else is not a read time."""
     if not isinstance(value, str):
         return None

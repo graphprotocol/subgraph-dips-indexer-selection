@@ -31,7 +31,7 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import base58
 import numpy as np
@@ -41,7 +41,6 @@ from iisa_client import IISAPushError, get_push_token, get_scores, post_scores
 from stake_reads import (
     STAKE_COLUMNS,
     STAKE_READ_AT,
-    no_stake,
     reusable_stake,
     stake_to_fees,
     utc_now,
@@ -584,7 +583,8 @@ class RedpandaProvider:
         Returns a DataFrame indexed by 'indexer' with the STAKE_COLUMNS and the time the stake was
         read, matching the schema expected by compute_all_scores. When the subgraph cannot be read
         it holds what an earlier run read, from the scores iisa holds, where that reading may
-        still be reused; any indexer without one has its stake and fees sent as missing.
+        still be reused. An indexer without one is then left out of the scores; if no indexer
+        has one, the answer is empty and stake and fees go out as missing for all.
         """
         logger.info("Fetching stake data from %s", redact_url(self.graph_network_url))
         try:
@@ -625,14 +625,21 @@ class RedpandaProvider:
 
     def _stake_from_an_earlier_read(self) -> pd.DataFrame:
         """The stake an earlier run read, from the scores iisa holds, where it may be reused."""
+        return reusable_stake(self.held_scores(), utc_now())
+
+    def held_scores(self) -> Any:
+        """iisa's reply to GET /scores, the scores it holds from earlier runs; None, after
+        logging why, when it cannot be read, which leaves a run nothing to reuse.
+        """
         try:
-            reply = get_scores(self._iisa_api_url, self._iisa_push_token)
+            return get_scores(self._iisa_api_url, self._iisa_push_token)
         except (IISAPushError, ValueError) as e:
             logger.warning(
-                "Could not read the scores iisa holds, so no earlier stake is reused: %s", e
+                "Could not read the scores iisa holds, so nothing an earlier run measured is "
+                "reused: %s",
+                e,
             )
-            return no_stake()
-        return reusable_stake(reply, utc_now())
+            return None
 
     def write_scores(self, scores_df: pd.DataFrame) -> None:
         """
