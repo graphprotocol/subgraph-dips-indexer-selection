@@ -921,6 +921,7 @@ class TestFetchStakeToFees:
             "stake_to_fees",
             "total_query_fees",
             "last_known_slashable_stake",
+            "stake_read_at",
         ]
         assert list(result.columns) == expected_cols
 

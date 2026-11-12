@@ -11,7 +11,7 @@ import random
 import resource
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 
 import pandas as pd
@@ -22,6 +22,7 @@ from processing import (
     validate_geoip_databases,
 )
 from redpanda import RedpandaProvider
+from stake_reads import STAKE_READ_AT, utc_now
 from subgraph import discover_indexers_from_network_subgraph, subgraph_url_problem
 
 logging.basicConfig(
@@ -194,9 +195,41 @@ def _warn_about_mode(mode: str) -> None:
         logger.error("Scoring failed")
 
 
+def _warn_about_missing_stake(
+    scores_df: Optional[pd.DataFrame], mode: str, run_started: datetime
+) -> None:
+    """Tell operators when measured scores went out with stake an earlier run read, or with no
+    stake for any indexer, both of which happen when this run could not read stake.
+    """
+    if scores_df is None or mode not in (MODE_FULL, MODE_PARTIAL):
+        return
+    stake = scores_df.get("last_known_slashable_stake")
+    if stake is None or stake.empty:
+        return
+    no_read_times = pd.Series(None, index=scores_df.index, dtype=object)
+    read_at = pd.to_datetime(scores_df.get(STAKE_READ_AT, no_read_times), utc=True, errors="coerce")
+    reused = read_at < run_started
+    if reused.any():
+        oldest = read_at[reused].min()
+        logger.warning(
+            "Stake read at %s (%.0f hours before this run) reused for %d indexer(s), as this run "
+            "could not read it; %d have none",
+            oldest.isoformat(),
+            (run_started - oldest).total_seconds() / 3600,
+            int(reused.sum()),
+            int(stake.isna().sum()),
+        )
+    elif stake.isna().all():
+        logger.warning(
+            "Scores pushed without stake data: no indexer has stake or query fees in this "
+            "run, so stake-to-fees scores every indexer the same until a run reads stake."
+        )
+
+
 def run_scoring() -> bool:
     """Run one scoring cycle. Returns True on success."""
     pipeline_start = time.time()
+    run_started = utc_now()
     logger.info("Starting score computation")
 
     # Seed RNGs for deterministic scoring given the same input data.
@@ -227,6 +260,7 @@ def run_scoring() -> bool:
         mode = MODE_FAILED
 
     _warn_about_mode(mode)
+    _warn_about_missing_stake(scores_df, mode, run_started)
 
     logger.info(
         "Scoring complete: mode=%s, indexers=%d, elapsed=%.1fs, peak_memory=%.0fMB",

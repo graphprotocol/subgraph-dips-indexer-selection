@@ -37,7 +37,15 @@ import base58
 import numpy as np
 import pandas as pd
 from gateway_queries_pb2 import ClientQueryProtobuf  # type: ignore[attr-defined]
-from iisa_client import get_push_token, post_scores
+from iisa_client import IISAPushError, get_push_token, get_scores, post_scores
+from stake_reads import (
+    STAKE_COLUMNS,
+    STAKE_READ_AT,
+    no_stake,
+    reusable_stake,
+    stake_to_fees,
+    utc_now,
+)
 from subgraph import (
     SubgraphResponseError,
     paginate_subgraph_query,
@@ -573,15 +581,22 @@ class RedpandaProvider:
         Fees come from self._fees_per_indexer, populated during _count_pass
         by summing fee_grt across all indexer attempts in the 28-day window.
 
-        Returns a DataFrame indexed by 'indexer' with a 'stake_to_fees' column,
-        matching the schema expected by compute_all_scores.
+        Returns a DataFrame indexed by 'indexer' with the STAKE_COLUMNS and the time the stake was
+        read, matching the schema expected by compute_all_scores. When the subgraph cannot be read
+        it holds what an earlier run read, from the scores iisa holds, where that reading may
+        still be reused; any indexer without one has its stake and fees sent as missing.
         """
         logger.info("Fetching stake data from %s", redact_url(self.graph_network_url))
         try:
             indexers = self._paginate_graphql_indexers()
         except Exception:
-            logger.exception("Failed to fetch stake data from subgraph")
-            return pd.DataFrame(columns=["stake_to_fees"])
+            logger.exception(
+                "Failed to fetch stake data from the network subgraph at %s; scoring carries on "
+                "with the stake an earlier run read where that is recent enough, else none",
+                redact_url(self.graph_network_url),
+            )
+            return self._stake_from_an_earlier_read()
+        read_at = utc_now()
 
         df = pd.DataFrame(indexers)
         df = df.rename(columns={"id": "indexer"})
@@ -592,13 +607,12 @@ class RedpandaProvider:
         # Map fee totals from the Redpanda replay onto subgraph indexers.
         df["total_query_fees"] = df["indexer"].map(self._fees_per_indexer).fillna(0.0)
 
-        # stake_to_fees = slashable_stake / total_fees. Indexers with zero fees
-        # get NaN (division by zero produces NULL / NaN).
-        df["stake_to_fees"] = df["last_known_slashable_stake"] / df["total_query_fees"].replace(
-            0.0, float("nan")
+        df["stake_to_fees"] = stake_to_fees(
+            df["last_known_slashable_stake"], df["total_query_fees"]
         )
 
-        df = df[["indexer", "stake_to_fees", "total_query_fees", "last_known_slashable_stake"]]
+        df[STAKE_READ_AT] = pd.Timestamp(read_at)
+        df = df[["indexer", *STAKE_COLUMNS, STAKE_READ_AT]]
         df = df.set_index("indexer")
 
         matched = df["stake_to_fees"].notna().sum()
@@ -608,6 +622,17 @@ class RedpandaProvider:
             matched,
         )
         return df
+
+    def _stake_from_an_earlier_read(self) -> pd.DataFrame:
+        """The stake an earlier run read, from the scores iisa holds, where it may be reused."""
+        try:
+            reply = get_scores(self._iisa_api_url, self._iisa_push_token)
+        except (IISAPushError, ValueError) as e:
+            logger.warning(
+                "Could not read the scores iisa holds, so no earlier stake is reused: %s", e
+            )
+            return no_stake()
+        return reusable_stake(reply, utc_now())
 
     def write_scores(self, scores_df: pd.DataFrame) -> None:
         """

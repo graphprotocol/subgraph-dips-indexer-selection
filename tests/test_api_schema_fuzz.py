@@ -53,6 +53,7 @@ def _score_record(indexer: str, **overrides: Any) -> dict[str, Any]:
         "stake_to_fees": 1_500.0,
         "total_query_fees": 2_000.0,
         "last_known_slashable_stake": 3_000_000.0,
+        "stake_read_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
         "norm_uptime_score": 0.9,
         "norm_success_rate": 0.85,
         "org": "Example Hosting",

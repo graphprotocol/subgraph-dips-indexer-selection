@@ -175,10 +175,12 @@ def post_sync_status(iisa_api_url: str, token: Optional[str], payload: dict) -> 
 
 
 def get_scores(iisa_api_url: str, token: Optional[str]) -> Any:
-    """Fetch the loaded scores, {"computed_at", "count", "scores": [records]}, from iisa.
+    """Fetch the scores iisa holds, {"computed_at", "count", "scores": [records]}.
 
-    The freshness prober reads which chains each indexer offers DIPs on from it.
-    Raises IISAPushError on failure after all retries exhausted.
+    The score job reads the stake an earlier run pushed from it when it cannot read stake
+    itself, and the freshness prober reads which chains each indexer offers DIPs on. Raises
+    IISAPushError on failure after all retries exhausted, and ValueError when the reply is
+    not JSON.
     """
     url = f"{_require_url(iisa_api_url)}/scores"
     response = _request_with_retry("GET", url, token=token)

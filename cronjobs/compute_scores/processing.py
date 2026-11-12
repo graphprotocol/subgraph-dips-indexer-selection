@@ -33,6 +33,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from stake_reads import STAKE_READ_AT
 
 if TYPE_CHECKING:
     import aiohttp
@@ -1059,6 +1060,7 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     scores["stake_to_fees"] = merged.get("stake_to_fees")
     scores["total_query_fees"] = merged.get("total_query_fees", 0.0)
     scores["last_known_slashable_stake"] = merged.get("last_known_slashable_stake", 0.0)
+    scores[STAKE_READ_AT] = merged.get(STAKE_READ_AT)
 
     # Organization/location
     scores["org"] = merged.get("org")
@@ -1755,6 +1757,8 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["dst_lon"] = None
     scores["total_query_fees"] = 0.0
     scores["last_known_slashable_stake"] = 0.0
+    # Never read from the network, so a later run can never take these zeros for stake.
+    scores[STAKE_READ_AT] = None
     scores["computed_at"] = now
     scores["query_count"] = 0
 
