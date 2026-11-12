@@ -1,5 +1,45 @@
 # Changelog
 
+## [2.11.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.10.2...v2.11.0) (2026-11-12)
+
+
+### Added
+
+* **api:** add a token that can read but not push ([#405](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/405)) ([9114753](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/9114753afa3d4900285973c9a5320f3bb7436449))
+* **cronjob:** check indexer freshness through the gateway ([#408](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/408)) ([2b34b39](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/2b34b39f350dbf6d4272941fd444f241cb9ab2ba))
+* **cronjob:** only count freshness failures the indexer caused ([#409](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/409)) ([118ca32](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/118ca3233bd8e7056c482f68b6b555d313270b55))
+* **selection:** check synced claims through the gateway ([#423](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/423)) ([b9ef264](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/b9ef264867391ed69430d9665f3a72e28fa8bf3f))
+* **service:** leave stale indexers out on enforced chains ([#411](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/411)) ([40f7d9c](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/40f7d9c3c2cd470ffba5be14719455502017d8ee))
+* **service:** record freshness checks and stale marks ([#406](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/406)) ([e1dedd8](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/e1dedd85e5d035e9f4a9e9f5e24c3663662c99d6))
+
+
+### Fixed
+
+* **api:** refuse unknown or oversized selection requests ([#403](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/403)) ([e2d4e7a](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/e2d4e7ae78bd18d77e7d6adea156af13cf2d398e))
+* **api:** stop counting sync status once it is 6 hours old ([#413](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/413)) ([942746e](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/942746e9e38fd19f7aba8e8e00a493f8b9c61d13))
+* **cronjob:** carry scores over when the whole run fails ([#419](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/419)) ([ddcb406](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ddcb406c49f4e46fd37486006cfef7412c42dd30))
+* **cronjob:** keep freshness checks from silently stopping ([#424](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/424)) ([d1c4265](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/d1c42657afa809237171eff0066c1545039ee141))
+* **cronjob:** read indexer replies whole and only up to a limit ([#401](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/401)) ([4d8d8b1](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/4d8d8b1fa08e198aa3e56d357b525164817deb94))
+* **cronjob:** reuse recent stake when the stake lookup fails ([#415](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/415)) ([387a59c](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/387a59cb49022385ca4d0d941e3240878da36ab4))
+* **cronjob:** stop indexers forging or flooding log lines ([#402](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/402)) ([ae637a9](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ae637a937f97a40e1f67701981620992c78fb25d))
+* **fetcher:** trust a sync claim only with an allocation ([#404](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/404)) ([021c482](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/021c48250cec39c1926086f4cdaf5cf94be15b66))
+* **selection:** stop a weak synced pick blocking a replacement ([#425](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/425)) ([c3e1a5b](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/c3e1a5b4e4b2d212ef76da69bb923bb5512ac793))
+
+
+### Changed
+
+* **cronjob:** remove the same-day skip check nothing calls ([#416](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/416)) ([23e888d](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/23e888de60fa20886781c2631cefb3df1744f5df))
+* **deps:** bump pytest-asyncio from 1.4.1 to 1.4.1.post1 ([#397](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/397)) ([d2cbe48](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/d2cbe482f82116160b5dd9ad1669707856eb1a6e))
+* **deps:** bump the cronjob-python group across 1 directory with 3 updates ([#394](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/394)) ([b241b97](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/b241b97d3c7987e965f2baf63a7880ee598b906b))
+* **deps:** bump the service-python group with 4 updates ([#395](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/395)) ([51b8e50](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/51b8e5095c628cbafc8d6d8b5cd5f8d899ace8ba))
+* **deps:** bump types-requests from 2.33.0.20261006 to 2.33.0.20261030 ([#396](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/396)) ([0ca774e](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/0ca774ed65a15374b87acd1042d49bec4c1a54d4))
+* **k8s:** update cronjob image to sha-118ca32 ([#429](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/429)) ([833986c](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/833986c859476a981587bf613c09215c61378a5b))
+
+
+### Documentation
+
+* **readme:** explain how an extreme stake-to-fees ratio scores ([#407](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/407)) ([80d1adb](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/80d1adba553912356b241d526c0abaf1ee3361e7))
+
 ## [2.10.2](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.10.1...v2.10.2) (2026-11-03)
 
 
