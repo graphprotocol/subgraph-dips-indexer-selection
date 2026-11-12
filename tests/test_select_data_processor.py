@@ -854,6 +854,43 @@ class TestSwapHelpers:
             assert swap[:2] == expected[:2]
             assert swap[2] == pytest.approx(expected[2])
 
+    def test_swap_for_passes_over_a_synced_candidate_that_gains_too_little(self):
+        """C is synced, so it is tried first, but it gains only 0.45 on A. D is not synced and
+        gains 0.75, so D replaces A: the preferred candidate falling short must not keep a
+        failing indexer in place.
+        """
+        processor = _selector_with_scores(self.SCORES, ["A", "B", "X"], synced_indexers={"c"})
+
+        swap = processor._swap_for("A")
+
+        assert swap is not None and swap[:2] == ("A", "D")
+        assert swap[2] == pytest.approx(0.75)
+
+    def test_swap_for_still_prefers_a_synced_candidate_that_gains_enough(self):
+        """C, synced, gains 0.60 on A, which is enough, so it is picked ahead of the better D."""
+        scores = {**self.SCORES, "C": 0.65}
+        processor = _selector_with_scores(scores, ["A", "B", "X"], synced_indexers={"c"})
+
+        swap = processor._swap_for("A")
+
+        assert swap is not None and swap[:2] == ("A", "C")
+
+    def test_swap_for_makes_no_swap_when_nobody_gains_enough(self):
+        """C is synced and D is not, and neither gains more than 0.50 on A, so A stays."""
+        scores = {**self.SCORES, "D": 0.55}
+        processor = _selector_with_scores(scores, ["A", "B", "X"], synced_indexers={"c"})
+
+        assert processor._swap_for("A") is None
+
+    def test_a_synced_candidate_that_gains_too_little_does_not_block_the_replacement(self):
+        """The whole replacement step: A is failing, synced C gains too little, D replaces A."""
+        scores = {"A": 0.05, "C": 0.50, "D": 0.80, "E": 0.90}
+        processor = _selector_with_scores(scores, ["A", "E"], synced_indexers={"c"})
+
+        processor._replace_underperforming_indexers()
+
+        assert processor.current_group == ["E", "D"]
+
     def test_find_best_swap_skips_indexers_added_this_call(self):
         processor = _selector_with_scores(self.SCORES, ["A", "B", "C"])
 
