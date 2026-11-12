@@ -265,13 +265,12 @@ def _rejected_by_push_checks(case: schemathesis.Case, response: schemathesis.Res
 
 def _rejected_by_freshness_checks(case: schemathesis.Case, response: schemathesis.Response) -> bool:
     """True when a freshness push got a 422 only from the checks its schema can't state: the
-    minute is a whole minute with a time zone and not ahead of the service's clock, and no
-    indexer and chain is listed twice.
+    minute is a whole minute with a time zone and not ahead of the service's clock.
     """
     if (case.method, case.path, response.status_code) != ("POST", "/freshness", 422):
         return False
     return all(
-        error["type"] == "value_error" and error["loc"] in (["body"], ["body", "minute"])
+        error["type"] == "value_error" and error["loc"] == ["body", "minute"]
         for error in response.json()["detail"]
     )
 
