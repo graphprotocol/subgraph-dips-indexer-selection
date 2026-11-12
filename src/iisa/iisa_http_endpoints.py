@@ -9,7 +9,8 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (read token)
 - GET /dips-indexers - Indexers selection would pick for a required ?chain (read token)
 - POST /sync-status - Push sync-status snapshot from the fetcher (push token)
-- POST, GET /freshness - Push 1 minute of freshness outcomes; read the stale marks (push token)
+- POST /freshness - Push 1 minute of freshness outcomes from the prober (push token)
+- GET /freshness - Return each indexer's stale mark and freshness counts, by chain (read token)
 - POST /get-score - Return weighted score and components for one indexer (read token)
 - POST /select-indexers - Select optimal indexers for a deployment
 """
@@ -95,8 +96,8 @@ class Settings(BaseSettings):
     # iisa accepting unauthenticated pushes. Default off for compose/local dev.
     require_push_token: bool = False
     # Optional bearer token for callers that only read, such as dipper. The endpoints that only
-    # read accept it as well as push_token; POST /scores and POST /sync-status accept only
-    # push_token. Unset, reads need push_token as before.
+    # read accept it as well as push_token; POST /scores, POST /sync-status and POST /freshness
+    # accept only push_token. Unset, reads need push_token as before.
     read_token: Optional[str] = None
 
     @field_validator("push_token", "read_token")
@@ -1298,7 +1299,7 @@ def freshness_report(
     authorization: Optional[str] = Header(None),
 ) -> FreshnessResponse:
     """Each indexer's stale mark, last 10 minutes, latest outcome and 28-day counts, by chain."""
-    _require_push_token(authorization)
+    _require_read_token(authorization)
     return FreshnessResponse.model_validate(_state.freshness.snapshot())
 
 
