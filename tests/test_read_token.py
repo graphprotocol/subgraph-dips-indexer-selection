@@ -2,7 +2,7 @@
 
 Dipper only reads from this service, but held the 1 token that also pushes the scores and sync
 status deciding who is paid. With IISA_READ_TOKEN set, the endpoints that only read accept it as
-well as the push token, and the 2 that push accept only the push token. Unset, nothing changes.
+well as the push token, and the 3 that push accept only the push token. Unset, nothing changes.
 """
 
 import json
@@ -53,12 +53,22 @@ def _score_record(indexer: str) -> dict:
     }
 
 
+def _freshness_push() -> dict:
+    """1 indexer's outcome for a minute a little in the past, which the service accepts."""
+    minute = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=2)
+    return {
+        "minute": minute.isoformat().replace("+00:00", "Z"),
+        "outcomes": [{"indexer": INDEXER, "chain": CHAIN, "outcome": "pass"}],
+    }
+
+
 READS = [
     pytest.param("GET", "/scores/status", None, id="scores-status"),
     pytest.param("GET", "/scores", None, id="scores"),
     pytest.param("GET", "/scores/weighted", None, id="scores-weighted"),
     pytest.param("GET", f"/dips-indexers?chain={CHAIN}", None, id="dips-indexers"),
     pytest.param("POST", "/get-score", {"indexer_id": INDEXER}, id="get-score"),
+    pytest.param("GET", "/freshness", None, id="freshness"),
 ]
 WRITES = [
     pytest.param("POST", "/scores", [_score_record(INDEXER)], id="push-scores"),
@@ -68,6 +78,7 @@ WRITES = [
         {INDEXER: {"deployments": ["QmOne"], "fetched_at": datetime.now(timezone.utc).isoformat()}},
         id="push-sync-status",
     ),
+    pytest.param("POST", "/freshness", _freshness_push(), id="push-freshness"),
 ]
 
 
@@ -83,6 +94,7 @@ def tokens(monkeypatch, tmp_path):
                 monkeypatch.setenv(name, value)
         monkeypatch.delenv("IISA_REQUIRE_PUSH_TOKEN", raising=False)
         monkeypatch.setenv("IISA_SYNC_STATUS_FILE_PATH", str(tmp_path / "sync_status.json"))
+        monkeypatch.setenv("IISA_FRESHNESS_FILE_PATH", str(tmp_path / "freshness.json"))
         monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
         iisa_http_endpoints.get_settings.cache_clear()
         state = iisa_http_endpoints.IISAState()
