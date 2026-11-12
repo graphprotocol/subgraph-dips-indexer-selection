@@ -620,6 +620,20 @@ class TestSettings:
     def test_an_address_and_a_key_switch_it_on(self):
         assert endpoints.sync_claim_checker(Settings(_env_file=None, **self.GATEWAY)) is not None
 
+    @pytest.mark.parametrize("scheme, warned", [("http", True), ("https", False)])
+    def test_a_plain_http_address_is_warned_about_at_startup(self, scheme, warned, caplog):
+        """Over plain http the API key travels unencrypted with every check. The warning
+        leaves the address out, since some gateway addresses carry a key themselves.
+        """
+        address = f"{scheme}://gateway.example/api/key-in-the-address"
+        settings = Settings(_env_file=None, **{**self.GATEWAY, "sync_check_gateway_url": address})
+
+        endpoints.sync_claim_checker(settings)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("unencrypted" in message for message in warnings) is warned
+        assert not any("key-in-the-address" in message for message in warnings)
+
     @pytest.mark.parametrize(
         "changes",
         [

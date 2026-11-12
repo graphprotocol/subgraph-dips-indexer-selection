@@ -146,6 +146,12 @@ def sync_claim_checker(settings: Settings) -> Optional[SyncClaimChecker]:
     url, key = settings.sync_check_gateway_url, settings.sync_check_gateway_api_key
     if url is None or key is None:
         return None
+    if url.startswith("http://"):
+        # The address stays out of the log: some gateway addresses carry a key themselves.
+        logger.warning(
+            "IISA_SYNC_CHECK_GATEWAY_URL is a plain http:// address, so the gateway API key "
+            "is sent unencrypted with every check of a synced claim"
+        )
     return SyncClaimChecker(
         url, key, settings.sync_check_timeout_seconds, settings.sync_check_bar_seconds
     )
