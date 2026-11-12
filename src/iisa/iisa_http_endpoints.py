@@ -1707,8 +1707,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
 
 async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionResponse:
-    """_select_with_processor, with the synced claims the selection weighs checked through
-    the gateway first, when the check is switched on.
+    """_select_with_processor, with the synced claims that put a candidate ahead checked
+    through the gateway first, when the check is switched on.
     """
     selection = _prepare_selection(request)
     if isinstance(selection, SelectionResponse):
@@ -1722,30 +1722,33 @@ async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionRe
 async def _with_claims_checked(
     selection: _Selection, processor: IndexerSelector, checker: SyncClaimChecker
 ) -> IndexerSelector:
-    """When the selection weighed a synced claim, check every claim it weighed through the
-    gateway at once, and select again counting only the claims that were confirmed.
+    """Check, through the gateway and all at once, the claim of every candidate the selection
+    put ahead because it says it has synced, and select again if any was not confirmed.
 
-    A selection weighs claims each time it looks for an indexer to add or swap in and a
-    candidate makes the claim, whether or not that candidate is the one picked. Every claim
-    weighed is then checked: each candidate's, and each group member's, since a synced member
-    makes a synced candidate need a minimum score. Nothing is checked for a group that needs
-    nobody new, or when no candidate makes the claim. Beyond MAX_CHECKS_PER_SELECTION claims,
-    members come first, then candidates by score, and the rest are set aside unchecked. An
-    indexer whose claim is set aside still competes on its score.
+    Only candidates are asked, and only those whose claim could win them a place: every
+    candidate making the claim while no group member makes it, and those scoring at least
+    0.60 once a member does. Group members are never asked, and nothing is asked when the
+    selection had no need to look for an indexer to add or swap in. Beyond
+    MAX_CHECKS_PER_SELECTION the best scores are asked and the rest are set aside unchecked.
+
+    The second selection counts the group members' claims as given and, among candidates,
+    only the claims that were confirmed. An indexer whose claim is not counted still competes
+    on its score.
     """
     request = selection.request
-    claimants = list(dict.fromkeys(indexer.lower() for indexer in processor.claims_weighed()))
-    if not claimants:
-        return processor
+    claimants = list(dict.fromkeys(indexer.lower() for indexer in processor.preferred_on_a_claim()))
     asked = claimants[:MAX_CHECKS_PER_SELECTION]
     not_asked = claimants[MAX_CHECKS_PER_SELECTION:]
+    if not asked:
+        return processor
     unconfirmed = await checker.unconfirmed(request.deployment_id, asked)
     _log_claim_checks(request.deployment_id, asked, unconfirmed, not_asked)
-    set_aside = unconfirmed.keys() | set(not_asked)
-    if not set_aside:
+    if not unconfirmed and not not_asked:
         return processor
-    synced = {indexer.lower() for indexer in selection.synced}
-    return _build_selector(request, selection.history, synced - set_aside)
+    members = {indexer.lower() for indexer in processor.initial_group}
+    claims = {indexer.lower() for indexer in selection.synced}
+    confirmed = set(asked) - unconfirmed.keys()
+    return _build_selector(request, selection.history, (claims & members) | confirmed)
 
 
 def _log_claim_checks(

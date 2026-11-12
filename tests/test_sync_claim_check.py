@@ -5,7 +5,7 @@ indexer's own word, so before such a pick goes back to dipper the service can as
 through the gateway for the deployment's latest block, as a paying customer would. The claim
 counts only if the indexer signed the answer and the block is recent. A claim that is not
 confirmed, for whatever reason, loses the preference and the indexer competes on its score.
-Every claim a selection weighs is checked at once: each candidate's and each group member's.
+Every candidate whose claim could win it a place is asked at once; group members never are.
 """
 
 import json
@@ -336,9 +336,10 @@ def _record(indexer: str, success_rate: float, **changes: Any) -> dict[str, Any]
 # By score alone D is the best pick, then C, then B; A is the worst. The rates sit close
 # together because a success rate under 97% of the best scores 0, which would tie A, B and C.
 RECORDS = [_record(A, 0.970), _record(B, 0.975), _record(C, 0.980), _record(D, 0.990)]
-# M is a weak indexer scoring about 0.41: under the 0.60 a synced candidate needs once the group
-# has a synced member, and not enough to replace anyone. X is a failing one scoring about 0.03,
-# which selection replaces when a candidate beats it by more than 0.50.
+# M is a weak indexer scoring under 0.45: less than the 0.60 a synced candidate needs once the
+# group has a synced member, and not enough to replace anyone. Beside it A, B, C and D all score
+# over 0.60. X is a failing indexer scoring about 0.03, which selection replaces when a candidate
+# beats it by more than 0.50.
 _WEAK = {"uptime_score": 0.5, "stake_to_fees": 0.0001}
 _FAILING = {
     **_WEAK,
@@ -390,8 +391,8 @@ async def _pick(
 
 
 class TestSelection:
-    """When selection weighs a synced claim, every claim it weighed is checked at once, and
-    selection then counts only the claims that were confirmed.
+    """When a claim puts candidates ahead, each of them is asked at once, and selection then
+    counts only the claims that were confirmed. Group members are never asked.
     """
 
     async def test_with_no_checker_the_claim_is_taken_on_trust_as_before(self):
@@ -476,28 +477,58 @@ class TestSelection:
         """
         checker = FakeChecker(fail=(M,))
 
-        picked = await _pick({M}, checker, WITH_WEAK_AND_FAILING, existing_indexers=[X])
+        assert await _pick({M}, checker, WITH_WEAK_AND_FAILING, existing_indexers=[X]) == [D]
 
-        assert picked == [D] and checker.asked == [(DEPLOYMENT, [M])]
-
-    async def test_a_members_claim_is_checked_when_it_is_weighed(self):
-        """D is in the group and says it is synced, so M, a weak candidate that says so too,
-        would need a score of 0.60 and C would get the place. D's claim fails the check, which
-        makes M the first synced indexer, and the first gets in at any score.
+    async def test_a_group_member_is_never_asked(self):
+        """D is in the group and says it is synced. That is taken as given, even here where
+        the check would have refused it, and only the candidate A is asked.
         """
         checker = FakeChecker(fail=(D,))
+        group = {"existing_indexers": [D], "num_candidates": 2}
 
-        picked = await _pick({D, M}, checker, WITH_WEAK, existing_indexers=[D], num_candidates=2)
+        assert await _pick({D, A}, checker, WITH_WEAK, **group) == [D, A]
+        assert checker.asked == [(DEPLOYMENT, [A])]
 
-        assert picked == [D, M] and checker.asked == [(DEPLOYMENT, [D, M])]
-
-    async def test_a_member_being_replaced_is_asked_as_a_member(self):
-        """X fails and is replaced, but its claim was weighed first, so it is asked too."""
+    async def test_a_member_being_replaced_is_not_asked(self):
+        """X fails on its score and D replaces it. X's own claim is not checked."""
         checker = FakeChecker()
 
         picked = await _pick({X, D}, checker, WITH_WEAK_AND_FAILING, existing_indexers=[X])
 
-        assert picked == [D] and checker.asked == [(DEPLOYMENT, [X, D])]
+        assert picked == [D] and checker.asked == [(DEPLOYMENT, [D])]
+
+    async def test_a_claim_too_weak_to_count_is_not_asked(self):
+        """With D, a synced member, in the group, a synced candidate needs a score of 0.60 to
+        be put ahead. M is under it, so its claim wins nothing and costs no query; A is asked.
+        """
+        checker = FakeChecker()
+        group = {"existing_indexers": [D], "num_candidates": 2}
+
+        assert await _pick({D, A, M}, checker, WITH_WEAK, **group) == [D, A]
+        assert checker.asked == [(DEPLOYMENT, [A])]
+
+    async def test_a_weak_claim_is_asked_when_it_would_be_the_first_synced(self):
+        """No member is synced, so the first synced candidate gets in at any score and M's weak
+        claim does decide the pick. It is asked, fails, and the place goes to C.
+        """
+        checker = FakeChecker(fail=(M,))
+        group = {"existing_indexers": [D], "num_candidates": 2}
+
+        assert await _pick({M}, checker, WITH_WEAK, **group) == [D, C]
+        assert checker.asked == [(DEPLOYMENT, [M])]
+
+    async def test_after_a_failed_check_only_members_and_confirmed_claims_count(self):
+        """B leads on a claim that fails, so selection runs again. It counts the claim of D, a
+        member, and of A, which was confirmed. M's was too weak to be asked and is left out.
+        """
+        checker = FakeChecker(fail=(B,))
+        group = {"existing_indexers": [D], "num_candidates": 2}
+
+        with patch.object(endpoints, "_build_selector", wraps=endpoints._build_selector) as build:
+            picked = await _pick({D, A, B, M}, checker, WITH_WEAK, **group)
+
+        assert picked == [D, A] and checker.asked == [(DEPLOYMENT, [B, A])]
+        assert build.call_args_list[1].args[2] == {D, A}
 
     async def test_a_claimant_that_cannot_be_picked_is_not_checked(self):
         """B is blocked by the caller, so its claim can win nothing and costs no query."""

@@ -123,8 +123,8 @@ class IndexerSelector:
         self.synced_indexers = {s.lower() for s in synced_indexers} if synced_indexers else set()
         self.current_group: list[IndexerId] = []
         self.initial_group: list[IndexerId] = []
-        # Set once the preference for synced candidates had a candidate to apply to.
-        self._weighed_a_claim = False
+        # Every candidate put ahead of the rest, at any point, because it says it has synced.
+        self._preferred_on_a_claim: set[IndexerId] = set()
 
         self._process_data()
 
@@ -543,36 +543,27 @@ class IndexerSelector:
         """Indexers this request can't pick: already in the group, on the denylist, with a
         pending (unaccepted) agreement on any subgraph, or that declined this subgraph.
         """
-        return set(self.current_group) | self._barred_indexers()
-
-    def _barred_indexers(self) -> set[IndexerId]:
-        """Indexers the caller rules out: on the denylist, with a pending (unaccepted)
-        agreement on any subgraph, or that declined this subgraph.
-        """
         return set(
-            self.indexer_denylist
+            self.current_group
+            + self.indexer_denylist
             + [indexer for pending in self.pending_agreements.values() for indexer in pending]
             + self.declined_indexers.get(self.deployment_id, [])
         )
 
-    def claims_weighed(self) -> list[IndexerId]:
-        """Every indexer whose synced claim this selection weighed, or [] when it weighed none.
+    def preferred_on_a_claim(self) -> list[IndexerId]:
+        """Every candidate this selection put ahead of the rest because it says it has synced
+        the deployment, best score first, whether or not it was then picked. Empty when the
+        selection never looked for an indexer to add or swap in.
 
-        Claims are weighed each time the selection looks for an indexer to add or swap in and
-        a candidate makes the claim, whether or not that candidate is then picked. Listed
-        first are the members of the starting group that make it, since a synced member makes
-        every synced candidate need MIN_SYNCED_THRESHOLD; then the candidates that make it,
-        best score first. Candidates are the scored indexers outside the starting group that
-        are not denied, pending or declined.
+        While no group member says it has synced, that is every candidate making the claim,
+        since the first synced indexer gets in at any score. Once a member does, it is only
+        the candidates scoring at least MIN_SYNCED_THRESHOLD. Members of the starting group are
+        never listed.
         """
-        if not self._weighed_a_claim:
-            return []
-        members = [m for m in self.initial_group if m.lower() in self.synced_indexers]
-        out_of_reach = set(self.initial_group) | self._barred_indexers()
-        within_reach = ~self.data["indexer"].isin(out_of_reach)
-        synced = self.data["indexer"].str.lower().isin(self.synced_indexers)
-        ranked = self.data[within_reach & synced].sort_values(by="weighted_score", ascending=False)
-        return members + cast(list[IndexerId], ranked["indexer"].tolist())
+        listed = self._preferred_on_a_claim - set(self.initial_group)
+        rows = self.data[self.data["indexer"].isin(listed)]
+        ranked = rows.sort_values(by="weighted_score", ascending=False)
+        return cast(list[IndexerId], list(dict.fromkeys(ranked["indexer"])))
 
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None
@@ -658,8 +649,6 @@ class IndexerSelector:
         all_synced_candidates = candidates[
             candidates["indexer"].str.lower().isin(self.synced_indexers)
         ]
-        if not all_synced_candidates.empty:
-            self._weighed_a_claim = True
 
         if group_has_synced:
             # Already have a synced indexer — threshold applies
@@ -670,6 +659,7 @@ class IndexerSelector:
             # No synced indexer yet — first one gets in at any score
             synced = all_synced_candidates
 
+        self._preferred_on_a_claim.update(synced["indexer"])
         unsynced = candidates[~candidates["indexer"].isin(synced["indexer"])]
         logger.info(
             "deployment=%s candidates: %d synced eligible, %d unsynced (group_has_synced=%s)",
