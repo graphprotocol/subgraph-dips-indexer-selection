@@ -54,6 +54,12 @@ class GatewayClient:
         # Error text can carry the request URL; keep any key out of what gets pushed and shown.
         return GatewayUnreachable(redact_url(detail).replace(self._api_key, "<redacted>"))
 
+    def _without_key(self, body: bytes) -> bytes:
+        # A gateway message can repeat the key it was sent. What gets stored is cut short later,
+        # so the key comes out here, whole, before a cut could leave a piece of it behind.
+        key = self._api_key.encode()
+        return body.replace(key, b"<redacted>") if key else body
+
     async def ask(self, deployment: str, indexer: str) -> GatewayResult:
         """Send the query once and return what came back, or why nothing did."""
         if self._session is None:
@@ -69,7 +75,7 @@ class GatewayClient:
                 return GatewayReply(
                     status=response.status,
                     attested=ATTESTATION_HEADER in response.headers,
-                    body=body,
+                    body=self._without_key(body),
                     arrived_at=self._clock(),
                 )
         except asyncio.TimeoutError:
