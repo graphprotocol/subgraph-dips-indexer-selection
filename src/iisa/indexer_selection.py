@@ -507,8 +507,8 @@ class IndexerSelector:
         REPLACEMENT_MARGIN; None otherwise.
 
         A synced candidate is preferred. When that one gains too little, the best candidate
-        whatever its sync status is tried, so the preference never keeps a failing indexer
-        that selection would replace if nobody were synced.
+        whatever its sync status is tried, so a synced candidate that falls short does not
+        end the search for this indexer's replacement.
         """
         current_score = self._score_of(existing_indexer)
         if current_score is None:
