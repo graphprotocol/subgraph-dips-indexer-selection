@@ -85,7 +85,8 @@ the new one could not make its first push.
 These secrets are created out of band and are never committed:
 
 - `iisa-redpanda-credentials` - Redpanda bootstrap servers, SASL username and
-  password, and the Graph Network subgraph URL (the URL embeds an API key).
+  password, and the Graph Network subgraph URL (the URL embeds an API key). Optionally
+  `FRESHNESS_GATEWAY_API_KEY`, the gateway API key the freshness prober pays its checks with.
 - `iisa-push-token` - the bearer token the CronJob and the sync-status fetcher use to
   authenticate their pushes;
   the service rejects pushes without it.
@@ -116,6 +117,15 @@ supplies to choose what the job scores: `REDPANDA_TOPIC` (for example
 `gateway_queries_testnet`) and `REDPANDA_GATEWAY_IDS`. If the ConfigMap or its
 `REDPANDA_TOPIC` key is missing, the run fails with `REDPANDA_TOPIC is required` rather
 than falling back to the mainnet `gateway_queries` topic.
+
+The sync-status fetcher loads the same ConfigMap when it exists, for the freshness prober's
+`FRESHNESS_*` settings other than its API key, because the gateway and the address it pays
+indexers from differ between networks. The prober runs only when `FRESHNESS_PROBE_ENABLED`
+is `true`, `1` or `yes`, and stays off when it is unset, `false`, `0` or `no`. Any other
+value, or a prober switched on with a setting missing or out of range, stops the fetcher
+from starting, and with it the sync-status pushes, so check the fetcher's log after a
+change. A pod reads the ConfigMap and the secret only when it starts, so a change takes
+effect after `kubectl rollout restart deployment/sync-status-fetcher` in that namespace.
 
 Geo-location data uses MaxMind GeoLite2, downloaded into the CronJob image at build
 time, so no geo API key is needed at runtime.
