@@ -259,9 +259,11 @@ class TestTheRequestItself:
         assert time.monotonic() - started < 1.2
 
 
-def _record(indexer: str, success_rate: float) -> dict[str, Any]:
-    """One scored indexer; a higher success rate gives a higher score, all else equal."""
-    return {
+def _record(indexer: str, success_rate: float, **changes: Any) -> dict[str, Any]:
+    """One scored indexer, in its own organisation and place, so any 2 make a group selection
+    accepts; a higher success rate gives a higher score, all else equal.
+    """
+    record = {
         "indexer": indexer,
         "url": f"https://{indexer[2:8]}.example/",
         "lat_lin_reg_coefficient": 0.012,
@@ -273,7 +275,7 @@ def _record(indexer: str, success_rate: float) -> dict[str, Any]:
         "total_query_fees": 10.0,
         "last_known_slashable_stake": 1_000.0,
         "org": f"org-{indexer[2:4]}",
-        "dst_lat": 52.4,
+        "dst_lat": int(indexer[2:4], 16) / 4,
         "dst_lon": 4.9,
         "computed_at": "2026-11-12T09:00:00Z",
         "dips_info_available": True,
@@ -281,6 +283,7 @@ def _record(indexer: str, success_rate: float) -> dict[str, Any]:
         "dips_min_grt_per_billion_entities_per_30_days": "200",
         "dips_supported_networks": f'["{CHAIN}"]',
     }
+    return {**record, **changes}
 
 
 # By score alone D is the best pick, then C, then B; A is the worst. The rates sit close
@@ -310,8 +313,9 @@ def _state(claimed: set[str], checker: Optional[FakeChecker]) -> SimpleNamespace
 
 
 async def _pick(claimed: set[str], checker: Optional[FakeChecker], **request: Any) -> list[str]:
+    """The indexers selection answers with; 1 is asked for unless the request says otherwise."""
     selection = SelectionRequest(
-        deployment_id=DEPLOYMENT, chain_id=CHAIN, num_candidates=1, **request
+        **{"deployment_id": DEPLOYMENT, "chain_id": CHAIN, "num_candidates": 1, **request}
     )
     with patch.object(endpoints, "_state", _state(claimed, checker)):
         response = await _select_checking_sync_claims(selection)
@@ -371,6 +375,20 @@ class TestSelection:
         picked = await _pick({A}, checker, existing_indexers=[A])
 
         assert picked == [A] and checker.asked == []
+
+    async def test_a_failed_claim_gives_way_in_a_group_that_already_has_a_member(self):
+        """D is serving and 1 more is wanted. A leads on a claim that fails the check, so the
+        place goes to the best score, C.
+        """
+        checker = FakeChecker(fail=(A,))
+
+        assert await _pick({A}, checker, existing_indexers=[D], num_candidates=2) == [D, C]
+
+    async def test_a_true_claim_beats_a_false_one_beside_a_member(self):
+        """B leads on a false claim. A's claim is true, so A takes the open place, not B."""
+        checker = FakeChecker(fail=(B,))
+
+        assert await _pick({A, B}, checker, existing_indexers=[D], num_candidates=2) == [D, A]
 
     async def test_a_claimant_that_cannot_be_picked_is_not_checked(self):
         """B is blocked by the caller, so its claim can win nothing and costs no query."""

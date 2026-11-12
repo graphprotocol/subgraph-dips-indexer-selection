@@ -230,10 +230,11 @@ class IndexerSelector:
         """
         Get the current group of indexers assigned to a subgraph.
 
-        :return: Indexers assigned to self.deployment_id, or [].
+        :return: Indexers assigned to self.deployment_id, or []. A list of its own, so the
+            picks added to it later never reach the caller's list.
         """
         # Check if the subgraph_id exists in the agreements and return the corresponding indexers
-        return self.existing_agreements.get(self.deployment_id, [])
+        return list(self.existing_agreements.get(self.deployment_id, []))
 
     def _normalize_and_score(self):
         """Normalise quality metrics and compute the weighted score per indexer.
