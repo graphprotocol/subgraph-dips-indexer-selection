@@ -16,6 +16,7 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 """
 
 import hmac
+import itertools
 import json
 import logging
 import math
@@ -45,6 +46,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .freshness import (
     HISTORY_DAYS,
@@ -195,6 +197,37 @@ def sync_claim_checker(settings: Settings) -> Optional[SyncClaimChecker]:
 # Request/Response Models
 # =============================================================================
 
+# Limits on a selection request. /select-indexers takes no token, so without them a request
+# could be any size. Each field limit is far above anything a real request holds.
+# Dipper never asks for more than this many candidates.
+MAX_NUM_CANDIDATES = 100
+# A deployment's IPFS hash is 46 characters and an indexer address 42.
+_MAX_ID_CHARS = 128
+_MAX_CHAIN_ID_CHARS = 64
+# Entries in a list or map of indexers, far more than the network has indexers.
+_MAX_INDEXERS = 10_000
+# Keys in a map keyed by deployment. Dipper sends every deployment with a pending agreement or a
+# decline in the last 30 days, so these grow with all of dipper's work, not just this request.
+# The body limit below binds first, since 100,000 deployment ids alone are about 5 MB; this one
+# still holds if the body limit is ever raised.
+_MAX_DEPLOYMENTS = 100_000
+# The whole body, checked before it is read in full. Dipper sends the pending agreements and
+# recent declines of every deployment it handles, though selection uses only this deployment's
+# declines and the indexers named in the pending agreements, so today a request grows with
+# dipper's whole workload. By 1 estimate it is about 0.14 MB at 1,000 deployments and 1.4 MB at
+# 10,000, and reaches this limit somewhere between 7,000 and 31,000, after which every request
+# is refused. Once dipper sends only what selection uses, a request is a few kilobytes and this
+# limit is far out of reach.
+MAX_SELECTION_BODY_BYTES = 4 * 1024 * 1024
+
+# fail_fast stops checking a list or map at its first bad entry. Without it each bad entry is
+# its own error, so a body of thousands of them builds thousands of errors in memory.
+_IdText = Annotated[str, Field(max_length=_MAX_ID_CHARS)]
+_IndexerList = Annotated[list[_IdText], Field(max_length=_MAX_INDEXERS, fail_fast=True)]
+_IndexersByDeployment = Annotated[
+    dict[_IdText, _IndexerList], Field(max_length=_MAX_DEPLOYMENTS, fail_fast=True)
+]
+
 
 class SelectionRequest(BaseModel):
     """
@@ -202,18 +235,25 @@ class SelectionRequest(BaseModel):
 
     Follows the SelectionRequest struct in dipper's Rust HTTP client, which types chain_id
     as optional. Dipper's reassess job always sets it, and a request without one is a 422.
+
+    A field this model does not know is a 422 too. Dipper's struct is kept in step with this
+    model by hand, so a field renamed on 1 side would otherwise be dropped without a word, and a
+    dropped blocklist or price ceiling would select blocked or over-priced indexers.
     """
 
-    deployment_id: str
-    existing_indexers: Optional[list[str]] = None
-    pending_agreements: Optional[dict[str, list[str]]] = None
-    num_candidates: int  # Target group size (required)
-    blocklist: Optional[list[str]] = None
-    declined_indexers: Optional[dict[str, list[str]]] = None
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_id: _IdText
+    existing_indexers: Optional[_IndexerList] = None
+    pending_agreements: Optional[_IndexersByDeployment] = None
+    # Target group size (required). 0 or below selects nobody.
+    num_candidates: int = Field(le=MAX_NUM_CANDIDATES)
+    blocklist: Optional[_IndexerList] = None
+    declined_indexers: Optional[_IndexersByDeployment] = None
     # Required: the DIPs-info, chain-support and price filters all key on the chain, so a
     # request without one would skip them all. They also skip any step whose DIPs column is
     # missing from the loaded scores, and every step when dips_info_available is missing.
-    chain_id: str = Field(min_length=1)  # e.g., "arbitrum-one"
+    chain_id: str = Field(min_length=1, max_length=_MAX_CHAIN_ID_CHARS)  # e.g., "arbitrum-one"
     max_grt_per_30_days: Optional[float] = Field(
         default=None, ge=0, allow_inf_nan=False
     )  # e.g., 4500.0
@@ -224,8 +264,24 @@ class SelectionRequest(BaseModel):
     # stake-to-fees is scored. A negative or infinite fee would skew that score and a NaN
     # one would be silently treated as 0, so each is a 422.
     optimistic_dips_fees: Optional[
-        dict[str, Annotated[float, Field(ge=0, allow_inf_nan=False)]]
+        Annotated[
+            dict[_IdText, Annotated[float, Field(ge=0, allow_inf_nan=False)]],
+            Field(max_length=_MAX_INDEXERS, fail_fast=True),
+        ]
     ] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_a_flood_of_fields(cls, data: Any) -> Any:
+        """Refuse a body with far more fields than this model has, before checking any of them.
+
+        Each unknown field is its own error, so thousands of them would build thousands of
+        errors in memory. Up to twice the model's own fields, each unknown 1 is still named.
+        """
+        most = 2 * len(cls.model_fields)
+        if isinstance(data, dict) and len(data) > most:
+            raise ValueError(f"has {len(data):,} fields, more than the {most} a request may have")
+        return data
 
 
 class SelectedIndexer(BaseModel):
@@ -561,6 +617,7 @@ class ErrorResponse(BaseModel):
 _ERROR_RESPONSES: dict[int, dict[str, Any]] = {
     400: {"model": ErrorResponse, "description": "The body could not be read as text"},
     401: {"model": ErrorResponse, "description": "The bearer token is missing or wrong"},
+    413: {"model": ErrorResponse, "description": "The body is over the size limit"},
     503: {"model": ErrorResponse, "description": "The service has not started or has no scores"},
 }
 
@@ -946,6 +1003,68 @@ app = FastAPI(
 )
 
 
+class _SelectionBodyLimit:
+    """Refuse a /select-indexers body over MAX_SELECTION_BODY_BYTES with a 413 before it is parsed.
+
+    The request's own checks run only once the whole body has been read and parsed, and this is
+    the 1 endpoint that takes no token, so a huge body could use up the service's memory first.
+    Only this route is covered, since the score job's POST /scores is legitimately large.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"] != "/select-indexers":
+            await self.app(scope, receive, send)
+            return
+        declared = dict(scope["headers"]).get(b"content-length", b"")
+        if declared.isdigit() and int(declared) > MAX_SELECTION_BODY_BYTES:
+            await _body_too_large(scope, receive, send)
+            return
+
+        # No length, or one within the limit: read the body, counting what arrives.
+        pieces: list[bytes] = []
+        received = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                return  # The client went away before sending the whole body.
+            received += len(message.get("body", b""))
+            if received > MAX_SELECTION_BODY_BYTES:
+                await _body_too_large(scope, receive, send)
+                return
+            pieces.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+
+        body = b"".join(pieces)
+        # Let the pieces go, so the route runs holding 1 copy of the body rather than 2.
+        del pieces
+        replayed = False
+
+        async def replay() -> Message:
+            nonlocal replayed
+            if replayed:
+                return await receive()
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await self.app(scope, replay, send)
+
+
+async def _body_too_large(scope: Scope, receive: Receive, send: Send) -> None:
+    logger.warning("Refused a /select-indexers body over %s bytes", f"{MAX_SELECTION_BODY_BYTES:,}")
+    response = JSONResponse(
+        status_code=413,
+        content={"detail": f"Request body is over the {MAX_SELECTION_BODY_BYTES:,} byte limit"},
+    )
+    await response(scope, receive, send)
+
+
+app.add_middleware(_SelectionBodyLimit)
+
+
 def _json_safe(value: Any) -> Any:
     """Replace NaN and infinite floats, at any depth, with their text form, and write half of a
     UTF-16 surrogate pair in text as a \\u escape, since UTF-8 can't encode it.
@@ -961,12 +1080,64 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+# A 422 reports at most this many errors, each echoing only a short excerpt of what was sent,
+# so a refusal stays small however much a request got wrong.
+_MAX_REPORTED_ERRORS = 20
+_MAX_EXCERPT_CHARS = 100
+_MAX_EXCERPT_ITEMS = 5
+
+
+def _excerpt(value: Any, depth: int = 0) -> Any:
+    """A short excerpt of a value a request sent, of the same type where it can be.
+
+    Text is cut to 100 characters, a list or map to its first 5 entries, and anything nested
+    deeper than 2 levels is described rather than copied. Other values are returned as they are.
+    """
+    if isinstance(value, str):
+        cut = len(value) > _MAX_EXCERPT_CHARS
+        return value[:_MAX_EXCERPT_CHARS] + "..." if cut else value
+    if isinstance(value, (list, tuple, dict)) and depth >= 2:
+        return f"{len(value):,} entries"
+    if isinstance(value, (list, tuple)):
+        return _excerpt_list(value, depth)
+    if isinstance(value, dict):
+        return _excerpt_map(value, depth)
+    return value
+
+
+def _excerpt_list(value: list | tuple, depth: int) -> list:
+    """The first entries of a list, each cut to an excerpt, and how many more there were."""
+    kept = [_excerpt(item, depth + 1) for item in value[:_MAX_EXCERPT_ITEMS]]
+    more = len(value) - len(kept)
+    return kept + [f"... {more:,} more"] if more else kept
+
+
+def _excerpt_map(value: dict, depth: int) -> dict:
+    """The first entries of a map, keys and values cut to excerpts, and how many more there were."""
+    first = itertools.islice(value.items(), _MAX_EXCERPT_ITEMS)
+    kept = {_excerpt(str(key)): _excerpt(item, depth + 1) for key, item in first}
+    more = len(value) - len(kept)
+    return {**kept, "...": f"{more:,} more"} if more else kept
+
+
+def _reported_error(error: Mapping[str, Any]) -> dict[str, Any]:
+    """1 validation error as a 422 reports it: its input and location cut to excerpts."""
+    reported = dict(error)
+    if "input" in reported:
+        reported["input"] = _excerpt(reported["input"])
+    reported["loc"] = [_excerpt(part) for part in reported.get("loc", ())]
+    return reported
+
+
 @app.exception_handler(RequestValidationError)
 async def _request_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
     """FastAPI's own 422 echoes the rejected input, and a NaN or infinite float there
-    can't be written as JSON, which turns the 422 into a 500.
+    can't be written as JSON, which turns the 422 into a 500. It also echoes every error in
+    full, so a request with thousands of errors, or 1 huge value, got an answer far larger than
+    itself; this reports the first 20, each with excerpts of what was sent.
     """
-    errors = _json_safe(jsonable_encoder(exc.errors()))
+    reported = [_reported_error(error) for error in exc.errors()[:_MAX_REPORTED_ERRORS]]
+    errors = _json_safe(jsonable_encoder(reported))
     return JSONResponse(status_code=422, content={"detail": errors})
 
 
@@ -1421,7 +1592,9 @@ async def get_score(
 
 
 @app.post(
-    "/select-indexers", response_model=SelectionResponse, responses=_documented_errors(400, 503)
+    "/select-indexers",
+    response_model=SelectionResponse,
+    responses=_documented_errors(400, 413, 503),
 )
 async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     """Select N indexers for a deployment via weighted scoring.

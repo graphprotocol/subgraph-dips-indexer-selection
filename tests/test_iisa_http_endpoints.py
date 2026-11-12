@@ -404,7 +404,7 @@ class TestOpenApiErrorResponses:
             ("post", "/freshness", {"400", "401", "503"}),
             ("get", "/freshness", {"401"}),
             ("post", "/get-score", {"400", "401", "503"}),
-            ("post", "/select-indexers", {"400", "503"}),
+            ("post", "/select-indexers", {"400", "413", "503"}),
         ],
     )
     def test_lists_each_error_answer(self, method, path, codes):
