@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.12.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.11.0...v2.12.0) (2026-11-12)
+
+
+### Added
+
+* **k8s:** let each environment configure the freshness prober ([#430](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/430)) ([663b55c](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/663b55cf3c1d1faedb270a47ba4be9bdce365c30))
+
 ## [2.11.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.10.2...v2.11.0) (2026-11-12)
 
 
