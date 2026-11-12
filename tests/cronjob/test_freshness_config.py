@@ -13,10 +13,12 @@ import sync_status_fetcher  # noqa: E402
 from freshness_config import FreshnessConfig, load_freshness_config  # noqa: E402
 
 FAKE_KEY = "fake-freshness-key-0000"
+PAYER = "0x" + "9" * 40
 ENABLED = {
     "FRESHNESS_PROBE_ENABLED": "true",
     "FRESHNESS_GATEWAY_URL": "https://gateway.example.com/api/",
     "FRESHNESS_GATEWAY_API_KEY": FAKE_KEY,
+    "FRESHNESS_GATEWAY_PAYERS": PAYER,
 }
 
 
@@ -39,6 +41,7 @@ def test_defaults_when_switched_on():
         refresh_interval=900.0,
         request_timeout=25.0,
         max_concurrency=50,
+        gateway_payers=(PAYER,),
     )
     assert config.min_allocation_age_seconds == 7 * 86_400
     assert FAKE_KEY not in repr(config)
@@ -155,3 +158,49 @@ def test_fetcher_refuses_to_start_when_enabled_without_url_or_key(fetcher_env, c
 
     assert f"{missing} is required; refusing to start" in caplog.text
     assert FAKE_KEY not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("payers", "expected"),
+    [
+        ("", "FRESHNESS_GATEWAY_PAYERS is required"),
+        (" , ", "FRESHNESS_GATEWAY_PAYERS is required"),
+        ("0x1234", "FRESHNESS_GATEWAY_PAYERS must be 0x addresses"),
+        (PAYER + ";" + PAYER, "FRESHNESS_GATEWAY_PAYERS must be 0x addresses"),
+    ],
+)
+def test_the_gateways_payers_are_required(payers, expected):
+    config, problem = load_freshness_config({**ENABLED, "FRESHNESS_GATEWAY_PAYERS": payers})
+
+    assert config is None
+    assert problem.startswith(expected)
+
+
+def test_the_gateways_collector_is_optional_and_in_lower_case():
+    collector = "0x" + "CD" * 20
+    unset, _ = load_freshness_config(ENABLED)
+    config, problem = load_freshness_config(
+        {**ENABLED, "FRESHNESS_GATEWAY_COLLECTOR": f" {collector} "}
+    )
+
+    assert unset.gateway_collector is None
+    assert problem is None
+    assert config.gateway_collector == collector.lower()
+
+
+@pytest.mark.parametrize("collector", ["0x1234", f"{PAYER},{PAYER}"])
+def test_a_collector_that_isnt_1_address_is_a_problem(collector):
+    config, problem = load_freshness_config({**ENABLED, "FRESHNESS_GATEWAY_COLLECTOR": collector})
+
+    assert config is None
+    assert problem == "FRESHNESS_GATEWAY_COLLECTOR must be a 0x address"
+
+
+def test_payers_are_a_comma_separated_list_in_lower_case():
+    second = "0x" + "AB" * 20
+    config, problem = load_freshness_config(
+        {**ENABLED, "FRESHNESS_GATEWAY_PAYERS": f" {PAYER}, {second},{PAYER} "}
+    )
+
+    assert problem is None
+    assert config.gateway_payers == (PAYER, second.lower())

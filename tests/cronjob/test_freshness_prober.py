@@ -75,12 +75,39 @@ class FakeGateway:
         return reply if isinstance(reply, GatewayUnreachable) else reply(self.clock())
 
 
-def _prober(targets, gateway, clock, pushed, config=CONFIG, load_targets=None):
+# For a prober whose stale answers find no other indexer to ask.
+NO_SECOND_OPINIONS = {
+    "read_allocated_indexers": lambda _deployment: [],
+    "read_deployments": lambda indexers, _chain: dict.fromkeys(indexers, {}),
+}
+
+
+def _prober(
+    targets,
+    gateway,
+    clock,
+    pushed,
+    config=CONFIG,
+    load_targets=None,
+    allocated_to=None,
+    allocations=(),
+):
+    """A prober on fakes. ``allocated_to`` maps a deployment to the indexers allocated to it and
+    ``allocations`` holds every indexer's open allocations, for second opinions."""
     return FreshnessProber(
         config,
         load_targets=load_targets or (lambda: targets),
         ask=gateway.ask,
         push=lambda payload: pushed.append(payload) or {"applied": True},
+        read_allocated_indexers=lambda deployment: list((allocated_to or {}).get(deployment, [])),
+        read_deployments=lambda indexers, chain: {
+            indexer: {
+                a.ipfs_hash: a.created_at
+                for a in allocations
+                if a.indexer == indexer and a.chain == chain
+            }
+            for indexer in indexers
+        },
         clock=clock,
         sleep=clock.sleep,
         rng=random.Random(7),
@@ -425,6 +452,7 @@ async def test_a_failed_push_is_logged_and_not_retried(caplog):
         load_targets=lambda: None,
         ask=None,
         push=failing_push,
+        **NO_SECOND_OPINIONS,
         clock=clock,
         sleep=clock.sleep,
     )
@@ -568,7 +596,9 @@ async def test_the_loop_checks_every_minute_and_stops_on_the_stop_event(fast_min
             stop.set()
         return {"applied": True}
 
-    prober = FreshnessProber(fast_minutes, load_targets=lambda: targets, ask=ask, push=push)
+    prober = FreshnessProber(
+        fast_minutes, load_targets=lambda: targets, ask=ask, push=push, **NO_SECOND_OPINIONS
+    )
 
     await _run_until(prober, stop, deadline_seconds=10)
 
@@ -585,7 +615,13 @@ async def test_the_loop_pushes_nothing_before_the_first_successful_refresh(fast_
     def failing_load():
         raise ValueError("GET /scores returned no score records")
 
-    prober = FreshnessProber(fast_minutes, load_targets=failing_load, ask=None, push=pushed.append)
+    prober = FreshnessProber(
+        fast_minutes,
+        load_targets=failing_load,
+        ask=None,
+        push=pushed.append,
+        **NO_SECOND_OPINIONS,
+    )
     asyncio.get_running_loop().call_later(1.0, stop.set)
 
     with caplog.at_level(logging.ERROR, logger="freshness_prober"):
@@ -593,3 +629,19 @@ async def test_the_loop_pushes_nothing_before_the_first_successful_refresh(fast_
 
     assert pushed == []
     assert "Freshness refresh failed" in caplog.text
+
+
+async def test_the_push_runs_on_its_own_thread():
+    """A slow refresh or network subgraph read can't hold up a minute's push."""
+    clock = FakeClock(MINUTE)
+    threads = []
+    prober = _prober(None, FakeGateway(clock, {}), clock, [])
+    prober._targets = Targets(pairs=(), eligible={})
+    prober._push_payload = lambda payload: (
+        threads.append(threading.current_thread().name) or {"applied": True}
+    )
+
+    await prober.run_minute(MINUTE)
+
+    assert len(threads) == 1
+    assert threads[0].startswith("freshness-push")

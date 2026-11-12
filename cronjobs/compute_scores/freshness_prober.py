@@ -3,7 +3,8 @@ gateway, judge how old the answer's block is, and push the minute's outcomes to 
 
 It runs on its own thread inside the sync-status fetcher, with its own event loop, and only when
 FRESHNESS_PROBE_ENABLED is true (freshness_config.py). The rules it applies are in
-freshness_rules.py, and what it checks comes from freshness_sources.py.
+freshness_rules.py, what it checks comes from freshness_sources.py, and second opinions on a
+stale answer come from freshness_blame.py.
 """
 
 from __future__ import annotations
@@ -14,33 +15,49 @@ import random
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from functools import partial
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Hashable, Optional, Sequence
 from urllib.parse import urlparse
 
 import requests
+from freshness_blame import BrokenSubgraphs, DeploymentAges, RecentPasses
 from freshness_config import PUSH_DELAY_SECONDS, FreshnessConfig
 from freshness_contract import without_refused
 from freshness_gateway import GatewayClient
 from freshness_registry import NetworksRegistry
 from freshness_rules import (
+    ESCROW_EMPTY,
     KEY_OUT_OF_FUNDS,
     NO_ELIGIBLE_SUBGRAPH,
     NO_EVIDENCE,
     NOT_SENT,
     PAIRING_UNKNOWN,
+    PAYMENT_REFUSED,
+    SUBGRAPH_BROKEN,
     VOID,
     CheckResult,
     GatewayResult,
     Judgement,
     Targets,
     apply_general_fault,
+    blame_refused_payment,
     format_minute,
+    is_behind,
     judge,
     minute_payload,
+    truncate_detail,
 )
-from freshness_sources import TargetLoader, read_first_allocations, read_open_allocations
+from freshness_sources import (
+    TargetLoader,
+    read_allocated_indexers,
+    read_deployments_on_chain,
+    read_escrow_funded,
+    read_first_allocations,
+    read_open_allocations,
+)
 from iisa_client import IISAPushError, get_scores, post_freshness
 from subgraph import SubgraphResponseError
 
@@ -51,10 +68,15 @@ PUSH_TIMEOUT_SECONDS = 10
 # A minute the loop reaches later than this is skipped: its checks could no longer be spread
 # across it, and a minute that never arrives is void for everyone.
 LATE_MINUTE_LIMIT_SECONDS = 5
-KEY_ALARM_INTERVAL_SECONDS = 600
+ALARM_INTERVAL_SECONDS = 600
 STOP_POLL_SECONDS = 1.0
 # Room left between the last check's timeout and the push.
 SEND_SLACK_SECONDS = 1.0
+# How long before that a check stops waiting for second opinions on a stale answer.
+DECIDE_MARGIN_SECONDS = 0.5
+# Network subgraph reads for second opinions get a pool this small of their own, so they can't
+# crowd out the refresh, and the push has a thread of its own for the same reason.
+SECOND_OPINION_READ_THREADS = 2
 
 _EXPECTED_REFRESH_ERRORS = (
     requests.RequestException,
@@ -71,29 +93,31 @@ def minute_start(t: float) -> float:
 
 
 class RateLimitedAlarm:
-    """Logs an error at most once per interval and says how many it held back."""
+    """Logs an error at most once per interval for each key and says how many it held back."""
 
     def __init__(self, interval: float, clock: Callable[[], float]) -> None:
         self._interval = interval
         self._clock = clock
-        self._last: Optional[float] = None
-        self._held = 0
+        self._last: dict[Hashable, float] = {}
+        self._held: dict[Hashable, int] = {}
 
-    def report(self, message: str, *args: object) -> None:
+    def report(self, key: Hashable, message: str, *args: object) -> None:
         now = self._clock()
-        if self._last is not None and now - self._last < self._interval:
-            self._held += 1
+        last = self._last.get(key)
+        if last is not None and now - last < self._interval:
+            self._held[key] = self._held.get(key, 0) + 1
             return
-        logger.error(message + " (%d more since the last report)", *args, self._held)
-        self._last = now
-        self._held = 0
+        held = self._held.pop(key, 0)
+        logger.error(message + " (%d more since the last report)", *args, held)
+        self._last[key] = now
 
 
 class FreshnessProber:
     """Refreshes what to check every ``config.refresh_interval`` and checks every minute.
 
     ``load_targets`` blocks (it reads GET /scores and the network subgraph), so it runs on a
-    worker thread, as does ``push``. ``ask`` sends 1 query through the gateway.
+    worker thread. ``push`` runs on a thread of its own and the 2 network subgraph reads second
+    opinions need on a small pool of their own. ``ask`` sends 1 query through the gateway.
     """
 
     def __init__(
@@ -103,6 +127,8 @@ class FreshnessProber:
         load_targets: Callable[[], Targets],
         ask: Ask,
         push: Callable[[dict], Any],
+        read_allocated_indexers: Callable[[str], list[str]],
+        read_deployments: Callable[[Sequence[str], str], DeploymentAges],
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rng: Optional[random.Random] = None,
@@ -116,7 +142,23 @@ class FreshnessProber:
         self._sleep = sleep
         self._rng = rng or random.Random()
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
-        self._key_alarm = RateLimitedAlarm(KEY_ALARM_INTERVAL_SECONDS, clock)
+        self._alarms = RateLimitedAlarm(ALARM_INTERVAL_SECONDS, clock)
+        self._push_executor = ThreadPoolExecutor(1, thread_name_prefix="freshness-push")
+        self._read_executor = ThreadPoolExecutor(
+            SECOND_OPINION_READ_THREADS, thread_name_prefix="freshness-opinions"
+        )
+        self._recent = RecentPasses(clock)
+        self._broken = BrokenSubgraphs(
+            ask=self._ask_for_second_opinion,
+            judge=partial(judge, bar_seconds=config.bar_seconds),
+            read_allocated_indexers=read_allocated_indexers,
+            read_deployments=read_deployments,
+            recent=self._recent,
+            min_allocation_age_seconds=config.min_allocation_age_seconds,
+            clock=clock,
+            rng=self._rng,
+            executor=self._read_executor,
+        )
         self._targets: Optional[Targets] = None
         # (indexer, deployment) pairings the gateway said it doesn't know, until the next refresh
         self._dropped: set[tuple[str, str]] = set()
@@ -165,6 +207,8 @@ class FreshnessProber:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            self._push_executor.shutdown(wait=False, cancel_futures=True)
+            self._read_executor.shutdown(wait=False, cancel_futures=True)
 
     def _start_minute(self, start: float, now: float, tasks: set[asyncio.Task]) -> None:
         if self._targets is None:
@@ -218,11 +262,9 @@ class FreshnessProber:
         if targets is None:
             return []
         push_at = start + MINUTE + PUSH_DELAY_SECONDS
-        # A check sent later than this might not be answered before the push.
-        send_by = push_at - self._config.request_timeout - SEND_SLACK_SECONDS
         tasks = {
             pair: asyncio.create_task(
-                self._check(pair, start + self._rng.uniform(0, MINUTE), send_by)
+                self._check(pair, start + self._rng.uniform(0, MINUTE), push_at)
             )
             for pair in targets.pairs
         }
@@ -238,11 +280,11 @@ class FreshnessProber:
         task.cancel()
         return CheckResult(*pair, VOID, NOT_SENT, "check did not finish before the push")
 
-    async def _check(self, pair: tuple[str, str], fire_at: float, send_by: float) -> CheckResult:
+    async def _check(self, pair: tuple[str, str], fire_at: float, push_at: float) -> CheckResult:
         indexer, chain = pair
         try:
             await self._sleep_until(fire_at)
-            return await self._check_now(indexer, chain, send_by)
+            return await self._check_now(indexer, chain, push_at)
         except Exception:
             logger.exception("Freshness check of %s on %s failed in the prober", indexer, chain)
             return CheckResult(indexer, chain, VOID, NOT_SENT, "prober error")
@@ -251,29 +293,39 @@ class FreshnessProber:
         targets = self._targets
         return targets.eligible.get((indexer, chain), ()) if targets else ()
 
-    @staticmethod
-    def _nothing_to_ask(indexer: str, chain: str, eligible: tuple[str, ...]) -> CheckResult:
-        if eligible:
+    def _choices(self, indexer: str, chain: str) -> tuple[list[str], list[str]]:
+        """The deployments the indexer may be asked about now, and those left out as broken."""
+        known = [d for d in self._eligible(indexer, chain) if (indexer, d) not in self._dropped]
+        broken = [d for d in known if self._broken.is_broken(d)]
+        return [d for d in known if d not in broken], broken
+
+    def _nothing_to_ask(self, indexer: str, chain: str, broken: list[str]) -> CheckResult:
+        if broken:
+            detail = "left out as broken for every indexer: " + ", ".join(broken)
+            return CheckResult(indexer, chain, VOID, SUBGRAPH_BROKEN, truncate_detail(detail))
+        if self._eligible(indexer, chain):
             # The gateway said it doesn't know any of them; that clears at the next refresh and
             # isn't evidence against the indexer.
             detail = "the gateway doesn't know this indexer on any eligible subgraph"
             return CheckResult(indexer, chain, VOID, PAIRING_UNKNOWN, detail)
         return CheckResult(indexer, chain, NO_EVIDENCE, NO_ELIGIBLE_SUBGRAPH)
 
-    async def _check_now(self, indexer: str, chain: str, send_by: float) -> CheckResult:
-        eligible = self._eligible(indexer, chain)
-        choices = [d for d in eligible if (indexer, d) not in self._dropped]
+    async def _check_now(self, indexer: str, chain: str, push_at: float) -> CheckResult:
+        choices, broken = self._choices(indexer, chain)
         if not choices:
-            return self._nothing_to_ask(indexer, chain, eligible)
+            return self._nothing_to_ask(indexer, chain, broken)
         deployment = self._rng.choice(choices)
         async with self._semaphore:
-            if self._clock() > send_by:
+            # A check sent later than this might not be answered before the push.
+            if self._clock() > push_at - self._config.request_timeout - SEND_SLACK_SECONDS:
                 return CheckResult(
                     indexer, chain, VOID, NOT_SENT, "too many checks waiting to be sent", deployment
                 )
             reply = await self._ask(deployment, indexer)
-        judgement = judge(reply, self._config.bar_seconds)
-        self._note(indexer, deployment, judgement)
+        answer = judge(reply, self._config.bar_seconds)
+        self._recent.record(indexer, chain, deployment, answer)
+        self._note(indexer, deployment, answer)
+        judgement = await self._assign_blame(indexer, chain, deployment, answer, choices, push_at)
         return CheckResult(
             indexer=indexer,
             chain=chain,
@@ -285,6 +337,44 @@ class FreshnessProber:
             attested=judgement.attested,
             asked=True,
         )
+
+    async def _ask_for_second_opinion(self, deployment: str, indexer: str) -> GatewayResult:
+        async with self._semaphore:
+            return await self._ask(deployment, indexer)
+
+    async def _assign_blame(
+        self,
+        indexer: str,
+        chain: str,
+        deployment: str,
+        judgement: Judgement,
+        choices: list[str],
+        push_at: float,
+    ) -> Judgement:
+        """Turn a failure that isn't the indexer's fault into a void one."""
+        if judgement.reason == PAYMENT_REFUSED:
+            return self._blame_refused_payment(indexer, judgement)
+        if is_behind(judgement):
+            decide_by = push_at - SEND_SLACK_SECONDS - DECIDE_MARGIN_SECONDS
+            if await self._broken.judge_stale(
+                indexer, chain, deployment, judgement, choices, decide_by
+            ):
+                return replace(judgement, outcome=VOID, reason=SUBGRAPH_BROKEN)
+        return judgement
+
+    def _blame_refused_payment(self, indexer: str, judgement: Judgement) -> Judgement:
+        targets = self._targets
+        outcome, reason = blame_refused_payment(
+            targets.escrow_funded.get(indexer) if targets else None
+        )
+        if reason == ESCROW_EMPTY:
+            self._alarms.report(
+                ("escrow", indexer),
+                "The gateway's escrow for indexer %s is empty or being withdrawn, so its refused "
+                "payments are void until it is topped up",
+                indexer,
+            )
+        return replace(judgement, outcome=outcome, reason=reason)
 
     def _scrub(self, detail: Optional[str]) -> Optional[str]:
         return detail.replace(self._config.api_key, "<redacted>") if detail else detail
@@ -299,7 +389,8 @@ class FreshnessProber:
                 judgement.detail,
             )
         elif judgement.reason == KEY_OUT_OF_FUNDS:
-            self._key_alarm.report(
+            self._alarms.report(
+                "api_key",
                 "Freshness API key is out of funds or over its spend limit, so checks are void "
                 "until it is topped up: %s",
                 self._scrub(judgement.detail),
@@ -316,7 +407,9 @@ class FreshnessProber:
         payload["outcomes"] = without_refused(minute, payload["outcomes"])
         counts = Counter(outcome["outcome"] for outcome in payload["outcomes"])
         try:
-            response = await asyncio.to_thread(self._push_payload, payload)
+            response = await asyncio.get_running_loop().run_in_executor(
+                self._push_executor, self._push_payload, payload
+            )
         except (IISAPushError, ValueError) as e:
             logger.error("Failed to push freshness minute %s (%s): %s", minute, dict(counts), e)
             return
@@ -358,6 +451,12 @@ def start_freshness_prober(
         fetch_scores=partial(get_scores, iisa_api_url, token),
         read_allocations=partial(read_open_allocations, subgraph_url),
         read_first_allocations=partial(read_first_allocations, subgraph_url),
+        read_escrow=partial(
+            read_escrow_funded,
+            subgraph_url,
+            payers=config.gateway_payers,
+            collector=config.gateway_collector,
+        ),
         min_allocation_age_seconds=config.min_allocation_age_seconds,
     )
     prober = FreshnessProber(
@@ -366,6 +465,8 @@ def start_freshness_prober(
         load_targets=loader,
         ask=gateway.ask,
         push=partial(post_freshness, iisa_api_url, token, timeout=PUSH_TIMEOUT_SECONDS),
+        read_allocated_indexers=partial(read_allocated_indexers, subgraph_url),
+        read_deployments=partial(read_deployments_on_chain, subgraph_url),
     )
     logger.info(
         "Freshness prober starting: gateway host=%s, bar=%gs, min allocation age=%g days, "

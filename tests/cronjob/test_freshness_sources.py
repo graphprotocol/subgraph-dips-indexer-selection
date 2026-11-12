@@ -16,6 +16,9 @@ from freshness_rules import Allocation, Targets  # noqa: E402
 from freshness_sources import (  # noqa: E402
     TargetLoader,
     post_graphql,
+    read_allocated_indexers,
+    read_deployments_on_chain,
+    read_escrow_funded,
     read_first_allocations,
     read_open_allocations,
 )
@@ -146,10 +149,11 @@ def test_a_failed_read_never_shows_the_network_subgraph_key(mock_post):
 class _Sources:
     """Fake GET /scores and network subgraph reads that record what was asked."""
 
-    def __init__(self, scores, allocations, first_allocations=None):
+    def __init__(self, scores, allocations, first_allocations=None, escrow=None):
         self.scores = scores
         self.allocations = allocations
         self.first_allocations = first_allocations or {}
+        self.escrow = escrow if escrow is not None else {}
         self.allocation_reads = []
         self.first_allocation_reads = []
         self.networks = lambda: frozenset({"arbitrum-one", "matic", "mainnet", "base"})
@@ -160,6 +164,7 @@ class _Sources:
             fetch_scores=lambda: self.scores,
             read_allocations=self._read_allocations,
             read_first_allocations=self._read_first_allocations,
+            read_escrow=self._read_escrow,
             min_allocation_age_seconds=7 * DAY,
             clock=clock,
         )
@@ -167,6 +172,11 @@ class _Sources:
     def _read_allocations(self, indexers):
         self.allocation_reads.append(list(indexers))
         return [a for a in self.allocations if a.indexer in indexers]
+
+    def _read_escrow(self, indexers):
+        if isinstance(self.escrow, Exception):
+            raise self.escrow
+        return {indexer: self.escrow.get(indexer, False) for indexer in indexers}
 
     def _read_first_allocations(self, keys):
         self.first_allocation_reads.append(list(keys))
@@ -210,6 +220,7 @@ def test_targets_pair_each_dips_chain_with_its_eligible_deployments():
     assert targets == Targets(
         pairs=((INDEXER_A, "arbitrum-one"), (INDEXER_A, "matic")),
         eligible={(INDEXER_A, "arbitrum-one"): ("Qm" + "A" * 44, "Qm" + "B" * 44)},
+        escrow_funded={INDEXER_A: False},
     )
     assert sources.allocation_reads == [[INDEXER_A]]
     assert sources.first_allocation_reads == [[(INDEXER_A, young.deployment_id)]]
@@ -362,3 +373,302 @@ def test_no_dips_indexers_means_no_pairs_and_no_subgraph_read():
 
     assert sources.loader()() == Targets(pairs=(), eligible={})
     assert sources.allocation_reads == []
+
+
+PAYER = "0x" + "9" * 40
+
+
+@patch("requests.post")
+def test_reads_whether_the_gateways_escrow_holds_funds_for_each_indexer(mock_post):
+    def account(balance, thawing="0", payer=PAYER):
+        return {
+            "payer": {"id": payer},
+            "collector": "0x1",
+            "balance": balance,
+            "totalAmountThawing": thawing,
+        }
+
+    mock_post.return_value = _reply(
+        {"e0": [account("500")], "e1": [account("500", "500"), account("9", payer="0x" + "8" * 40)]}
+    )
+
+    funded = read_escrow_funded(URL, [INDEXER_A, INDEXER_B], {PAYER})
+
+    assert funded == {INDEXER_A: True, INDEXER_B: False}
+    assert read_escrow_funded(URL, [INDEXER_A, INDEXER_B], {PAYER}, collector="0x" + "2" * 40) == {
+        INDEXER_A: False,
+        INDEXER_B: False,
+    }
+
+
+@patch("requests.post")
+def test_the_escrow_query_asks_only_for_the_gateways_payers(mock_post):
+    """Every payer's accounts used to come back; for 1 real indexer, 8 accounts became 1."""
+    other = "0x" + "7" * 40
+    mock_post.return_value = _reply({"e0": [], "e1": []})
+
+    read_escrow_funded(URL, [INDEXER_A, INDEXER_B], (PAYER.upper().replace("0X", "0x"), other))
+
+    query = mock_post.call_args.kwargs["json"]["query"]
+    for alias, indexer in (("e0", INDEXER_A), ("e1", INDEXER_B)):
+        assert (
+            f'{alias}: paymentsEscrowAccounts(first: 1000, where: {{ receiver: "{indexer}", '
+            f'payer_in: ["{other}", "{PAYER}"] }}) {{ payer {{ id }} collector balance '
+            "totalAmountThawing }"
+        ) in query
+
+
+@pytest.mark.parametrize(
+    ("accounts", "funded"),
+    [
+        (
+            [
+                {
+                    "payer": {"id": PAYER},
+                    "collector": "0x1",
+                    "balance": "500",
+                    "totalAmountThawing": "0",
+                }
+            ],
+            True,
+        ),
+        (
+            [
+                {
+                    "payer": {"id": PAYER},
+                    "collector": "0x1",
+                    "balance": "0",
+                    "totalAmountThawing": "0",
+                }
+            ],
+            False,
+        ),
+        ([], False),
+    ],
+    ids=["funded", "empty", "no-account"],
+)
+@patch("requests.post")
+def test_escrow_outcomes_are_unchanged_by_asking_for_the_payers(mock_post, accounts, funded):
+    mock_post.return_value = _reply({"e0": accounts})
+
+    assert read_escrow_funded(URL, [INDEXER_A], (PAYER,)) == {INDEXER_A: funded}
+
+
+@pytest.mark.parametrize("payers", [(), ("0x1234",), (PAYER + "\n",), (PAYER, 'x" }')])
+def test_payers_that_arent_addresses_never_go_into_the_escrow_query(payers):
+    with patch("requests.post") as mock_post:
+        with pytest.raises(ValueError):
+            read_escrow_funded(URL, [INDEXER_A], payers)
+
+    mock_post.assert_not_called()
+
+
+@patch("requests.post")
+def test_reads_who_else_is_allocated_to_a_deployment(mock_post):
+    mock_post.return_value = _reply(
+        {
+            "subgraphDeployments": [
+                {
+                    "indexerAllocations": [
+                        {"indexer": {"id": INDEXER_B}},
+                        {"indexer": {"id": INDEXER_A.upper().replace("0X", "0x")}},
+                        {"indexer": {"id": INDEXER_B}},
+                        {"indexer": None},
+                    ]
+                }
+            ]
+        }
+    )
+
+    assert read_allocated_indexers(URL, "Qm" + "A" * 44) == [INDEXER_B, INDEXER_A]
+    query = mock_post.call_args.kwargs["json"]["query"]
+    assert 'ipfsHash: "Qm' + "A" * 44 + '"' in query
+    assert "first: 100, orderBy: allocatedTokens, orderDirection: desc" in query
+
+
+def _priced_offer(indexer, chains):
+    return {
+        "indexer": indexer,
+        "dips_supported_networks": list(chains),
+        "dips_min_grt_per_30_days": dict.fromkeys(chains, 100.0),
+    }
+
+
+def test_a_failed_escrow_read_reuses_the_last_answers_with_a_warning(caplog):
+    """Forgetting them would let a refusal count against an indexer whose escrow had run dry."""
+    sources = _Sources(
+        _scores(_priced_offer(INDEXER_A, ["arbitrum-one"])),
+        [_allocation(INDEXER_A, "A", int(NOW - 9 * DAY))],
+        escrow={INDEXER_A: False},
+    )
+    now = [NOW]
+    loader = sources.loader(clock=lambda: now[0])
+    assert loader().escrow_funded == {INDEXER_A: False}
+
+    sources.escrow = SubgraphResponseError("GraphQL errors: [bad]")
+    now[0] += 900
+    with caplog.at_level(logging.WARNING, logger="freshness_sources"):
+        targets = loader()
+
+    assert targets.escrow_funded == {INDEXER_A: False}
+    assert targets.eligible == {(INDEXER_A, "arbitrum-one"): ("Qm" + "A" * 44,)}
+    (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "Couldn't read the gateway's escrow" in warning
+    assert "900s ago" in warning
+
+
+def test_a_failed_escrow_read_before_any_worked_leaves_it_unknown(caplog):
+    sources = _Sources(
+        _scores(_priced_offer(INDEXER_A, ["arbitrum-one"])),
+        [_allocation(INDEXER_A, "A", int(NOW - 9 * DAY))],
+        escrow=SubgraphResponseError("GraphQL errors: [bad]"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="freshness_sources"):
+        targets = sources.loader()()
+
+    assert targets.escrow_funded == {}
+    assert targets.eligible == {(INDEXER_A, "arbitrum-one"): ("Qm" + "A" * 44,)}
+    assert "none read yet" in caplog.text
+
+
+def _escrow_loader(now):
+    sources = _Sources(
+        _scores(_priced_offer(INDEXER_A, ["arbitrum-one"])),
+        [_allocation(INDEXER_A, "A", int(NOW - 9 * DAY))],
+        escrow={INDEXER_A: False},
+    )
+    return sources, sources.loader(clock=lambda: now[0])
+
+
+@pytest.mark.parametrize(("minutes", "reused"), [(59, True), (61, False)])
+def test_old_escrow_answers_are_reused_for_at_most_an_hour(caplog, minutes, reused):
+    """Past that, an empty escrow recorded long ago would keep excusing refused payments, made-up
+    ones included, for as long as the reads keep failing."""
+    now = [NOW]
+    sources, loader = _escrow_loader(now)
+    loader()
+
+    sources.escrow = SubgraphResponseError("GraphQL errors: [bad]")
+    now[0] += minutes * 60
+    with caplog.at_level(logging.WARNING, logger="freshness_sources"):
+        targets = loader()
+
+    assert targets.escrow_funded == ({INDEXER_A: False} if reused else {})
+    (warning,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    if reused:
+        assert f"read {minutes * 60}s ago" in warning
+    else:
+        assert "unreadable for over an hour" in warning
+        assert "count against" in warning
+
+
+def test_a_working_escrow_read_after_an_hour_of_failures_restores_reuse():
+    now = [NOW]
+    sources, loader = _escrow_loader(now)
+    loader()
+    sources.escrow = SubgraphResponseError("GraphQL errors: [bad]")
+    now[0] += 61 * 60
+    assert loader().escrow_funded == {}
+
+    sources.escrow = {INDEXER_A: False}
+    now[0] += 900
+    assert loader().escrow_funded == {INDEXER_A: False}
+
+    sources.escrow = SubgraphResponseError("GraphQL errors: [bad]")
+    now[0] += 900
+    assert loader().escrow_funded == {INDEXER_A: False}
+
+
+@patch("requests.post")
+def test_reading_who_else_is_allocated_tries_once_with_a_short_timeout(mock_post):
+    mock_post.side_effect = requests.ConnectionError("refused")
+
+    with pytest.raises(requests.ConnectionError):
+        read_allocated_indexers(URL, "Qm" + "A" * 44)
+
+    assert mock_post.call_count == 1
+    assert mock_post.call_args.kwargs["timeout"] == freshness_sources.SECOND_OPINION_READ_TIMEOUT
+
+
+def _deployment_row(letter, created_at):
+    return {"ipfsHash": "Qm" + letter * 44, "indexerAllocations": [{"createdAt": str(created_at)}]}
+
+
+@patch("requests.post")
+def test_second_opinions_ask_only_for_each_indexers_deployments_on_the_chain(mock_post):
+    """1 large indexer has over 3,000 open allocations, so reading them all hit a cap that could
+    cut off the very chain being asked about."""
+    mock_post.return_value = _reply({"a0": [], "a1": []})
+
+    read_deployments_on_chain(URL, [INDEXER_A, INDEXER_B], "arbitrum-one")
+
+    query = mock_post.call_args.kwargs["json"]["query"]
+    for alias, indexer in (("a0", INDEXER_A), ("a1", INDEXER_B)):
+        assert (
+            f"{alias}: subgraphDeployments(first: 1000, where: {{ manifest_: {{ network: "
+            f'"arbitrum-one" }}, indexerAllocations_: {{ indexer: "{indexer}", status: Active }} '
+            f"}}) {{ ipfsHash indexerAllocations(first: 1, orderBy: createdAt, where: {{ "
+            f'indexer: "{indexer}", status: Active }}) {{ createdAt }} }}'
+        ) in query
+    assert query.count("subgraphDeployments(") == 2
+    assert mock_post.call_args.kwargs["timeout"] == freshness_sources.SECOND_OPINION_READ_TIMEOUT
+
+
+@patch("requests.post")
+def test_second_opinion_deployments_come_back_with_when_each_was_first_allocated(mock_post):
+    unusable = [
+        {"ipfsHash": "not-a-hash", "indexerAllocations": [{"createdAt": "5"}]},
+        {"ipfsHash": "Qm" + "E" * 44, "indexerAllocations": []},
+        {"ipfsHash": "Qm" + "F" * 44, "indexerAllocations": [{"createdAt": "soon"}]},
+        "not a row",
+    ]
+    mock_post.return_value = _reply(
+        {"a0": [_deployment_row("C", 100), _deployment_row("D", 200), *unusable], "a1": []}
+    )
+
+    deployments = read_deployments_on_chain(URL, [INDEXER_A, INDEXER_B], "mainnet")
+
+    assert deployments == {INDEXER_A: {"Qm" + "C" * 44: 100, "Qm" + "D" * 44: 200}, INDEXER_B: {}}
+
+
+@pytest.mark.parametrize(
+    "data", [{}, {"a0": None}, {"a0": {"ipfsHash": "Qm" + "C" * 44}}, {"a0": "rows"}]
+)
+@patch("requests.post")
+def test_a_malformed_second_opinion_deployments_reply_is_a_failed_read(mock_post, data):
+    mock_post.return_value = _reply(data)
+
+    with pytest.raises(SubgraphResponseError):
+        read_deployments_on_chain(URL, [INDEXER_A], "mainnet")
+
+
+@patch("requests.post")
+def test_second_opinion_deployments_are_read_in_1_attempt(mock_post):
+    mock_post.side_effect = requests.ConnectionError("refused")
+
+    with pytest.raises(requests.ConnectionError):
+        read_deployments_on_chain(URL, [INDEXER_A], "mainnet")
+
+    assert mock_post.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("indexers", "chain"),
+    [(["0x1234"], "mainnet"), ([INDEXER_A + "\n"], "mainnet"), ([INDEXER_A], "main net")],
+)
+def test_unchecked_text_never_goes_into_the_second_opinion_query(indexers, chain):
+    with patch("requests.post") as mock_post:
+        with pytest.raises(ValueError):
+            read_deployments_on_chain(URL, indexers, chain)
+
+    mock_post.assert_not_called()
+
+
+@patch("requests.post")
+def test_a_quote_in_a_chain_name_cannot_break_out_of_the_query_string(mock_post):
+    mock_post.return_value = _reply({"a0": []})
+
+    read_deployments_on_chain(URL, [INDEXER_A], 'main"net')
+
+    assert 'network: "main\\"net"' in mock_post.call_args.kwargs["json"]["query"]

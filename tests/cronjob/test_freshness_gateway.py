@@ -14,7 +14,7 @@ from aiohttp.test_utils import TestServer
 sys.path.insert(0, str(Path(__file__).parents[2] / "cronjobs" / "compute_scores"))
 
 from freshness_gateway import FRESHNESS_QUERY, GatewayClient  # noqa: E402
-from freshness_rules import GatewayReply, GatewayUnreachable  # noqa: E402
+from freshness_rules import GatewayReply, GatewayUnreachable, judge  # noqa: E402
 
 FAKE_KEY = "fake-freshness-key-0000"
 DEPLOYMENT = "Qm" + "A" * 44
@@ -98,3 +98,20 @@ async def test_a_refused_connection_is_unreachable_and_never_shows_the_key():
     assert isinstance(reply, GatewayUnreachable)
     assert reply.detail.startswith("connection error: ")
     assert FAKE_KEY not in reply.detail
+
+
+async def test_a_gateway_message_repeating_the_key_never_shows_any_of_it(fake_gateway):
+    # What gets stored is cut to 300 characters, so a key lying across that cut must already
+    # be gone, or a piece of it would be left behind.
+    server, _, behaviour = fake_gateway
+    message = "auth error: " + "x" * 278 + FAKE_KEY + " is not allowed"
+    behaviour.update(headers={}, body={"errors": [{"message": message}]})
+
+    async with GatewayClient(str(server.make_url("/api")), FAKE_KEY, timeout=5) as gateway:
+        reply = await gateway.ask(DEPLOYMENT, INDEXER)
+
+    assert isinstance(reply, GatewayReply)
+    assert FAKE_KEY.encode() not in reply.body
+    detail = judge(reply, 36).detail
+    assert detail is not None and detail.endswith("<redacted>")
+    assert FAKE_KEY[:6] not in detail

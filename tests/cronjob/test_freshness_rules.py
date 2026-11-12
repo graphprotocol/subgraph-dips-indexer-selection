@@ -18,15 +18,20 @@ from freshness_rules import (  # noqa: E402
     CheckResult,
     GatewayReply,
     GatewayUnreachable,
+    Judgement,
     apply_general_fault,
+    blame_refused_payment,
     dips_pairs,
     eligible_deployments,
+    escrow_is_funded,
     first_allocation_lookups,
     format_minute,
+    is_broken_for_everyone,
     is_general_fault,
     judge,
     minute_payload,
     supported_chains,
+    supports_broken_verdict,
 )
 
 NOW = 1_794_345_636.0
@@ -605,3 +610,118 @@ def test_minute_payload_has_the_contract_shape():
 
 def test_format_minute_is_utc_iso_with_a_z():
     assert format_minute(0.0) == "1970-01-01T00:00:00Z"
+
+
+# ---------------------------------------------------------------------------
+# Whose fault a refused payment is
+# ---------------------------------------------------------------------------
+
+PAYER = "0x" + "9" * 40
+OTHER_PAYER = "0x" + "8" * 40
+
+
+def _account(payer, balance, thawing="0"):
+    return {
+        "payer": {"id": payer},
+        "collector": "0x" + "7" * 40,
+        "balance": balance,
+        "totalAmountThawing": thawing,
+    }
+
+
+@pytest.mark.parametrize(
+    ("accounts", "funded"),
+    [
+        ([_account(PAYER, "1000")], True),
+        ([_account(PAYER.upper().replace("0X", "0x"), "1000", "999")], True),
+        ([_account(PAYER, "0")], False),
+        ([_account(PAYER, "1000", "1000")], False),
+        ([_account(OTHER_PAYER, "1000")], False),
+        ([_account(OTHER_PAYER, "1000"), _account(PAYER, "5", "0")], True),
+        ([], False),
+    ],
+)
+def test_escrow_is_funded_when_a_listed_payer_holds_more_than_it_is_withdrawing(accounts, funded):
+    assert escrow_is_funded(accounts, {PAYER}) is funded
+
+
+@pytest.mark.parametrize(
+    "accounts",
+    [None, "nope", [_account(PAYER, "lots")], [{"payer": {"id": PAYER}, "balance": "1"}]],
+)
+def test_unreadable_escrow_raises(accounts):
+    with pytest.raises(ValueError):
+        escrow_is_funded(accounts, {PAYER})
+
+
+COLLECTOR = "0x" + "7" * 40
+OTHER_COLLECTOR = "0x" + "6" * 40
+
+
+@pytest.mark.parametrize(
+    ("collector", "funded"),
+    [(None, True), (COLLECTOR, False), (OTHER_COLLECTOR, True)],
+)
+def test_only_the_gateways_collector_counts_when_one_is_set(collector, funded):
+    accounts = [
+        {**_account(PAYER, "0"), "collector": COLLECTOR},
+        {**_account(PAYER, "1000"), "collector": OTHER_COLLECTOR.upper().replace("0X", "0x")},
+    ]
+
+    assert escrow_is_funded(accounts, {PAYER}, collector) is funded
+
+
+def test_an_unreadable_account_of_another_payer_is_ignored():
+    assert escrow_is_funded([_account(OTHER_PAYER, "lots"), _account(PAYER, "3")], {PAYER})
+
+
+@pytest.mark.parametrize(
+    ("funded", "blame"),
+    [
+        (True, (FAIL, "payment_refused")),
+        (False, (VOID, "escrow_empty")),
+        (None, (FAIL, "payment_refused")),
+    ],
+)
+def test_a_refused_payment_counts_against_the_indexer_unless_its_escrow_is_known_empty(
+    funded, blame
+):
+    """An indexer can answer with its own error reading "402", which the gateway reports exactly
+    like a real refusal, so an escrow nobody could read must not excuse it."""
+    assert blame_refused_payment(funded) == blame
+
+
+# ---------------------------------------------------------------------------
+# A subgraph broken for every indexer on it
+# ---------------------------------------------------------------------------
+
+STALE_ANSWER = Judgement(FAIL, "stale", age_seconds=900.0, attested=True)
+NO_TIMESTAMP_ANSWER = Judgement(FAIL, "no_timestamp", attested=True)
+FRESH_ANSWER = Judgement(PASS, age_seconds=1.0, attested=True)
+TIMED_OUT = Judgement(FAIL, "indexer_timeout")
+
+
+@pytest.mark.parametrize(
+    ("on_subgraph", "elsewhere", "supports"),
+    [
+        (STALE_ANSWER, FRESH_ANSWER, True),
+        (NO_TIMESTAMP_ANSWER, FRESH_ANSWER, True),
+        (STALE_ANSWER, STALE_ANSWER, False),
+        (STALE_ANSWER, None, False),
+        (FRESH_ANSWER, FRESH_ANSWER, False),
+        (TIMED_OUT, FRESH_ANSWER, False),
+        (None, FRESH_ANSWER, False),
+    ],
+)
+def test_an_indexer_supports_a_broken_verdict_only_when_fresh_elsewhere(
+    on_subgraph, elsewhere, supports
+):
+    assert supports_broken_verdict(on_subgraph, elsewhere) is supports
+
+
+@pytest.mark.parametrize(
+    ("supporters", "anyone_fresh", "broken"),
+    [(2, False, True), (3, False, True), (1, False, False), (2, True, False), (0, False, False)],
+)
+def test_broken_needs_2_supporters_and_nobody_fresh(supporters, anyone_fresh, broken):
+    assert is_broken_for_everyone(supporters, anyone_fresh) is broken

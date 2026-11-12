@@ -32,6 +32,8 @@ KEY_OUT_OF_FUNDS = "key_out_of_funds"
 PAIRING_UNKNOWN = "pairing_unknown"
 GENERAL_FAULT = "general_fault"
 NOT_SENT = "not_sent"
+ESCROW_EMPTY = "escrow_empty"
+SUBGRAPH_BROKEN = "subgraph_broken"
 
 # The gateway returns an indexer's answer with the indexer's signature in this header and its own
 # messages without it. Only the header decides which is which: an indexer could sign a body that
@@ -52,6 +54,10 @@ MAX_PAIRS = 50_000
 # than half didn't answer.
 GENERAL_FAULT_ALL_SILENT_MIN = 3
 GENERAL_FAULT_MAJORITY_SILENT_MIN = 10
+
+# A subgraph is broken for everyone when at least this many indexers are behind on it while
+# fresh on another subgraph of the same chain, and none answered fresh on it.
+BROKEN_SUBGRAPH_MIN_SUPPORTERS = 2
 
 _INDEXER_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _DEPLOYMENT_HASH = re.compile(r"^Qm[1-9A-HJ-NP-Za-km-z]{44}$")
@@ -148,6 +154,9 @@ class Targets:
 
     pairs: tuple[tuple[str, str], ...]
     eligible: Mapping[tuple[str, str], tuple[str, ...]]
+    # Whether the gateway's escrow for each indexer holds funds. A refused payment from an
+    # indexer missing here counts against it, as only an escrow known to be empty excuses one.
+    escrow_funded: Mapping[str, bool] = field(default_factory=dict)
 
 
 def truncate_detail(text: Optional[str]) -> Optional[str]:
@@ -261,8 +270,8 @@ def _bad_indexer_outcome(message: str) -> tuple[str, str]:
     match = _BAD_INDEXER_ERROR.match(message)
     error = match.group("error") if match else ""
     if _PAYMENT_REFUSED_ERROR.match(error):
-        # Whose fault a refused payment is depends on the gateway's escrow, which is not read
-        # here, so it is not counted for now.
+        # Void until the gateway's escrow is checked (blame_refused_payment). An indexer can send
+        # this same text as its own error, so only an escrow known to be empty excuses it.
         return VOID, PAYMENT_REFUSED
     if error.startswith("Timeout"):
         return FAIL, INDEXER_TIMEOUT
@@ -500,3 +509,74 @@ def minute_payload(minute_start: float, results: Iterable[CheckResult]) -> dict[
         "minute": format_minute(minute_start),
         "outcomes": [result.to_payload() for result in results],
     }
+
+
+# ---------------------------------------------------------------------------
+# Whose fault a refused payment is
+# ---------------------------------------------------------------------------
+
+
+def _is_gateways_account(
+    account: object, payers: Collection[str], collector: Optional[str]
+) -> bool:
+    payer = _get_dict(account, "payer")
+    payer_id = payer.get("id") if payer else None
+    if not isinstance(payer_id, str) or payer_id.lower() not in payers:
+        return False
+    account_collector = account.get("collector") if isinstance(account, dict) else None
+    return collector is None or str(account_collector).lower() == collector
+
+
+def escrow_is_funded(
+    accounts: object, payers: Collection[str], collector: Optional[str] = None
+) -> bool:
+    """True when, for at least 1 of ``payers`` (and under ``collector`` when given), an escrow
+    account holds more than it is withdrawing. Raises ValueError when the accounts can't be
+    read."""
+    if not isinstance(accounts, list):
+        raise ValueError(f"escrow accounts are not a list: {accounts!r:.100}")
+    for account in accounts:
+        if not _is_gateways_account(account, payers, collector):
+            continue
+        try:
+            available = int(account["balance"]) - int(account["totalAmountThawing"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"unreadable escrow amounts: {account!r:.200}") from None
+        if available > 0:
+            return True
+    return False
+
+
+def blame_refused_payment(escrow_funded: Optional[bool]) -> tuple[str, str]:
+    """A refused payment counts against the indexer unless the gateway's escrow for it is known
+    to be empty, which is the gateway's fault. The gateway reports an indexer's own error text
+    reading "402" exactly like a real refusal, so an escrow nobody could read excuses nothing."""
+    if escrow_funded is False:
+        return VOID, ESCROW_EMPTY
+    return FAIL, PAYMENT_REFUSED
+
+
+# ---------------------------------------------------------------------------
+# A subgraph broken for every indexer on it
+# ---------------------------------------------------------------------------
+
+
+def is_behind(judgement: Optional[Judgement]) -> bool:
+    """An answer whose block was too old, or so old that it had no timestamp."""
+    return (
+        judgement is not None
+        and judgement.outcome == FAIL
+        and judgement.reason in (STALE, NO_TIMESTAMP)
+    )
+
+
+def supports_broken_verdict(
+    on_subgraph: Optional[Judgement], elsewhere: Optional[Judgement]
+) -> bool:
+    """An indexer behind on the subgraph but fresh on another of the same chain: its own chain
+    data is fine, so the subgraph is what is stuck."""
+    return is_behind(on_subgraph) and elsewhere is not None and elsewhere.outcome == PASS
+
+
+def is_broken_for_everyone(supporters: int, anyone_fresh_on_it: bool) -> bool:
+    return supporters >= BROKEN_SUBGRAPH_MIN_SUPPORTERS and not anyone_fresh_on_it
