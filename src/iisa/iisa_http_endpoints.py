@@ -7,7 +7,7 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - GET /scores - Return the current scores snapshot (read token)
 - GET /scores/status - Return when the loaded scores were computed, for monitoring (read token)
 - GET /scores/weighted - Bulk weighted scores for every loaded indexer (read token)
-- GET /dips-indexers - Indexers selection would pick for a required ?chain (read token)
+- GET /dips-indexers - Indexers offering DIPs on a required ?chain (read token)
 - POST /sync-status - Push sync-status snapshot from the fetcher (push token)
 - POST /freshness - Push 1 minute of freshness outcomes from the prober (push token)
 - GET /freshness - Return each indexer's stale mark and freshness counts, by chain (read token)
@@ -44,9 +44,17 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-from .freshness import Check, FreshnessStore, load_state, minute_index, minute_text
+from .freshness import (
+    HISTORY_DAYS,
+    Check,
+    Enforcement,
+    FreshnessStore,
+    load_state,
+    minute_index,
+    minute_text,
+)
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
 from .score_loader import (
     STALE_SCORES_CRITICAL_HOURS,
@@ -86,6 +94,12 @@ class Settings(BaseSettings):
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
     freshness_file_path: str = "/app/scores/freshness.json"
+    # Chains, comma-separated, on which an indexer marked stale isn't picked for new
+    # agreements. Elsewhere the mark is only recorded and reported.
+    freshness_enforced_chains: Annotated[frozenset[str], NoDecode] = frozenset()
+    # How many minutes behind this service's clock an enforced chain's last counted check may
+    # be. Past that its marks are too old to trust, and selection there ignores them.
+    freshness_max_age_minutes: int = Field(default=60, ge=1)
     # Bearer token for pushing scores and sync status, also accepted on every read.
     # /health and /select-indexers take no token. When it is unset, a WARNING is
     # logged at startup and the pushes accept unauthenticated requests, as do the
@@ -111,6 +125,13 @@ class Settings(BaseSettings):
         if token is None:
             return None
         return token.strip() or None
+
+    @field_validator("freshness_enforced_chains", mode="before")
+    @classmethod
+    def _split_chains(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return frozenset(chain.strip() for chain in value.split(",") if chain.strip())
+        return value
 
 
 @lru_cache
@@ -284,9 +305,9 @@ class WeightedScoresResponse(BaseModel):
 
 
 class DipsIndexersResponse(BaseModel):
-    """Response for GET /dips-indexers: the indexers selection would pick for the
-    requested chain — answered their probe, support it, priced it. ``computed_at``
-    mirrors the push so callers can reject a stale snapshot. Example::
+    """Response for GET /dips-indexers: the indexers offering DIPs on the chain. Where freshness
+    is enforced there, selection also leaves out the ones marked stale. ``computed_at`` mirrors
+    the push so callers can reject an out-of-date snapshot. Example::
 
         {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2, "indexers": ["0xaa", "0xbb"]}
     """
@@ -466,8 +487,14 @@ class FreshnessPair(BaseModel):
 
 
 class FreshnessChain(BaseModel):
-    """Freshness on 1 chain, by indexer."""
+    """Freshness on 1 chain, by indexer. enforced says the chain is listed as enforced, and
+    enforcing that a check there also counted recently enough for a marked indexer to be
+    left out of new agreements. last_counted_minute is null when no check there has counted.
+    """
 
+    enforced: bool = False
+    enforcing: bool = False
+    last_counted_minute: Optional[str] = None
     indexers: dict[str, FreshnessPair] = {}
 
 
@@ -1174,10 +1201,11 @@ def dips_indexers(
     ),
     authorization: Optional[str] = Header(None),
 ) -> DipsIndexersResponse:
-    """Indexers selection would pick for ``chain``: answered their DIPs probe, support
-    the chain, and priced within the optional ``max_grt_per_30_days`` and
-    ``max_grt_per_billion_entities_per_30_days`` ceilings (omit either to skip it).
-    Omitting ``chain`` is a 422. Example: ``?chain=arbitrum-one&max_grt_per_30_days=4500``.
+    """Indexers offering DIPs on ``chain`` (a 422 if omitted), by selection's price test: they
+    answered their DIPs probe, support the chain and are priced within the optional
+    ``max_grt_per_30_days`` and ``max_grt_per_billion_entities_per_30_days`` ceilings (omit
+    either to skip it). Where freshness is enforced on the chain, selection also leaves out
+    indexers marked stale, which this list still includes. Example: ``?chain=arbitrum-one``.
     """
     _require_read_token(authorization)
 
@@ -1191,9 +1219,8 @@ def dips_indexers(
     if snap.data is None or snap.data.empty or "dips_supported_networks" not in snap.data.columns:
         return DipsIndexersResponse(computed_at=computed_at, count=0, indexers=[])
 
-    # Reuse the selection path's test so this endpoint and selection can't disagree:
-    # an indexer accepts DIPs for a chain only if it answered its probe, supports the
-    # chain, and priced it within the optional ceilings (None skips a ceiling).
+    # Selection's own price test: an indexer offers DIPs on a chain only if it answered its
+    # probe, supports the chain and priced it within the optional ceilings (None skips one).
     matched, _ = _filter_by_price(
         snap.data, chain, max_grt_per_30_days, max_grt_per_billion_entities_per_30_days
     )
@@ -1300,7 +1327,7 @@ def freshness_report(
 ) -> FreshnessResponse:
     """Each indexer's stale mark, last 10 minutes, latest outcome and 28-day counts, by chain."""
     _require_read_token(authorization)
-    return FreshnessResponse.model_validate(_state.freshness.snapshot())
+    return FreshnessResponse.model_validate(_state.freshness.snapshot(_enforcement()))
 
 
 @app.post("/get-score", response_model=ScoreResponse, responses=_documented_errors(400, 401, 503))
@@ -1873,6 +1900,79 @@ def _without_failing_members(history: pd.DataFrame, request: SelectionRequest) -
     return request.model_copy(update={"existing_indexers": kept})
 
 
+def _current_minute() -> int:
+    """This service's clock, as a minute counted from the Unix epoch."""
+    return minute_index(datetime.now(timezone.utc))
+
+
+def _enforcement() -> Enforcement:
+    settings = get_settings()
+    return Enforcement(
+        settings.freshness_enforced_chains, settings.freshness_max_age_minutes, _current_minute()
+    )
+
+
+def _checks_too_old(request: SelectionRequest, enforcement: Enforcement) -> bool:
+    """True, after a warning saying why, when the request's chain is enforced but no check
+    there counted recently enough for its marks to be trusted.
+    """
+    last_counted = _state.freshness.last_counted_minute(request.chain_id)
+    if enforcement.current(last_counted):
+        return False
+    if last_counted is None:
+        why = f"no freshness check on it has counted in the last {HISTORY_DAYS} days"
+    else:
+        why = (
+            f"its last counted check was {enforcement.now - last_counted} minutes ago, over "
+            f"the limit of {enforcement.max_age_minutes} set by IISA_FRESHNESS_MAX_AGE_MINUTES"
+        )
+    logger.warning(
+        "deployment=%s chain=%s is listed as enforced but freshness isn't enforced there, "
+        "since %s; candidates are picked as if the chain weren't listed",
+        request.deployment_id,
+        request.chain_id,
+        why,
+    )
+    return True
+
+
+def _stale_candidates(request: SelectionRequest, candidates: pd.DataFrame) -> list[str]:
+    """Candidates marked stale on the request's chain, or with no freshness record there, when
+    that chain is enforced and its checks are recent enough to trust. Group members are never
+    listed: a stale member keeps its place and still counts towards each metric's scale, as
+    members do on a chain that isn't enforced.
+    """
+    enforcement = _enforcement()
+    if request.chain_id not in enforcement.chains or _checks_too_old(request, enforcement):
+        return []
+    members = {member.lower() for member in request.existing_indexers or []}
+    ids = [ix for ix in candidates.get("indexer", pd.Series(dtype=object)) if isinstance(ix, str)]
+    pickable = [ix for ix in ids if ix.lower() not in members]
+    stale = sorted(_state.freshness.stale_indexers(request.chain_id, pickable))
+    logger.info(
+        "deployment=%s chain=%s left out %d of %d candidates as stale",
+        request.deployment_id,
+        request.chain_id,
+        len(stale),
+        len(pickable),
+    )
+    return stale
+
+
+def _without_stale_candidates(
+    request: SelectionRequest, candidates: pd.DataFrame
+) -> SelectionRequest:
+    """The request with its stale candidates added to the indexers that declined its
+    deployment, which keeps them from being picked and from setting each metric's scale.
+    """
+    stale = _stale_candidates(request, candidates)
+    if not stale:
+        return request
+    declined = dict(request.declined_indexers or {})
+    declined[request.deployment_id] = [*declined.get(request.deployment_id, []), *stale]
+    return request.model_copy(update={"declined_indexers": declined})
+
+
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """Run IndexerSelector and return a SelectionResponse for the deployment.
 
@@ -1898,6 +1998,7 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
     # Enrich with chain-specific price columns for normalization
     enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
+    request = _without_stale_candidates(request, enriched_history)
     synced_indexers = _synced_indexers_for(request.deployment_id)
     processor = _build_selector(request, enriched_history, synced_indexers)
     _log_selection_reasoning(processor, request.deployment_id)

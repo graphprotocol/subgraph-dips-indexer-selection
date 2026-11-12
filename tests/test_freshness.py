@@ -9,6 +9,7 @@ import pytest
 
 from iisa.freshness import (
     Check,
+    Enforcement,
     FreshnessStore,
     load_state,
     minute_index,
@@ -193,6 +194,118 @@ class TestStaleMark:
         assert _pair(store, chain=OTHER_CHAIN)["marked"] is True
 
 
+class TestStaleIndexers:
+    def test_marked_and_unrecorded_indexers_are_stale(self):
+        store = FreshnessStore()
+        _run(store, ["fail"] * 5)
+        unknown = "0x" + "c3" * 20
+
+        assert store.stale_indexers(CHAIN, [INDEXER, OTHER, unknown]) == {INDEXER, unknown}
+        assert store.stale_indexers(OTHER_CHAIN, [OTHER]) == {OTHER}
+
+    def test_indexers_are_looked_up_in_lower_case(self):
+        store = FreshnessStore()
+        _run(store, ["pass"] * 5)
+
+        assert store.stale_indexers(CHAIN, [INDEXER.upper().replace("0X", "0x")]) == set()
+
+    def test_snapshot_lists_enforced_chains_even_without_indexers(self):
+        store = FreshnessStore()
+        _push(store, START, _check("pass"))
+
+        chains = store.snapshot(Enforcement(frozenset({"amoy"}), 60, START))["chains"]
+
+        assert {chain: body["enforced"] for chain, body in chains.items()} == {
+            "amoy": True,
+            CHAIN: False,
+        }
+        assert chains["amoy"]["indexers"] == {}
+
+
+class TestLastCountedMinute:
+    @pytest.mark.parametrize("outcome", ["pass", "fail", "no_evidence"])
+    def test_counted_outcome_sets_its_chains_minute(self, outcome):
+        store = FreshnessStore()
+        _push(store, START, _check(outcome), _check("void", chain=OTHER_CHAIN))
+
+        assert store.last_counted_minute(CHAIN) == START
+        assert store.last_counted_minute(OTHER_CHAIN) is None
+
+    def test_void_outcomes_and_empty_pushes_leave_it_alone(self):
+        store = FreshnessStore()
+        _push(store, START, _check("pass"))
+        _push(store, START + 1, _check("void"), _check("void", indexer=OTHER))
+        _push(store, START + 2)
+
+        assert store.last_counted_minute(CHAIN) == START
+        assert store.last_minute == START + 2
+
+    def test_1_counted_outcome_on_the_chain_is_enough(self):
+        store = FreshnessStore()
+        _push(store, START, _check("pass"))
+        _push(store, START + 1, _check("void"), _check("fail", indexer=OTHER))
+
+        assert store.last_counted_minute(CHAIN) == START + 1
+
+    def test_forgotten_with_its_chain(self):
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        store.apply(START, [_check("pass", chain=OTHER_CHAIN)], saves.append)
+        store.apply(START + 28 * DAY, [_check("pass")], saves.append)
+
+        assert store.last_counted_minute(OTHER_CHAIN) is None
+        assert saves[-1]["last_counted"] == {CHAIN: START + 28 * DAY}
+
+    def test_read_without_waiting_for_the_lock(self):
+        store = FreshnessStore()
+        _push(store, START, _check("pass"))
+
+        with store._lock:
+            assert store.last_counted_minute(CHAIN) == START
+
+
+class TestEnforcement:
+    @pytest.mark.parametrize(
+        ("last_counted", "current"),
+        [(START + 100, True), (START + 40, True), (START + 39, False), (None, False)],
+        ids=["this-minute", "at-the-limit", "past-the-limit", "never"],
+    )
+    def test_checks_are_current_up_to_the_age_limit(self, last_counted, current):
+        assert Enforcement(frozenset({CHAIN}), 60, START + 100).current(last_counted) is current
+
+    def test_a_minute_ahead_of_the_clock_is_current(self):
+        assert Enforcement(frozenset({CHAIN}), 60, START).current(START + 3) is True
+
+    def test_snapshot_reports_each_chains_enforcement_and_last_counted_minute(self):
+        store = FreshnessStore()
+        _push(store, START, _check("pass"), _check("pass", chain=OTHER_CHAIN))
+        _push(store, START + 1, _check("void"), _check("void", chain=OTHER_CHAIN))
+        enforced = frozenset({CHAIN, "amoy"})
+
+        def chains(now: int) -> dict[str, tuple[bool, bool, Optional[str]]]:
+            report = store.snapshot(Enforcement(enforced, 60, now))["chains"]
+            return {
+                chain: (body["enforced"], body["enforcing"], body["last_counted_minute"])
+                for chain, body in report.items()
+            }
+
+        assert chains(START + 60) == {
+            CHAIN: (True, True, minute_text(START)),
+            OTHER_CHAIN: (False, False, minute_text(START)),
+            "amoy": (True, False, None),
+        }
+        assert chains(START + 61)[CHAIN] == (True, False, minute_text(START))
+
+    def test_snapshot_without_enforcement_enforces_nothing(self):
+        store = FreshnessStore()
+        _push(store, START, _check("pass"))
+
+        body = store.snapshot()["chains"][CHAIN]
+
+        assert (body["enforced"], body["enforcing"]) == (False, False)
+        assert body["last_counted_minute"] == minute_text(START)
+
+
 class TestPushes:
     def test_repeated_or_older_minute_is_ignored(self):
         saves: list[dict[str, Any]] = []
@@ -290,15 +403,39 @@ class TestSavedFile:
         for offset, outcome in enumerate(["no_evidence", "pass", "fail", "void", "pass", "pass"]):
             store.apply(START + offset, [_check(outcome), _check("fail", indexer=OTHER)], save)
         assert json.loads(path.read_text())["version"] == 1
+        assert json.loads(path.read_text())["last_counted"] == {CHAIN: START + 5}
 
         reloaded = FreshnessStore(load_state(str(path)))
 
         assert reloaded.snapshot() == store.snapshot()
         assert reloaded.last_minute == START + 5
+        assert reloaded.last_counted_minute(CHAIN) == START + 5
+        assert reloaded.stale_indexers(CHAIN, [INDEXER, OTHER]) == {OTHER}
         # The reloaded store keeps judging from where the saved one stopped.
         reloaded.apply(START + 6, [_check("pass")], _no_save)
         store.apply(START + 6, [_check("pass")], _no_save)
         assert reloaded.snapshot() == store.snapshot()
+
+    def test_file_saved_before_the_last_counted_minute_was_kept_loads(self, tmp_path, caplog):
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        for offset in range(5):
+            store.apply(
+                START + offset, [_check("pass"), _check("fail", indexer=OTHER)], saves.append
+            )
+        older = {key: value for key, value in saves[-1].items() if key != "last_counted"}
+        path = tmp_path / "freshness.json"
+        path.write_text(json.dumps(older))
+
+        with caplog.at_level(logging.WARNING, logger="iisa.freshness"):
+            reloaded = FreshnessStore(load_state(str(path)))
+
+        assert caplog.records == []
+        assert reloaded.last_minute == START + 4
+        assert reloaded.stale_indexers(CHAIN, [INDEXER, OTHER]) == {OTHER}
+        assert reloaded.last_counted_minute(CHAIN) is None
+        reloaded.apply(START + 5, [_check("pass")], _no_save)
+        assert reloaded.last_counted_minute(CHAIN) == START + 5
 
     def test_saved_file_keeps_only_the_window(self):
         saves: list[dict[str, Any]] = []

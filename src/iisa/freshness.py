@@ -9,7 +9,7 @@ is a UTC day.
 
 import logging
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 __all__ = [
     "Check",
+    "Enforcement",
     "FreshnessState",
     "FreshnessStore",
     "load_state",
@@ -104,6 +105,8 @@ class FreshnessState(BaseModel):
     received: set[int] = Field(default_factory=set)
     # Chain, then indexer.
     chains: dict[str, dict[str, PairState]] = Field(default_factory=dict)
+    # By chain, the last minute holding an outcome there that counted, meaning any but void.
+    last_counted: dict[str, int] = Field(default_factory=dict)
 
 
 def _window(pair: PairState, received: set[int], last_minute: int) -> tuple[int, int]:
@@ -156,11 +159,13 @@ def _record(state: FreshnessState, minute: int, check: Check) -> None:
         pair.last = last
     pair.minutes[minute] = check.outcome
     _count(pair, minute // MINUTES_PER_DAY, check.outcome)
+    if check.outcome != "void":
+        state.last_counted[check.chain] = minute
 
 
 def _prune(state: FreshnessState, last_minute: int) -> None:
     """Forget minutes outside the window, days older than HISTORY_DAYS, and pairs with no
-    outcome in HISTORY_DAYS.
+    outcome in HISTORY_DAYS, along with any chain left with no pairs.
     """
     window_start = last_minute - WINDOW_MINUTES + 1
     forget_before = last_minute - HISTORY_DAYS * MINUTES_PER_DAY
@@ -173,6 +178,7 @@ def _prune(state: FreshnessState, last_minute: int) -> None:
             state.chains[chain] = kept
         else:
             del state.chains[chain]
+            state.last_counted.pop(chain, None)
 
 
 def _trim(pair: PairState, last_minute: int) -> None:
@@ -211,18 +217,75 @@ def _report(pair: PairState, received: set[int], last_minute: int) -> dict[str, 
     }
 
 
+@dataclass(frozen=True)
+class Enforcement:
+    """The chains whose marks are meant to decide selection, how many minutes a chain's last
+    counted check may be behind ``now`` for them to still do so, and ``now``, the service's
+    current minute.
+    """
+
+    chains: frozenset[str]
+    max_age_minutes: int
+    now: int
+
+    def current(self, last_counted: Optional[int]) -> bool:
+        """Whether a chain whose last counted check was in the minute ``last_counted`` has
+        checks recent enough for its marks to be trusted.
+        """
+        return last_counted is not None and self.now - last_counted <= self.max_age_minutes
+
+
+_NOTHING_ENFORCED = Enforcement(frozenset(), 0, 0)
+
+
+def _chain_report(
+    chain: str, indexers: dict[str, Any], last_counted: Optional[int], enforcement: Enforcement
+) -> dict[str, Any]:
+    """1 chain as GET /freshness reports it."""
+    enforced = chain in enforcement.chains
+    return {
+        "enforced": enforced,
+        "enforcing": enforced and enforcement.current(last_counted),
+        "last_counted_minute": minute_text(last_counted) if last_counted is not None else None,
+        "indexers": indexers,
+    }
+
+
+@dataclass(frozen=True)
+class _Marks:
+    """The last minute applied, by chain the indexers not marked there, and by chain the last
+    minute a check there counted. Rebuilt after each push and swapped in with 1 assignment,
+    so selection reads it without the lock.
+    """
+
+    last_minute: Optional[int]
+    unmarked: Mapping[str, frozenset[str]]
+    last_counted: Mapping[str, int]
+
+
+def _marks_of(state: FreshnessState) -> _Marks:
+    unmarked = {
+        chain: frozenset(indexer for indexer, pair in pairs.items() if not pair.marked)
+        for chain, pairs in state.chains.items()
+    }
+    return _Marks(state.last_minute, unmarked, dict(state.last_counted))
+
+
 class FreshnessStore:
-    """The freshness state behind a lock, since pushes and reads run on different threads."""
+    """The freshness state behind a lock, since pushes and reads run on different threads.
+    Selection reads only the marks swapped in after each push, so it never waits for a push
+    to be recorded and saved.
+    """
 
     def __init__(self, state: Optional[FreshnessState] = None) -> None:
         self._state = state if state is not None else FreshnessState()
         self._lock = threading.Lock()
+        self._marks = _marks_of(self._state)
 
     @property
     def last_minute(self) -> Optional[int]:
         """The last minute applied, or None before the first push."""
-        with self._lock:
-            return self._state.last_minute
+        return self._marks.last_minute
 
     def apply(
         self, minute: int, checks: Sequence[Check], save: Callable[[dict[str, Any]], None]
@@ -243,26 +306,47 @@ class FreshnessStore:
             state.received.add(minute)
             _prune(state, minute)
             _update_marks(state, minute)
+            self._marks = _marks_of(state)
             save(state.model_dump(mode="json"))
             return True
 
-    def snapshot(self) -> dict[str, Any]:
-        """Every pair's mark, window, latest outcome and 28-day counts, by chain."""
+    def stale_indexers(self, chain: str, indexers: Iterable[str]) -> set[str]:
+        """The ``indexers`` that are marked on ``chain`` or have no record there, since an
+        indexer starts marked until it passes checks.
+        """
+        unmarked = self._marks.unmarked.get(chain, frozenset())
+        return {indexer for indexer in indexers if indexer.lower() not in unmarked}
+
+    def last_counted_minute(self, chain: str) -> Optional[int]:
+        """The last minute in which a check on ``chain`` counted, or None when none has in
+        HISTORY_DAYS.
+        """
+        return self._marks.last_counted.get(chain)
+
+    def snapshot(self, enforcement: Enforcement = _NOTHING_ENFORCED) -> dict[str, Any]:
+        """Every pair's mark, window, latest outcome and 28-day counts, by chain, with whether
+        each chain is enforced and enforcing under ``enforcement`` and the last minute a check
+        on it counted. An enforced chain is listed even with no indexers.
+        """
         with self._lock:
             state = self._state
-            if state.last_minute is None:
-                return {"last_minute": None, "chains": {}}
             last_minute = state.last_minute
-            chains = {
-                chain: {
-                    "indexers": {
+            reports: dict[str, dict[str, Any]] = {chain: {} for chain in sorted(enforcement.chains)}
+            if last_minute is not None:
+                for chain, pairs in state.chains.items():
+                    reports[chain] = {
                         indexer: _report(pair, state.received, last_minute)
                         for indexer, pair in pairs.items()
                     }
-                }
-                for chain, pairs in state.chains.items()
+            return {
+                "last_minute": minute_text(last_minute) if last_minute is not None else None,
+                "chains": {
+                    chain: _chain_report(
+                        chain, indexers, state.last_counted.get(chain), enforcement
+                    )
+                    for chain, indexers in reports.items()
+                },
             }
-            return {"last_minute": minute_text(last_minute), "chains": chains}
 
 
 def load_state(path: str) -> FreshnessState:
