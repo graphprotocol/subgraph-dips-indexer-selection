@@ -2,9 +2,10 @@
 
 Schemathesis reads the schema FastAPI publishes, generates requests that fit it and requests
 that break it, and sends them to the app in process. A test fails on any 5xx response and on
-any answer the schema does not list. Each request meets freshly seeded scores and sync status,
-and carries the push token, or in one test any bearer token, so the endpoints do real work.
-Since each request starts afresh, a last test pushes unusual scores and then reads them back.
+any answer the schema does not list. Each request meets freshly seeded scores, sync status and
+freshness, and carries the push token, or in one test any bearer token, so the endpoints do
+real work. Since each request starts afresh, a last test pushes unusual scores and then reads
+them back.
 """
 
 import copy
@@ -26,7 +27,8 @@ from schemathesis.specs.openapi.checks import (
 )
 
 from iisa import iisa_http_endpoints, score_loader
-from iisa.iisa_http_endpoints import IISAState, SelectionRequest, Settings
+from iisa.freshness import minute_index, minute_text
+from iisa.iisa_http_endpoints import FreshnessPush, IISAState, SelectionRequest, Settings
 
 PUSH_TOKEN = "schema-fuzz-push-token"
 AUTH_HEADERS = {"Authorization": f"Bearer {PUSH_TOKEN}"}
@@ -112,30 +114,55 @@ def _sync_status_payload() -> dict[str, Any]:
     }
 
 
-# The state _seed_state last made, and the scores and sync status it held then.
+def _freshness_push(minute: int) -> FreshnessPush:
+    """1 minute of freshness outcomes for the first 3 indexers on the test chain."""
+    outcomes = ["pass", "fail", "no_evidence"]
+    return FreshnessPush.model_validate(
+        {
+            "minute": minute_text(minute),
+            "outcomes": [
+                {"indexer": record["indexer"], "chain": CHAIN, "outcome": outcome}
+                for record, outcome in zip(SCORE_RECORDS, outcomes)
+            ],
+        }
+    )
+
+
+# The state _seed_state last made, and the scores, sync status and freshness it held then.
 _seeded: dict[str, Any] = {}
 
 
 def _seed_state() -> None:
-    """Replace the app's state with a fresh one holding the seeded scores and sync status."""
+    """Replace the app's state with a fresh one holding the seeded scores, sync status and
+    freshness, the last pushed a few minutes ago so that a later minute can still be pushed.
+    """
     state = IISAState()
     state.initialize(Settings())
     state.load_scores_from_records(copy.deepcopy(SCORE_RECORDS))
     state.load_sync_status_from_dict(_sync_status_payload())
+    freshness_minute = minute_index(datetime.now(timezone.utc)) - 3
+    state.apply_freshness(_freshness_push(freshness_minute))
     iisa_http_endpoints._state = state
-    _seeded.update(state=state, history=state.history, sync_status=state.sync_status)
+    _seeded.update(
+        state=state,
+        history=state.history,
+        sync_status=state.sync_status,
+        freshness_minute=freshness_minute,
+    )
 
 
 def _start_from_seeded_state() -> None:
-    """Seed the app's state unless it still holds the seeded scores and sync status, so a
-    request that pushes new ones cannot change what the next sees and each failure replays on
-    its own. A push swaps in new objects, so comparing them by identity spots one.
+    """Seed the app's state unless it still holds the seeded scores, sync status and
+    freshness, so a request that pushes new ones cannot change what the next sees and each
+    failure replays on its own. A scores or sync-status push swaps in new objects, so comparing
+    them by identity spots one, and an applied freshness push moves the last minute on.
     """
     state = iisa_http_endpoints._state
     if (
         state is not _seeded.get("state")
         or state.history is not _seeded["history"]
         or state.sync_status is not _seeded["sync_status"]
+        or state.freshness.last_minute != _seeded["freshness_minute"]
     ):
         _seed_state()
 
@@ -150,6 +177,7 @@ def app_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
         mp.setenv("IISA_PUSH_TOKEN", PUSH_TOKEN)
         mp.delenv("IISA_REQUIRE_PUSH_TOKEN", raising=False)
         mp.setenv("IISA_SYNC_STATUS_FILE_PATH", str(cache_dir / "sync_status.json"))
+        mp.setenv("IISA_FRESHNESS_FILE_PATH", str(cache_dir / "freshness.json"))
         mp.setattr(score_loader, "SCORES_FILE_PATH", str(cache_dir / "indexer_scores.json"))
         iisa_http_endpoints.get_settings.cache_clear()
         try:
@@ -187,8 +215,9 @@ SEEDED_BODY_IDS = {
 
 
 def _use_seeded_data(case: schemathesis.Case) -> None:
-    """Swap generated text ids for ones the seeded data matches, and give each pushed score
-    record the columns a push needs, so requests get past lookups, filters and checks.
+    """Swap generated text ids for ones the seeded data matches, give each pushed score
+    record the columns a push needs, and give a freshness push the minute after the seeded
+    one, so requests get past lookups, filters and checks.
     """
     if isinstance(case.body, dict):
         seeded = {
@@ -204,6 +233,8 @@ def _use_seeded_data(case: schemathesis.Case) -> None:
         ]
     if case.query and isinstance(case.query.get("chain"), str):
         case.query = {**case.query, "chain": CHAIN}
+    if case.path == "/freshness" and isinstance(case.body, dict) and "minute" in case.body:
+        case.body = {**case.body, "minute": minute_text(_seeded["freshness_minute"] + 1)}
 
 
 def _accepted_by_lenient_number_parsing(case: schemathesis.Case, status_code: int) -> bool:
@@ -232,17 +263,30 @@ def _rejected_by_push_checks(case: schemathesis.Case, response: schemathesis.Res
     )
 
 
+def _rejected_by_freshness_checks(case: schemathesis.Case, response: schemathesis.Response) -> bool:
+    """True when a freshness push got a 422 only from the checks its schema can't state: the
+    minute is a whole minute with a time zone and not ahead of the service's clock.
+    """
+    if (case.method, case.path, response.status_code) != ("POST", "/freshness", 422):
+        return False
+    return all(
+        error["type"] == "value_error" and error["loc"] == ["body", "minute"]
+        for error in response.json()["detail"]
+    )
+
+
 def _known_gaps(case: schemathesis.Case, response: schemathesis.Response) -> list[CheckFunction]:
     """Checks to skip for the cases that need a decision rather than a fix."""
     excluded: list[CheckFunction] = []
-    # Starlette answers OPTIONS /scores with `Allow: POST` alone, since GET and POST are two
-    # routes on one path and it stops at the first. Only a custom 405 handler would fix that.
-    if case.path == "/scores":
+    # Starlette answers OPTIONS /scores and /freshness with `Allow: POST` alone, since GET and
+    # POST are two routes on one path and it stops at the first. Only a custom 405 handler
+    # would fix that.
+    if case.path in ("/scores", "/freshness"):
         excluded.append(allow_header_conformance)
     # The push schema lists no required score columns and no type for the indexer, so a
     # schema-valid record can lack one or hold a number there and get a 422. Listing them
     # means settling which value types a push may carry.
-    if _rejected_by_push_checks(case, response):
+    if _rejected_by_push_checks(case, response) or _rejected_by_freshness_checks(case, response):
         excluded.append(positive_data_acceptance)
     # Accepting `"num_candidates": true` or `"max_grt_per_30_days": "4500"` follows pydantic's
     # lax mode. Making the request model strict would reject callers that send numbers as text.
