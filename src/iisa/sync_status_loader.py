@@ -18,6 +18,11 @@ __all__ = ["SyncStatusData", "SyncStatusLoader"]
 logger = logging.getLogger(__name__)
 
 
+def _utc_now() -> datetime:
+    """The current time; a function of its own so tests can move it."""
+    return datetime.now(timezone.utc)
+
+
 def _parse_fetched_at(indexer: str, fetched_at_str: Any) -> Optional[datetime]:
     """Parse an entry's fetched_at as an aware datetime, taking naive values as UTC.
 
@@ -62,16 +67,23 @@ def _readable_deployments(indexer: str, deployments: Any) -> list[str]:
 
 
 class SyncStatusData:
-    """Reverse index: deployment -> set[indexer] for synced+healthy deployments."""
+    """Reverse index: deployment -> set[indexer] for synced+healthy deployments.
+
+    An indexer's entry counts only while its fetched_at is within staleness_threshold_hours of
+    now, judged on every lookup rather than once when the snapshot is built, so a snapshot stops
+    counting once it is too old even when no newer push arrives to replace it.
+    """
 
     def __init__(
         self,
         raw: dict[str, Any],
         staleness_threshold_hours: float = 6.0,
     ):
-        now = datetime.now(timezone.utc)
+        now = _utc_now()
+        self._staleness_threshold_hours = staleness_threshold_hours
         self._deployment_index: dict[str, set[str]] = {}
-        self._indexer_count = 0
+        # When each indexed indexer's entry was fetched, the newest if it appears more than once.
+        self._fetched_at: dict[str, datetime] = {}
 
         for indexer, entry in raw.items():
             if not isinstance(entry, dict):
@@ -90,37 +102,51 @@ class SyncStatusData:
             if not deployments:
                 continue
 
-            self._indexer_count += 1
             indexer_lower = indexer.lower()
+            self._fetched_at[indexer_lower] = max(
+                fetched_at, self._fetched_at.get(indexer_lower, fetched_at)
+            )
             for deployment_id in deployments:
                 self._deployment_index.setdefault(deployment_id, set()).add(indexer_lower)
 
-        stale_count = len(raw) - self._indexer_count
+        stale_count = len(raw) - len(self._fetched_at)
         if stale_count > 0:
             logger.info(
                 "sync_status: loaded %d indexers, %d deployments (%d stale entries filtered)",
-                self._indexer_count,
+                len(self._fetched_at),
                 len(self._deployment_index),
                 stale_count,
             )
         else:
             logger.info(
                 "sync_status: loaded %d indexers, %d deployments",
-                self._indexer_count,
+                len(self._fetched_at),
                 len(self._deployment_index),
             )
 
+    def _counting_indexers(self) -> set[str]:
+        """The indexers whose entry is still young enough to count."""
+        now = _utc_now()
+        return {
+            indexer
+            for indexer, fetched_at in self._fetched_at.items()
+            if _is_fresh(fetched_at, now, self._staleness_threshold_hours)
+        }
+
     def synced_indexers_for(self, deployment_id: str) -> set[str]:
-        """Return indexer addresses synced+healthy for this deployment."""
-        return set(self._deployment_index.get(deployment_id, set()))
+        """Return the indexers synced+healthy for this deployment whose entry still counts."""
+        return self._deployment_index.get(deployment_id, set()) & self._counting_indexers()
 
     @property
     def total_indexers(self) -> int:
-        return self._indexer_count
+        """How many indexers have an entry that still counts."""
+        return len(self._counting_indexers())
 
     @property
     def total_deployments(self) -> int:
-        return len(self._deployment_index)
+        """How many deployments have at least 1 indexer whose entry still counts."""
+        counting = self._counting_indexers()
+        return sum(1 for indexers in self._deployment_index.values() if indexers & counting)
 
 
 class SyncStatusLoader:

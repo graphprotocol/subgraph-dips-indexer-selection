@@ -311,6 +311,8 @@ class HealthResponse(BaseModel):
 
     status: str
     data_loaded: bool
+    # True while the loaded sync status still has an entry young enough to count. Entries
+    # stop counting 6 hours after they were fetched, so this turns false when pushes stop.
     sync_status_loaded: bool = False
     # When the currently loaded scores were computed, and how old they are.
     # status flips to "degraded" once the age crosses the critical threshold,
@@ -1172,7 +1174,7 @@ async def health_check() -> HealthResponse:
     return HealthResponse(
         status=status,
         data_loaded=_state.is_ready,
-        sync_status_loaded=_state.sync_status is not None,
+        sync_status_loaded=_state.sync_status is not None and _state.sync_status.total_indexers > 0,
         computed_at=computed_at_iso,
         scores_age_hours=round(age_hours, 1) if age_hours is not None else None,
     )
