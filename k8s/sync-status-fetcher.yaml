@@ -8,8 +8,8 @@ metadata:
 spec:
   replicas: 1
   # A new pod passes its startup probe only after its first successful push, so a rolling
-  # update keeps the running pod, with its code, pushing every hour for as long as the new one
-  # cannot push. Stop the running pod first instead.
+  # update keeps the old pod, and the old code, pushing every hour for as long as the new one
+  # cannot push. Stop the old pod first instead.
   strategy:
     type: Recreate
   selector:
