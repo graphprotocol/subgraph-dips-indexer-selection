@@ -507,8 +507,12 @@ class IndexerSelector:
         self, existing_indexer: IndexerId
     ) -> Optional[tuple[IndexerId, IndexerId, float]]:
         """Return (existing_indexer, candidate, improvement) when existing_indexer
-        scores below MIN_INDEXER_SCORE and its best replacement beats it by more
-        than REPLACEMENT_MARGIN; None otherwise.
+        scores below MIN_INDEXER_SCORE and a candidate beats it by more than
+        REPLACEMENT_MARGIN; None otherwise.
+
+        A synced candidate is preferred. When that one gains too little, the best candidate
+        whatever its sync status is tried, so a synced candidate that falls short does not
+        end the search for this indexer's replacement.
         """
         current_score = self._score_of(existing_indexer)
         if current_score is None:
@@ -525,19 +529,18 @@ class IndexerSelector:
             )
             return None
 
-        # Find best candidate for replacing this specific indexer
-        candidate = self._find_best_replacement_or_select_best_indexer(
-            replacing_indexer=existing_indexer
-        )
-        if not candidate:
-            return None
-        candidate_score = self._score_of(candidate)
-        if candidate_score is None:
-            return None
-
-        # Only replace if candidate is significantly better
-        if candidate_score > current_score + REPLACEMENT_MARGIN:
-            return existing_indexer, candidate, candidate_score - current_score
+        # Find the best candidate for replacing this specific indexer, preferring a synced one
+        # first and then, if that gains too little, picking as if nobody were synced.
+        for prefer_synced in (True, False) if self.synced_indexers else (True,):
+            candidate = self._find_best_replacement_or_select_best_indexer(
+                replacing_indexer=existing_indexer, prefer_synced=prefer_synced
+            )
+            if not candidate:
+                continue
+            candidate_score = self._score_of(candidate)
+            # Only replace if candidate is significantly better
+            if candidate_score is not None and candidate_score > current_score + REPLACEMENT_MARGIN:
+                return existing_indexer, candidate, candidate_score - current_score
         return None
 
     def _unpickable_indexers(self) -> set[IndexerId]:
@@ -589,13 +592,14 @@ class IndexerSelector:
         )
 
     def _find_best_replacement_or_select_best_indexer(
-        self, replacing_indexer: Optional[IndexerId] = None
+        self, replacing_indexer: Optional[IndexerId] = None, prefer_synced: bool = True
     ) -> Optional[IndexerId]:
         """Pick the highest-scoring eligible indexer to add or to replace one.
         Skips indexers already in the group, on the denylist, with pending
         (unaccepted) agreements, or that previously declined this subgraph.
         replacing_indexer, when set, simulates the swap for the decentralisation
-        check. Returns the best indexer ID, or None if none qualify.
+        check. prefer_synced, when False, ranks candidates on score alone, as if
+        none were synced. Returns the best indexer ID, or None if none qualify.
         """
         unpickable_indexers = self._unpickable_indexers()
         logger.debug(
@@ -622,7 +626,8 @@ class IndexerSelector:
         )
 
         # Iterate pools in order, checking decentralisation
-        for pool_name, pool_df in self._candidate_pools(candidates):
+        pools = self._candidate_pools(candidates) if prefer_synced else [("all", candidates)]
+        for pool_name, pool_df in pools:
             for indexer in pool_df["indexer"]:
                 if self._meets_decentralization_requirements(
                     indexer, replacing_indexer=replacing_indexer

@@ -13,7 +13,8 @@ on its own thread.
 
 HTTP endpoints:
   GET /health  -- healthcheck (503 until the first push, and again once the
-                  last push is older than SYNC_STATUS_MAX_PUSH_AGE seconds)
+                  last push is older than SYNC_STATUS_MAX_PUSH_AGE seconds or
+                  the freshness prober has stopped)
 """
 
 import asyncio
@@ -280,11 +281,19 @@ def run_fetch_cycle() -> bool:
 
 
 def _health(now: datetime) -> tuple[int, dict]:
-    """The sync-status health, plus the freshness prober's last push when it runs; the
-    prober never changes the status code."""
+    """The sync-status health, plus the freshness prober's fields when it was started.
+
+    A prober whose thread has ended while the fetcher isn't shutting down makes this 503, so the
+    pod is restarted. One that runs but can't push leaves the code alone: IISA or the gateway
+    being down would otherwise restart this pod over and over.
+    """
     code, body = _sync_status_health(now)
-    if _freshness_prober is not None:
-        body["freshness"] = _freshness_prober.health(now)
+    prober = _freshness_prober
+    if prober is None:
+        return code, body
+    body["freshness"] = prober.health(now)
+    if prober.stopped and not _stop_event.is_set():
+        return 503, {**body, "status": "freshness_prober_stopped"}
     return code, body
 
 

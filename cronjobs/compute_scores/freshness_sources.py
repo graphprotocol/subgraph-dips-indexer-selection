@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Collection, Optional, Sequence
 
 import requests
+from escaping import for_log
 from freshness_rules import (
     MAX_PAIRS,
     Allocation,
+    LeftOut,
     Targets,
     dips_pairs,
     eligible_deployments,
@@ -199,6 +201,41 @@ def score_records(scores_response: Any) -> list:
     return records
 
 
+def _counted(count: int, noun: str) -> str:
+    return f"{count:,} {noun}" if count == 1 else f"{count:,} {noun}s"
+
+
+def _log_left_out(left_out: LeftOut) -> None:
+    """1 line for each kind of thing a refresh left out of GET /scores, however many there were."""
+    if left_out.no_price_field:
+        logger.warning(
+            "GET /scores records have no dips_min_grt_per_30_days field, so every chain an "
+            "indexer lists is checked, as selection applies no price filter without it"
+        )
+    if left_out.refused_names:
+        indexer, name = left_out.refused_names[0]
+        logger.warning(
+            "Left out chain names that aren't in The Graph's networks registry or "
+            "FRESHNESS_ADDITIONAL_NETWORKS: %s, listed by %s, such as %s from indexer %s",
+            _counted(len(left_out.refused_names), "chain name"),
+            _counted(len({indexer for indexer, _ in left_out.refused_names}), "indexer"),
+            for_log(name),
+            indexer,
+        )
+    if left_out.unreadable_prices:
+        logger.warning(
+            "Couldn't read the DIPs prices of %s, so none of their chains is checked, "
+            "such as indexer %s",
+            _counted(len(left_out.unreadable_prices), "indexer"),
+            left_out.unreadable_prices[0],
+        )
+    if left_out.unpriced:
+        logger.debug(
+            "Left out %s without a price, which selection can't pick an indexer on",
+            _counted(left_out.unpriced, "listed chain"),
+        )
+
+
 class TargetLoader:
     """Builds the Targets each minute checks, keeping first-allocation times between refreshes,
     since an indexer's first allocation on a deployment never changes."""
@@ -206,12 +243,14 @@ class TargetLoader:
     def __init__(
         self,
         *,
+        networks: Callable[[], Collection[str]],
         fetch_scores: Callable[[], Any],
         read_allocations: Callable[[Sequence[str]], list[Allocation]],
         read_first_allocations: Callable[[Sequence[tuple[str, str]]], dict[tuple[str, str], int]],
         min_allocation_age_seconds: float,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        self._networks = networks
         self._fetch_scores = fetch_scores
         self._read_allocations = read_allocations
         self._read_first_allocations = read_first_allocations
@@ -220,7 +259,10 @@ class TargetLoader:
         self._first_allocated: dict[tuple[str, str], int] = {}
 
     def __call__(self) -> Targets:
-        pairs = dips_pairs(score_records(self._fetch_scores()))
+        networks = self._networks()
+        left_out = LeftOut()
+        pairs = dips_pairs(score_records(self._fetch_scores()), networks, left_out)
+        _log_left_out(left_out)
         if len(pairs) > MAX_PAIRS:
             logger.error(
                 "%d (indexer, chain) pairs offer DIPs, more than 1 push holds; checking %d",

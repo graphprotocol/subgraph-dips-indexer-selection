@@ -1,5 +1,6 @@
 """Tests for how the freshness prober reads what to check, with every HTTP call faked."""
 
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -10,6 +11,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).parents[2] / "cronjobs" / "compute_scores"))
 
 import freshness_sources  # noqa: E402
+from freshness_registry import NetworksRegistry, RegistryUnavailable  # noqa: E402
 from freshness_rules import Allocation, Targets  # noqa: E402
 from freshness_sources import (  # noqa: E402
     TargetLoader,
@@ -150,9 +152,11 @@ class _Sources:
         self.first_allocations = first_allocations or {}
         self.allocation_reads = []
         self.first_allocation_reads = []
+        self.networks = lambda: frozenset({"arbitrum-one", "matic", "mainnet", "base"})
 
     def loader(self, clock=lambda: NOW):
         return TargetLoader(
+            networks=lambda: self.networks(),
             fetch_scores=lambda: self.scores,
             read_allocations=self._read_allocations,
             read_first_allocations=self._read_first_allocations,
@@ -177,15 +181,21 @@ def _scores(*records):
     return {"computed_at": "2026-11-10T00:00:00Z", "count": len(records), "scores": list(records)}
 
 
+def _offer(indexer, chains, prices=None):
+    """A GET /scores record offering DIPs on ``chains``, each priced unless ``prices`` is given."""
+    return {
+        "indexer": indexer,
+        "dips_supported_networks": list(chains),
+        "dips_min_grt_per_30_days": dict.fromkeys(chains, 100.0) if prices is None else prices,
+    }
+
+
 def test_targets_pair_each_dips_chain_with_its_eligible_deployments():
     young = _allocation(INDEXER_A, "B", int(NOW - DAY))
     sources = _Sources(
         _scores(
-            {
-                "indexer": INDEXER_A.upper().replace("0X", "0x"),
-                "dips_supported_networks": ('["arbitrum-one", "matic"]'),
-            },
-            {"indexer": INDEXER_B, "dips_supported_networks": "[]"},
+            _offer(INDEXER_A.upper().replace("0X", "0x"), ["arbitrum-one", "matic"]),
+            _offer(INDEXER_B, []),
         ),
         [
             _allocation(INDEXER_A, "A", int(NOW - 9 * DAY)),
@@ -205,10 +215,130 @@ def test_targets_pair_each_dips_chain_with_its_eligible_deployments():
     assert sources.first_allocation_reads == [[(INDEXER_A, young.deployment_id)]]
 
 
+def test_a_chain_the_indexer_lists_without_a_price_is_not_checked():
+    sources = _Sources(
+        _scores(_offer(INDEXER_A, ["arbitrum-one", "matic"], {"arbitrum-one": 100.0})),
+        [_allocation(INDEXER_A, "A", int(NOW - 9 * DAY), chain="matic")],
+    )
+
+    assert sources.loader()().pairs == ((INDEXER_A, "arbitrum-one"),)
+
+
+def test_an_indexer_listing_150_known_networks_is_checked_on_all_of_them(caplog):
+    """Made-up chain names can't crowd out real ones, so no indexer needs a cap."""
+    many = [f"chain-{n:03d}" for n in range(150)]
+    sources = _Sources(_scores(_offer(INDEXER_A, many), _offer(INDEXER_B, ["mainnet"])), [])
+    sources.networks = lambda: frozenset([*many, "mainnet"])
+
+    with caplog.at_level(logging.WARNING):
+        targets = sources.loader()()
+
+    assert len(targets.pairs) == 151
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def _warnings(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_refused_chain_names_get_1_warning_per_refresh(caplog):
+    """Nothing is dropped silently, and 1 line covers them however many there are."""
+    sources = _Sources(
+        _scores(
+            _offer(INDEXER_A, ["mainnet", "bad\nname", 7]),
+            _offer(INDEXER_B, ["\ud800", "base", "made-up"]),
+        ),
+        [],
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        targets = sources.loader()()
+
+    assert targets.pairs == ((INDEXER_A, "mainnet"), (INDEXER_B, "base"))
+    (warning,) = _warnings(caplog)
+    assert "4 chain names" in warning and "listed by 2 indexers" in warning
+    assert "networks registry" in warning
+    assert INDEXER_A in warning and "bad\\nname" in warning and "\n" not in warning
+
+
+def test_unreadable_price_fields_get_1_warning_per_refresh(caplog):
+    sources = _Sources(
+        _scores(
+            _offer(INDEXER_A, ["mainnet"], "x{"),
+            _offer(INDEXER_B, ["mainnet"], ["mainnet"]),
+            _offer("0x" + "c" * 40, ["mainnet"]),
+        ),
+        [],
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        targets = sources.loader()()
+
+    assert targets.pairs == (("0x" + "c" * 40, "mainnet"),)
+    (warning,) = _warnings(caplog)
+    assert "2 indexers" in warning and INDEXER_A in warning
+
+
+def test_a_listed_chain_without_a_price_is_logged_at_debug_only(caplog):
+    """An indexer listing a chain it hasn't priced yet is ordinary."""
+    sources = _Sources(
+        _scores(_offer(INDEXER_A, ["mainnet", "matic", "base"], {"mainnet": 100.0})), []
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        sources.loader()()
+
+    assert _warnings(caplog) == []
+    assert any("2 listed chains" in r.getMessage() for r in caplog.records)
+
+
+def test_scores_without_a_price_field_check_every_listed_chain_with_a_warning(caplog):
+    """Selection applies no price filter when the scores carry no price field at all, so every
+    listed chain can be picked and is worth checking."""
+    records = [{"indexer": INDEXER_A, "dips_supported_networks": ["mainnet", "base"]}]
+    sources = _Sources(_scores(*records), [])
+
+    with caplog.at_level(logging.WARNING):
+        targets = sources.loader()()
+
+    assert targets.pairs == ((INDEXER_A, "base"), (INDEXER_A, "mainnet"))
+    (warning,) = _warnings(caplog)
+    assert "dips_min_grt_per_30_days" in warning
+
+
+def _registry(document_or_error, additional=()):
+    def fetch(url):
+        if isinstance(document_or_error, Exception):
+            raise document_or_error
+        return document_or_error
+
+    return NetworksRegistry(
+        "https://registry.example.com/networks.json", additional, fetch=fetch, clock=lambda: NOW
+    )
+
+
+def test_a_chain_from_the_additional_networks_setting_is_checked():
+    sources = _Sources(_scores(_offer(INDEXER_A, ["mainnet", "hardhat", "made-up"])), [])
+    sources.networks = _registry({"networks": [{"id": "mainnet"}]}, ["hardhat"]).networks
+
+    targets = sources.loader()()
+
+    assert targets.pairs == ((INDEXER_A, "hardhat"), (INDEXER_A, "mainnet"))
+
+
+def test_before_any_registry_copy_has_loaded_a_refresh_fails_without_reading_the_scores():
+    """The prober logs the failed refresh as an error and checks nothing until a copy loads."""
+    sources = _Sources(None, [])
+    sources.networks = _registry(requests.ConnectionError("refused")).networks
+
+    with pytest.raises(RegistryUnavailable, match="refused"):
+        sources.loader()()
+
+
 def test_first_allocations_are_cached_across_refreshes():
     young = _allocation(INDEXER_A, "B", int(NOW - DAY))
     sources = _Sources(
-        _scores({"indexer": INDEXER_A, "dips_supported_networks": '["arbitrum-one"]'}),
+        _scores(_offer(INDEXER_A, ["arbitrum-one"])),
         [young],
         {(INDEXER_A, young.deployment_id): int(NOW - 2 * DAY)},
     )
@@ -228,7 +358,7 @@ def test_scores_without_records_fail_the_refresh(response):
 
 
 def test_no_dips_indexers_means_no_pairs_and_no_subgraph_read():
-    sources = _Sources(_scores({"indexer": INDEXER_A, "dips_supported_networks": "[]"}), [])
+    sources = _Sources(_scores(_offer(INDEXER_A, [])), [])
 
     assert sources.loader()() == Targets(pairs=(), eligible={})
     assert sources.allocation_reads == []

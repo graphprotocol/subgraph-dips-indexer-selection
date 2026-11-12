@@ -93,9 +93,9 @@ These secrets are created out of band and are never committed:
 Each caller should hold only the token it needs. The CronJob and the sync-status fetcher
 push, so they hold `iisa-push-token`. Dipper only reads, from `GET /dips-indexers`, so it
 should hold `iisa-read-token` and not the push token: the service accepts the read token on
-every endpoint that only reads and refuses it on `POST /scores` and `POST /sync-status`, so
-whoever obtains dipper's token cannot rewrite the scores and sync status that decide who is
-paid. Until `iisa-read-token` exists, dipper needs the push token to read. The service reads
+every endpoint that only reads and refuses it on `POST /scores`, `POST /sync-status` and
+`POST /freshness`, so whoever obtains dipper's token cannot rewrite the scores, sync status
+and freshness checks that decide who is paid. Until `iisa-read-token` exists, dipper needs the push token to read. The service reads
 both tokens when it starts, so a changed secret takes effect when the pod next restarts.
 
 The CronJob also needs the `iisa-redpanda-config` ConfigMap, which each environment
