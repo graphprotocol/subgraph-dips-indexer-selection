@@ -14,21 +14,26 @@ from pathlib import Path
 
 import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
+import processing  # noqa: E402
 from processing import _fetch_single_graph_node_version_async  # noqa: E402
 
 
 class _FakeContent:
-    """Mimics `aiohttp.ClientResponse.content.read(n)` for size-capped reads."""
+    """Mimics `aiohttp.ClientResponse.content.read(n)`: each read returns the next part of the
+    body, at most `n` bytes of it, and an empty read means the body has ended."""
 
     def __init__(self, body_bytes: bytes):
         self._body = body_bytes
 
     async def read(self, n: int) -> bytes:
-        return self._body[:n]
+        piece, self._body = self._body[:n], self._body[n:]
+        return piece
 
 
 class _FakeRequestInfo:
@@ -40,6 +45,9 @@ class _FakeRequestInfo:
 
 
 class _FakeResponse:
+    # No declared length, so the size limit is enforced by counting what arrives.
+    content_length = None
+
     def __init__(self, body, status=200, oversize_bytes: int = 0):
         # body is a Python dict — encode once and store. oversize_bytes lets a
         # test simulate a response that exceeds the configured cap so the
@@ -86,6 +94,8 @@ class _HtmlResponse:
     """Stub that returns raw non-JSON bytes from `content.read`. Used to
     cover the malformed-body branch: aiohttp itself is happy with the
     response (2xx, valid framing), only `json.loads` rejects the body."""
+
+    content_length = None
 
     def __init__(self, body_bytes: bytes = b"<html>Bad Gateway</html>", status: int = 200):
         self.content = _FakeContent(body_bytes)
@@ -332,8 +342,10 @@ def test_fetch_oversized_response_returns_unknown(semaphore, monkeypatch):
         )
     )
 
-    # Assert — overflow triggered the failure path, all retries consumed.
+    # Assert — overflow triggered the failure path. The same indexer would send the same
+    # oversized reply again, so it is asked only once.
     assert result["graph_node_version"] is None
+    assert len(session.calls) == 1
 
 
 def test_fetch_5xx_retries_then_succeeds(semaphore, monkeypatch):
@@ -383,14 +395,14 @@ def test_fetch_handles_malformed_json_body(semaphore, monkeypatch):
         )
     )
 
-    # Assert — JSONDecodeError was caught and treated like any transient
-    # failure: three attempts, all-None record returned.
+    # Assert — JSONDecodeError was caught and the record is all-None. The whole
+    # body was read, so asking again would get the same page: 1 attempt only.
     assert result == {
         "indexer": "0xhtml",
         "graph_node_version": None,
         "graph_node_commit": None,
     }
-    assert len(session.calls) == 3
+    assert len(session.calls) == 1
 
 
 def test_fetch_handles_invalid_utf8_body(semaphore, monkeypatch):
@@ -401,9 +413,8 @@ def test_fetch_handles_invalid_utf8_body(semaphore, monkeypatch):
 
     monkeypatch.setattr("processing.asyncio.sleep", _no_sleep)
 
-    # Provide one bad-bytes response per retry attempt; the decode error
-    # is transient-like (could in principle be a partial read), so the
-    # fetcher exhausts the retry budget before giving up.
+    # Provide one bad-bytes response per possible attempt. The whole body is
+    # read, so the same bytes would come back and only 1 attempt should be made.
     session = _FakeSession([_HtmlResponse(body_bytes=b"\xc3\x28\xff\xfe") for _ in range(3)])
 
     # Act
@@ -416,7 +427,34 @@ def test_fetch_handles_invalid_utf8_body(semaphore, monkeypatch):
     # Assert — the decode error was caught; the record falls through to
     # all-None and the cron run continues.
     assert result["graph_node_version"] is None
-    assert len(session.calls) == 3
+    assert len(session.calls) == 1
+
+
+def test_fetch_handles_deeply_nested_body(semaphore, monkeypatch):
+    # Arrange — about 40 KB of nested brackets, well under the size limit, is deeper than the
+    # JSON reader can follow, so it raises RecursionError. Uncaught, that would escape through
+    # `asyncio.gather` and lose every indexer's version, failing the run when a minimum is set.
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr("processing.asyncio.sleep", _no_sleep)
+    deep = b"[" * 20_000 + b"]" * 20_000
+    session = _FakeSession([_HtmlResponse(body_bytes=deep) for _ in range(3)])
+
+    # Act
+    result = _run(
+        _fetch_single_graph_node_version_async(
+            session, indexer="0xdeep", url="http://i.example", semaphore=semaphore
+        )
+    )
+
+    # Assert — treated like any other unreadable body: all-None record, 1 attempt.
+    assert result == {
+        "indexer": "0xdeep",
+        "graph_node_version": None,
+        "graph_node_commit": None,
+    }
+    assert len(session.calls) == 1
 
 
 def test_fetch_handles_non_dict_version_field(semaphore):
@@ -459,3 +497,46 @@ def test_fetch_handles_top_level_array_body(semaphore):
     # Assert — shape mismatch handled cleanly, all-None record.
     assert result["graph_node_version"] is None
     assert result["graph_node_commit"] is None
+
+
+# --- Reading the whole reply when it arrives in more than 1 piece ---------------------------
+#
+# A proxy that streams, or a slow link, can deliver an honest reply in several pieces. Reading
+# only the first piece left the rest unread, so the version failed to parse and was recorded as
+# unknown. These tests serve the reply from a local aiohttp server so the real reading runs.
+
+
+@pytest.mark.parametrize(
+    "declare_length", [True, False], ids=["declared-length", "no-declared-length"]
+)
+def test_reply_sent_in_2_pieces_is_read_whole(declare_length, monkeypatch):
+    # 1 attempt only, so a first read that comes back short cannot be rescued by a retry.
+    monkeypatch.setattr(processing, "GRAPH_NODE_VERSION_MAX_RETRIES", 1)
+    body = json_module.dumps({"data": {"version": {"version": "0.36.0", "commit": "abc"}}}).encode()
+
+    async def handler(request):
+        resp = web.StreamResponse(headers={"Content-Type": "application/json"})
+        if declare_length:
+            resp.content_length = len(body)
+        await resp.prepare(request)
+        await resp.write(body[:20])
+        await asyncio.sleep(0.2)
+        await resp.write(body[20:])
+        await resp.write_eof()
+        return resp
+
+    async def run():
+        app = web.Application()
+        app.router.add_post("/status", handler)
+        async with TestServer(app) as server, aiohttp.ClientSession() as session:
+            return await _fetch_single_graph_node_version_async(
+                session, "0xpieces", str(server.make_url("/")), asyncio.Semaphore(1)
+            )
+
+    result = _run(run())
+
+    assert result == {
+        "indexer": "0xpieces",
+        "graph_node_version": "0.36.0",
+        "graph_node_commit": "abc",
+    }

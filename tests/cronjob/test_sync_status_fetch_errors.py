@@ -5,7 +5,10 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "cronjobs" / "compute_scores"))
 
@@ -18,11 +21,14 @@ from sync_status_fetcher import (  # noqa: E402
 )
 
 
-def _session_returning(json_side_effect):
-    """A session whose POST answers 200 and whose body parsing returns or raises the given value."""
+def _session_returning(body):
+    """A session whose POST answers 200 with the given raw bytes, or the given value as JSON."""
+    raw = body if isinstance(body, bytes) else json.dumps(body).encode()
     resp = AsyncMock()
     resp.status = 200
-    resp.json = AsyncMock(side_effect=[json_side_effect])
+    resp.content_length = None
+    # The whole body in 1 read, then the empty read that marks its end.
+    resp.content.read = AsyncMock(side_effect=[raw, b""])
     resp.raise_for_status = MagicMock()
     resp.__aenter__ = AsyncMock(return_value=resp)
     resp.__aexit__ = AsyncMock(return_value=False)
@@ -39,9 +45,19 @@ def _session_returning(json_side_effect):
         ["not", "an", "object"],
         {"data": {"indexingStatuses": ["not an object"]}},
         {"data": {"indexingStatuses": [{"synced": True, "health": "healthy"}]}},
-        json.JSONDecodeError("Expecting value", "<html>", 0),
+        b"<html>",
+        # Deeper than the JSON reader can follow, so it raises RecursionError, not ValueError.
+        b"[" * 20_000 + b"]" * 20_000,
     ],
-    ids=["null-data", "null-statuses", "list-body", "non-object-status", "no-subgraph", "bad-json"],
+    ids=[
+        "null-data",
+        "null-statuses",
+        "list-body",
+        "non-object-status",
+        "no-subgraph",
+        "bad-json",
+        "nested-too-deep",
+    ],
 )
 async def test_a_malformed_reply_counts_as_no_answer(body):
     """One indexer's bad reply must not raise out of the fetch and sink every other indexer."""
@@ -95,3 +111,35 @@ def test_cycle_pushes_nothing_when_no_indexer_answered(monkeypatch):
     assert run_fetch_cycle() is False
     push.assert_not_called()
     assert sync_status_fetcher._last_write_time is None
+
+
+# --- Refusing a /status reply that is too large ---------------------------------------------
+#
+# Reading a reply with no size limit let 1 indexer send a huge or never-ending body and run the
+# fetcher out of memory. These tests serve the reply from a local aiohttp server so the real
+# reading runs.
+
+
+async def _fetch_from_server(handler):
+    app = web.Application()
+    app.router.add_post("/status", handler)
+    async with TestServer(app) as server, aiohttp.ClientSession() as session:
+        return await _fetch_single_status(
+            session, "0xBig", str(server.make_url("/")), sync_status_fetcher.asyncio.Semaphore(1)
+        )
+
+
+async def test_a_reply_over_the_limit_counts_as_no_answer(monkeypatch):
+    # raising=False so that, before the limit existed, this ran and failed on what it checks.
+    monkeypatch.setattr(sync_status_fetcher, "MAX_RESPONSE_BYTES", 1_024, raising=False)
+    synced = {"subgraph": "QmSynced", "synced": True, "health": "healthy"}
+    oversized = {"data": {"indexingStatuses": [synced] * 50}}
+    requests_seen = []
+
+    async def handler(request):
+        requests_seen.append(request.path)
+        return web.json_response(oversized)
+
+    assert await _fetch_from_server(handler) is None
+    # The same indexer would send the same reply again, so it is asked only once.
+    assert requests_seen == ["/status"]

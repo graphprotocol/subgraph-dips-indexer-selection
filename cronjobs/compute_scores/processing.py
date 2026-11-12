@@ -26,6 +26,7 @@ import pandas as pd
 from escaping import error_for_log, url_for_log
 from escaping import for_log as _for_log
 from numpy.linalg import pinv
+from reply_body import read_reply_body
 from scipy.stats import t
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LinearRegression
@@ -155,6 +156,12 @@ DIPS_INFO_MAX_CONCURRENCY = int(os.environ.get("DIPS_INFO_MAX_CONCURRENCY", "100
 DIPS_INFO_MAX_RETRIES = int(os.environ.get("DIPS_INFO_MAX_RETRIES", "5"))
 DIPS_INFO_RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MULTIPLIER", "1"))
 DIPS_INFO_RETRY_BACKOFF_MAX = int(os.environ.get("DIPS_INFO_RETRY_BACKOFF_MAX", "5"))
+# Byte limit on a /dips/info reply, so an indexer cannot stream a huge body and run the job out of
+# memory. Parsing a hostile body made of tiny elements can take up to about 45 times its size, so
+# the limit sits close to what a real reply needs: about 55 bytes for each network an indexer
+# prices, so 64 KiB fits over 1,000 networks. Dipper uses the same limit, so the 2 agree on whose
+# prices can be read.
+DIPS_INFO_MAX_RESPONSE_BYTES = int(os.environ.get("DIPS_INFO_MAX_RESPONSE_BYTES", str(64 * 1024)))
 
 # Graph-node version fetch settings. Mirror the dips-info constants so a slow
 # fleet of /status endpoints can be tuned independently if it ever becomes a
@@ -336,7 +343,7 @@ async def _fetch_single_dips_info_async(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                return await resp.json()
+                return json.loads(await read_reply_body(resp, DIPS_INFO_MAX_RESPONSE_BYTES))
 
     last_error: Optional[Exception] = None
     for attempt in range(DIPS_INFO_MAX_RETRIES):
@@ -351,10 +358,10 @@ async def _fetch_single_dips_info_async(
                 )
                 await asyncio.sleep(delay)
             continue
-        except (ValueError, LookupError, RecursionError) as e:
-            # Not JSON, not in its declared charset, or nested too deep. That is the indexer's
-            # answer, not a network fault, so it is not retried. Uncaught, it would fail the
-            # fetch for every indexer.
+        except (ValueError, RecursionError) as e:
+            # Not JSON, over the size limit, or nested too deep. That is the indexer's answer, not
+            # a network fault, so it is not retried. Uncaught, it would fail the fetch for every
+            # indexer.
             logger.warning(
                 "Ignoring DIPs info from indexer %s: unreadable /dips/info body (%s: %s)",
                 indexer,
@@ -418,8 +425,8 @@ async def _post_graph_node_status(
 ) -> dict:
     """POST the version query to one indexer's status endpoint and return the parsed body.
 
-    Raises aiohttp errors for 5xx / non-2xx responses and for bodies over the size cap, so
-    the caller's retry loop can decide what to do with them.
+    Raises aiohttp errors for 5xx / non-2xx responses and ReplyTooLargeError for bodies over
+    the size cap, so the caller's retry loop can decide what to do with them.
     """
     import aiohttp
 
@@ -438,15 +445,9 @@ async def _post_graph_node_status(
                     message=f"Server error {resp.status}",
                 )
             resp.raise_for_status()
-            # Explicit byte cap so a pathological indexer can't stream a
-            # huge body and exhaust cron memory; reading N+1 lets us
-            # detect overflow by comparing the returned length to N.
-            raw = await resp.content.read(GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES + 1)
-            if len(raw) > GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES:
-                raise aiohttp.ClientPayloadError(
-                    f"Response exceeded {GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES} bytes"
-                )
-            body: dict = json.loads(raw)
+            body: dict = json.loads(
+                await read_reply_body(resp, GRAPH_NODE_VERSION_MAX_RESPONSE_BYTES)
+            )
             return body
 
 
@@ -463,11 +464,18 @@ def _extract_graph_node_version(data: object) -> tuple[Optional[str], Optional[s
     return version_obj.get("version"), version_obj.get("commit")
 
 
-def _is_deterministic_client_error(error: Exception) -> bool:
-    """True for 4xx: the endpoint is missing or rejects the query, so a retry is wasted."""
+def _retry_would_not_help(error: Exception) -> bool:
+    """True when asking again would get the same answer, so a retry is wasted.
+
+    Only a network fault, a timeout or a 5xx is worth another try. A 4xx means the endpoint is
+    missing or rejects the query, and a reply that arrived whole but is too large, not JSON or the
+    wrong shape would arrive the same way again.
+    """
     import aiohttp
 
-    return isinstance(error, aiohttp.ClientResponseError) and 400 <= error.status < 500
+    if isinstance(error, aiohttp.ClientResponseError):
+        return 400 <= error.status < 500
+    return not isinstance(error, (aiohttp.ClientError, asyncio.TimeoutError))
 
 
 async def _fetch_single_graph_node_version_async(
@@ -495,12 +503,14 @@ async def _fetch_single_graph_node_version_async(
             aiohttp.ClientError,
             asyncio.TimeoutError,
             ValueError,
+            RecursionError,
             AttributeError,
         ) as e:
-            # Deliberately broad: 1 indexer returning HTML, invalid UTF-8 (a ValueError)
-            # or a malformed shape would otherwise crash the whole run through gather().
+            # Deliberately broad: 1 indexer returning HTML, invalid UTF-8 (a ValueError), JSON
+            # nested too deep to read or a malformed shape would otherwise crash the whole run
+            # through gather().
             last_error = e
-        if _is_deterministic_client_error(last_error):
+        if _retry_would_not_help(last_error):
             break
         if attempt < GRAPH_NODE_VERSION_MAX_RETRIES - 1:
             delay = min(

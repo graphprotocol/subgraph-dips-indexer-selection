@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 from escaping import error_for_log, url_for_log
 from freshness_config import FreshnessConfig, load_freshness_config
 from iisa_client import IISAPushError, get_push_token, post_sync_status
+from reply_body import read_reply_body
 from subgraph import (
     discover_indexers_from_network_subgraph,
     read_active_allocations,
@@ -55,6 +56,14 @@ MAX_RETRIES = int(os.environ.get("SYNC_STATUS_MAX_RETRIES", "5"))
 RETRY_BACKOFF_MULTIPLIER = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MULTIPLIER", "1"))
 RETRY_BACKOFF_MAX = int(os.environ.get("SYNC_STATUS_RETRY_BACKOFF_MAX", "5"))
 HTTP_PORT = int(os.environ.get("SYNC_STATUS_HTTP_PORT", "9091"))
+# Byte limit on 1 indexer's /status reply, so a huge or never-ending reply cannot run the fetcher
+# out of memory. A real reply lists every deployment the indexer has, about 90 bytes each, so 8 MiB
+# fits about 90,000 deployments. The fetcher's memory must hold SYNC_STATUS_MAX_CONCURRENCY replies
+# being read at once, each up to this limit, plus 1 reply being parsed, which takes about 4 times
+# its size for a real reply and up to about 45 times for a hostile one made of tiny elements. At
+# the defaults that is about 400 MiB plus 360 MiB. If the pod has less memory to spare than that,
+# lower this setting.
+MAX_RESPONSE_BYTES = int(os.environ.get("SYNC_STATUS_MAX_RESPONSE_BYTES", str(8 * 1024 * 1024)))
 # Unhealthy once 2 cycles in a row fail to push. The extra half interval leaves room for the
 # cycles' own run time, so 1 failed cycle followed by a slow good one stays healthy.
 MAX_PUSH_AGE = int(os.environ.get("SYNC_STATUS_MAX_PUSH_AGE", str(FETCH_INTERVAL * 5 // 2)))
@@ -122,7 +131,7 @@ async def _fetch_single_status(
                         message=f"Server error {resp.status}",
                     )
                 resp.raise_for_status()
-                return await resp.json()
+                return json.loads(await read_reply_body(resp, MAX_RESPONSE_BYTES))
 
     last_error: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
@@ -131,8 +140,9 @@ async def _fetch_single_status(
                 "indexer": indexer,
                 "deployments": _synced_deployments(await do_fetch()),
             }
-        except ValueError as e:
-            # Unparseable JSON or the wrong shape won't change on a retry; skip this indexer only.
+        except (ValueError, RecursionError) as e:
+            # Unparseable JSON, JSON nested too deep to read, a reply over the size limit or the
+            # wrong shape won't change on a retry; skip this indexer only.
             logger.warning(
                 "Malformed /status reply from %s (%s): %s",
                 indexer[:10],

@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 import aiohttp
@@ -23,8 +24,10 @@ from aiohttp.test_utils import TestServer
 jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
+import processing  # noqa: E402
 from processing import (  # noqa: E402
     _extract_dips_prices,
+    _fetch_all_dips_info_async,
     _fetch_single_dips_info_async,
     _for_log,
 )
@@ -133,17 +136,26 @@ def test_entity_price_only_in_flat_shape():
 # won selection. These tests drive `_fetch_single_dips_info_async` through a stub session.
 
 
+class _StubContent:
+    """Serves a body as aiohttp's reply stream does: the next part per read, then b"" at its end."""
+
+    def __init__(self, raw: bytes):
+        self._raw = raw
+
+    async def read(self, n: int) -> bytes:
+        piece, self._raw = self._raw[:n], self._raw[n:]
+        return piece
+
+
 class _StubResponse:
     status = 200
+    content_length = None
 
     def __init__(self, body):
-        self._body = body
+        self.content = _StubContent(json.dumps(body).encode())
 
     def raise_for_status(self):
         return None
-
-    async def json(self):
-        return self._body
 
     async def __aenter__(self):
         return self
@@ -349,8 +361,8 @@ def _fetch_record_from_server(raw: bytes, content_type: str):
         pytest.param(b"<html>bad gateway</html>", "application/json", id="not-json"),
         pytest.param(b"\xff\xfe", "application/json", id="not-utf8"),
         pytest.param(b"1" * 5_000, "application/json", id="integer-too-long-to-read"),
-        pytest.param(b"[" * 100_000 + b"]" * 100_000, "application/json", id="nested-too-deep"),
-        pytest.param(b"{}", "application/json; charset=hex", id="charset-not-for-text"),
+        # 40 KB, under the size limit, so it is the nesting that makes it unreadable.
+        pytest.param(b"[" * 20_000 + b"]" * 20_000, "application/json", id="nested-too-deep"),
     ],
 )
 def test_body_that_is_not_a_json_object_makes_dips_info_unusable(raw, content_type, caplog):
@@ -362,23 +374,115 @@ def test_body_that_is_not_a_json_object_makes_dips_info_unusable(raw, content_ty
     assert "0xindexer" in warning
 
 
-def test_json_object_from_server_is_read():
+# The body is read as JSON whatever type or character set the reply declares, since the indexer
+# controls those as much as the body, and JSON itself is always in a Unicode encoding.
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/json",
+        "application/json; charset=utf-8",
+        "text/plain",
+        "application/json; charset=hex",
+    ],
+)
+def test_json_object_from_server_is_read(content_type):
     record = _fetch_record_from_server(
-        b'{"min_grt_per_30_days": {"arbitrum-one": "450"}}', "application/json"
+        b'{"min_grt_per_30_days": {"arbitrum-one": "450"}}', content_type
     )
 
     assert record["dips_info_available"] is True
     assert json.loads(record["dips_min_grt_per_30_days"]) == {"arbitrum-one": 450.0}
 
 
+# --- Refusing a /dips/info reply that is too large ------------------------------------------
+#
+# Reading a reply with no size limit let 1 indexer send a huge or never-ending body and run the
+# job out of memory. A reply over the limit is that indexer's answer, so it is not asked again.
+
+SMALL_LIMIT = 1_024
+PRICED = {"min_grt_per_30_days": {"arbitrum-one": "450"}}
+
+
+def test_reply_over_the_limit_counts_as_no_dips_info_and_spares_the_others(monkeypatch, caplog):
+    # raising=False so that, before the limit existed, this ran and failed on what it checks.
+    monkeypatch.setattr(processing, "DIPS_INFO_MAX_RESPONSE_BYTES", SMALL_LIMIT, raising=False)
+    oversized = json.dumps({**PRICED, "padding": "x" * 2 * SMALL_LIMIT}).encode()
+    requests_for_oversized = []
+
+    async def serve_oversized(request):
+        requests_for_oversized.append(request.path)
+        return web.json_response(body=oversized)
+
+    async def serve_small(request):
+        return web.json_response(PRICED)
+
+    async def run():
+        app = web.Application()
+        app.router.add_get("/big/dips/info", serve_oversized)
+        app.router.add_get("/small/dips/info", serve_small)
+        async with TestServer(app) as server:
+            return await _fetch_all_dips_info_async(
+                {
+                    "0xindexer": str(server.make_url("/big")),
+                    "0xsmall": str(server.make_url("/small")),
+                }
+            )
+
+    with caplog.at_level(logging.WARNING, logger="processing"):
+        records = {record["indexer"]: record for record in asyncio.run(run())}
+
+    assert records["0xindexer"] == UNUSABLE_RECORD
+    assert records["0xsmall"]["dips_info_available"] is True
+    assert requests_for_oversized == ["/big/dips/info"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("0xindexer" in w and "1,024" in w for w in warnings), warnings
+
+
+def test_reply_that_never_ends_is_cut_off_rather_than_read_until_the_timeout(monkeypatch, caplog):
+    monkeypatch.setattr(processing, "DIPS_INFO_MAX_RESPONSE_BYTES", SMALL_LIMIT, raising=False)
+    monkeypatch.setattr(processing, "DIPS_INFO_FETCH_TIMEOUT", 3)
+    monkeypatch.setattr(processing, "DIPS_INFO_MAX_RETRIES", 1)
+
+    # No declared length and no end: the body keeps coming until the client hangs up.
+    async def handler(request):
+        resp = web.StreamResponse(headers={"Content-Type": "application/json"})
+        await resp.prepare(request)
+        try:
+            await resp.write(b'{"padding": "')
+            while True:
+                await resp.write(b"x" * 100)
+                await asyncio.sleep(0.01)
+        except ConnectionResetError:
+            return resp
+
+    async def run():
+        app = web.Application()
+        app.router.add_get("/dips/info", handler)
+        async with TestServer(app) as server, aiohttp.ClientSession() as session:
+            return await _fetch_single_dips_info_async(
+                session, "0xindexer", str(server.make_url("/")), asyncio.Semaphore(1)
+            )
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="processing"):
+        record = asyncio.run(run())
+    elapsed = time.monotonic() - started
+
+    assert record == UNUSABLE_RECORD
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("0xindexer" in w and "1,024" in w for w in warnings), warnings
+    assert elapsed < processing.DIPS_INFO_FETCH_TIMEOUT
+
+
 # --- Keeping what an indexer sends from flooding or forging CronJob log lines ---------------
 #
 # The warnings for a dropped price quote the chain name and value the indexer sent. A line break
-# in either would start a fake log line, and a multi-megabyte value would be logged in full on
-# every run, so both are quoted with escapes and cut to a fixed length.
+# in either would start a fake log line, and a value of up to the 64 KiB reply limit would be
+# logged in full on every run, so both are quoted with escapes and cut to a fixed length.
 
-HUGE_TEXT = "9" * 1_000_000 + "x"
-HUGE_OBJECT = {f"key{i}": {"nested": ["v" * 1_000] * 100} for i in range(1_000)}
+# About 50 KB each, so the reply stays under the limit and reaches the price checks.
+HUGE_TEXT = "9" * 50_000 + "x"
+HUGE_OBJECT = {f"key{i}": {"nested": ["v" * 1_000] * 10} for i in range(5)}
 
 
 def test_line_break_in_a_chain_name_cannot_start_a_fake_log_line(caplog):
@@ -415,4 +519,5 @@ def test_huge_advertised_value_is_cut_short_in_the_warning(body, caplog):
 
     warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
     assert "0xindexer" in warning
+    assert "byte limit" not in warning
     assert len(warning) < 500

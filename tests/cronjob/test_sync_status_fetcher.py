@@ -1,5 +1,6 @@
 """Tests for the sync status fetcher service."""
 
+import json
 import sys
 import threading
 from pathlib import Path
@@ -30,7 +31,9 @@ class TestFetchSingleStatus:
         def _make(json_data, status=200):
             resp = AsyncMock()
             resp.status = status
-            resp.json = AsyncMock(return_value=json_data)
+            resp.content_length = None
+            # The whole body in 1 read, then the empty read that marks its end.
+            resp.content.read = AsyncMock(side_effect=[json.dumps(json_data).encode(), b""])
             resp.raise_for_status = MagicMock()
             resp.__aenter__ = AsyncMock(return_value=resp)
             resp.__aexit__ = AsyncMock(return_value=False)
