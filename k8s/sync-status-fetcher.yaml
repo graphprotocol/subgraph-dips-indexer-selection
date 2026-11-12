@@ -7,6 +7,11 @@ metadata:
     app: iisa-sync-status-fetcher
 spec:
   replicas: 1
+  # A new pod passes its startup probe only after its first successful push, so a rolling
+  # update keeps the old pod, and the old code, pushing every hour for as long as the new one
+  # cannot push. Stop the old pod first instead.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: iisa-sync-status-fetcher
@@ -50,15 +55,20 @@ spec:
                 secretKeyRef:
                   name: iisa-push-token
                   key: IISA_PUSH_TOKEN
+            # The freshness prober spends query fees on its own gateway API key, so it stays off
+            # until that key's secret exists (see the README).
+            - name: FRESHNESS_PROBE_ENABLED
+              value: "false"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
-          # /health is 503 until the first push and again once 2 pushes in a row fail, so a stuck
-          # fetcher is restarted (which also picks up a rotated token). The first cycle probes every
-          # indexer, so it gets 15 minutes. No readiness probe: nothing sends this pod traffic.
+          # /health is 503 until the first push, again once 2 pushes in a row fail, and once the
+          # freshness prober has stopped, so a stuck fetcher is restarted (which also picks up a
+          # rotated token). The first cycle probes every indexer, so it gets 15 minutes. No
+          # readiness probe: nothing sends this pod traffic.
           startupProbe:
             httpGet:
               path: /health

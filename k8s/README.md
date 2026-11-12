@@ -22,9 +22,11 @@ POSTs them to the IISA service.
 
 The sync-status fetcher runs all the time, from the CronJob's image. Every hour it reads
 indexer URLs from the Graph Network subgraph, asks each indexer's `/status` which
-deployments it has synced, and POSTs that snapshot to the service the same way. The
-service uses it to prefer indexers that have already synced a deployment. Nothing is
-shared on disk between them.
+deployments it has synced, keeps only the deployments the indexer also holds an active
+allocation on, read from the same subgraph, and POSTs that snapshot to the service the
+same way. If it cannot read the allocations it pushes nothing that hour. The service uses
+the snapshot to prefer indexers that have already synced a deployment. Nothing is shared
+on disk between them.
 
 The IISA service answers indexer-selection requests. On startup it loads the last
 scores and sync status from its own cache volume, so a restart serves the most
@@ -61,7 +63,9 @@ pushes in a row fail, and the liveness probe then restarts it. A restart fixes a
 inside the pod, such as a rotated push token. If IISA or the network subgraph stays
 unreachable instead, each restarted container fails its first push and then its startup
 probe, so the pod shows CrashLoopBackOff and retries every 15 to 20 minutes until the cause clears. It has no readiness probe, since nothing
-sends it traffic.
+sends it traffic. A rollout stops the old fetcher pod before starting the new one too:
+otherwise the old pod, running the old code, would keep pushing every hour for as long as
+the new one could not make its first push.
 
 ## Prerequisites
 
@@ -75,14 +79,23 @@ These secrets are created out of band and are never committed:
 - `iisa-read-token` (optional, key `IISA_READ_TOKEN`) - a bearer token that reads from the
   service but cannot push to it. Without it the service starts as before, and reads need the
   push token.
+- `iisa-sync-check-gateway` (optional, keys `IISA_SYNC_CHECK_GATEWAY_URL` and
+  `IISA_SYNC_CHECK_GATEWAY_API_KEY`) - the gateway's base address, such as
+  `https://gateway.thegraph.com/api`, and an API key for it. With both, the service checks
+  a candidate's claim to have synced a deployment before the claim can win it a place. Each
+  check is 1 paid query on that key. When a selection looks for an indexer to add or swap in,
+  every candidate that could be picked ahead of the rest on its claim is asked at once, up
+  to 50. Indexers already in the group are never asked: their claims count as given. Without
+  the secret every claim is taken on trust; with only 1 of the 2 keys the service refuses to
+  start.
 - `github-registry-secret` - image pull secret for the GitHub container registry.
 
 Each caller should hold only the token it needs. The CronJob and the sync-status fetcher
 push, so they hold `iisa-push-token`. Dipper only reads, from `GET /dips-indexers`, so it
 should hold `iisa-read-token` and not the push token: the service accepts the read token on
-every endpoint that only reads and refuses it on `POST /scores` and `POST /sync-status`, so
-whoever obtains dipper's token cannot rewrite the scores and sync status that decide who is
-paid. Until `iisa-read-token` exists, dipper needs the push token to read. The service reads
+every endpoint that only reads and refuses it on `POST /scores`, `POST /sync-status` and
+`POST /freshness`, so whoever obtains dipper's token cannot rewrite the scores, sync status
+and freshness checks that decide who is paid. Until `iisa-read-token` exists, dipper needs the push token to read. The service reads
 both tokens when it starts, so a changed secret takes effect when the pod next restarts.
 
 The CronJob also needs the `iisa-redpanda-config` ConfigMap, which each environment

@@ -74,6 +74,29 @@ def test_unhealthy_once_the_last_push_is_too_old(health_url, monkeypatch):
     assert body["last_write_age_seconds"] >= 9001
 
 
+class _StoppedProber:
+    stopped = True
+
+    def health(self, now):
+        return {"running": False, "stopped": True}
+
+
+def test_unhealthy_once_the_freshness_prober_has_stopped(health_url, monkeypatch):
+    """The liveness probe restarts the pod after 3 failures, which brings the prober back."""
+    monkeypatch.setattr(sync_status_fetcher, "MAX_PUSH_AGE", 9000)
+    monkeypatch.setattr(
+        sync_status_fetcher, "_last_write_time", datetime.now(timezone.utc) - timedelta(seconds=60)
+    )
+    monkeypatch.setattr(sync_status_fetcher, "_stop_event", threading.Event())
+    monkeypatch.setattr(sync_status_fetcher, "_freshness_prober", _StoppedProber())
+
+    status, body = _get(health_url)
+
+    assert status == 503
+    assert body["status"] == "freshness_prober_stopped"
+    assert body["freshness"] == {"running": False, "stopped": True}
+
+
 def test_default_allows_one_failed_cycle(monkeypatch):
     """By default the limit sits between 2 and 3 fetch intervals."""
     interval = sync_status_fetcher.FETCH_INTERVAL
@@ -93,6 +116,9 @@ def test_a_successful_cycle_records_the_push_time(monkeypatch):
         return {"0xAAA": {"deployments": ["QmDeploy1"], "fetched_at": "2026-03-24T00:00:00+00:00"}}
 
     monkeypatch.setattr(sync_status_fetcher, "_fetch_all_statuses", fake_fetch)
+    monkeypatch.setattr(
+        sync_status_fetcher, "read_active_allocations", lambda _url: {"0xaaa": {"QmDeploy1"}}
+    )
     monkeypatch.setattr(sync_status_fetcher, "_push_sync_status", lambda _data: None)
 
     before = datetime.now(timezone.utc)

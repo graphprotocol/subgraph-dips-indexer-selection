@@ -10,7 +10,7 @@ the sync-status fetcher can use it without loading the scoring libraries.
 import logging
 import re
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 import requests
@@ -226,3 +226,48 @@ def discover_indexers_from_network_subgraph(network_subgraph_url: str) -> Dict[s
     all_indexers = _query_indexer_urls(network_subgraph_url)
     logger.info(f"Discovered {len(all_indexers)} indexers from network subgraph")
     return all_indexers
+
+
+# Every allocation the network subgraph records as open, the newest Horizon ones and any older
+# ones not yet closed alike. Its deployment is named by the same IPFS hash an indexer's /status
+# reply uses.
+ACTIVE_ALLOCATIONS_QUERY = """
+query($first: Int!, $lastId: String!) {
+  allocations(first: $first, where: { id_gt: $lastId, status: Active }, orderBy: id) {
+    id
+    indexer { id }
+    subgraphDeployment { ipfsHash }
+  }
+}
+"""
+
+
+@retry_subgraph_read
+def read_active_allocations(network_subgraph_url: str) -> Dict[str, Set[str]]:
+    """Map each indexer to the deployments it has an active allocation on.
+
+    Raises when the subgraph can't be read or lists no active allocation at all, which the
+    network always has, so an empty answer means the subgraph was served from a broken copy.
+    """
+    allocations = paginate_subgraph_query(
+        network_subgraph_url, ACTIVE_ALLOCATIONS_QUERY, entity="allocations"
+    )
+    allocated: Dict[str, Set[str]] = {}
+    unreadable = 0
+    for allocation in allocations:
+        indexer = (allocation.get("indexer") or {}).get("id")
+        deployment = (allocation.get("subgraphDeployment") or {}).get("ipfsHash")
+        if not isinstance(indexer, str) or not isinstance(deployment, str):
+            unreadable += 1
+            continue
+        allocated.setdefault(indexer.lower(), set()).add(deployment)
+    if unreadable:
+        logger.warning(
+            "Skipped %d active allocations with no indexer or deployment in the network subgraph",
+            unreadable,
+        )
+    if not allocated:
+        # Retried: the gateway may have served the query from an indexer that is behind.
+        raise SubgraphResponseError("network subgraph returned no active allocations")
+    logger.info("Read %d active allocations held by %d indexers", len(allocations), len(allocated))
+    return allocated
