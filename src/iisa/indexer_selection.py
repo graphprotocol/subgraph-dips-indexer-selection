@@ -558,7 +558,8 @@ class IndexerSelector:
         _note_claims_that_could_win for which candidates those are. Members of the starting
         group are never listed, even one that left the group and was weighed as a candidate.
         """
-        listed = self._preferred_on_a_claim - set(self.initial_group)
+        members = {member.lower() for member in self.initial_group}
+        listed = {i for i in self._preferred_on_a_claim if i.lower() not in members}
         rows = self.data[self.data["indexer"].isin(listed)]
         ranked = rows.sort_values(by="weighted_score", ascending=False)
         return cast(list[IndexerId], list(dict.fromkeys(ranked["indexer"])))

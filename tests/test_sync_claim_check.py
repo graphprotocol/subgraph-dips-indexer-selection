@@ -521,12 +521,14 @@ class TestSelection:
 
         assert picked == [D] and checker.asked == [(DEPLOYMENT, [D])]
 
-    def test_a_starting_member_is_never_listed_even_if_it_came_back_as_a_candidate(self):
+    @pytest.mark.parametrize("member", [D, "0x" + "D4" * 20])
+    def test_a_starting_member_is_never_listed_even_if_it_came_back_as_a_candidate(self, member):
         """A member that leaves the group during a selection can be weighed again as a
-        candidate. It is still a member to the check, and is left off the list to ask.
+        candidate. It is still a member to the check, and is left off the list to ask,
+        whichever letter case the caller wrote its address in.
         """
         request = SelectionRequest(
-            deployment_id=DEPLOYMENT, chain_id=CHAIN, num_candidates=2, existing_indexers=[D]
+            deployment_id=DEPLOYMENT, chain_id=CHAIN, num_candidates=2, existing_indexers=[member]
         )
         with patch.object(endpoints, "_state", _state({A, D}, None)):
             selection = endpoints._prepare_selection(request)
