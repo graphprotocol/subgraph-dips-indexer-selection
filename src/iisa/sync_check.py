@@ -1,12 +1,12 @@
-"""Checks an indexer's claim to have synced a deployment before selection relies on it.
+"""Checks a candidate's claim to have synced a deployment before the claim can win it a place.
 
-Selection prefers an indexer that says it has already synced the deployment, so queries can be
-served straight after the agreement is accepted. That claim is the indexer's own word. Before a
-selection that put candidates ahead on that claim goes back to dipper, the service asks each of
-those candidates, through the gateway, for the deployment's latest block, as a paying customer
-would. A claim is confirmed only if the indexer signed the answer and the block is recent. Each
-check is 1 paid query on the gateway API key, so group members are never asked, and nothing is
-asked for a group that needs nobody new.
+Selection prefers a candidate that says it has already synced the deployment, so queries can be
+served straight after the agreement is accepted. That claim is the candidate's own word. Before
+a selection goes back to dipper, the service asks each candidate that could have been picked
+ahead of the rest on its claim, through the gateway, for the deployment's latest block, as a
+paying customer would. A claim is confirmed only if the indexer signed the answer and the block
+is recent. Each check is 1 paid query on the gateway API key. Indexers already in the group are
+never asked: their claims count as given.
 """
 
 import asyncio

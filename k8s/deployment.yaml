@@ -59,10 +59,10 @@ spec:
                   name: iisa-read-token
                   key: IISA_READ_TOKEN
                   optional: true
-            # Optional. With both set, the service checks an indexer's claim to have synced a
-            # deployment through the gateway before selection relies on it, 1 paid query for
-            # each check. Without the secret the claim is taken on trust, as before. With only
-            # 1 of the 2 keys the service refuses to start.
+            # Optional. With both set, the service checks a candidate's claim to have synced a
+            # deployment through the gateway before the claim can win it a place, 1 paid query
+            # for each check. Without the secret every claim is taken on trust, as before. With
+            # only 1 of the 2 keys the service refuses to start.
             - name: IISA_SYNC_CHECK_GATEWAY_URL
               valueFrom:
                 secretKeyRef:

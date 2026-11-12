@@ -90,8 +90,8 @@ class Settings(BaseSettings):
     # read accept it as well as push_token; POST /scores and POST /sync-status accept only
     # push_token. Unset, reads need push_token as before.
     read_token: Optional[str] = None
-    # Optional check, through the gateway, of an indexer's claim to have synced a deployment,
-    # made before selection relies on the claim. It is on when the gateway's address and an API
+    # Optional check, through the gateway, of a candidate's claim to have synced a deployment,
+    # made before the claim can win it a place. It is on when the gateway's address and an API
     # key are both set, and each check is 1 paid query on that key. See sync_check.py.
     sync_check_gateway_url: Optional[str] = None
     sync_check_gateway_api_key: Optional[str] = None
@@ -384,8 +384,10 @@ class IISAState:
         self.settings = settings
         self.sync_checker = sync_claim_checker(settings)
         logger.info(
-            "Synced claims are %s before selection relies on them",
-            "checked through the gateway" if self.sync_checker else "not checked",
+            "Candidates' synced claims are %s",
+            "checked through the gateway before they can win a place"
+            if self.sync_checker
+            else "taken on trust",
         )
 
         try:
@@ -1707,8 +1709,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
 
 async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionResponse:
-    """_select_with_processor, with the synced claims that put a candidate ahead checked
-    through the gateway first, when the check is switched on.
+    """_select_with_processor, with the synced claims that could win a candidate a place
+    checked through the gateway first, when the check is switched on.
     """
     selection = _prepare_selection(request)
     if isinstance(selection, SelectionResponse):
@@ -1723,15 +1725,15 @@ async def _with_claims_checked(
     selection: _Selection, processor: IndexerSelector, checker: SyncClaimChecker
 ) -> IndexerSelector:
     """Check, through the gateway and all at once, the claim of every candidate the selection
-    put ahead because it says it has synced, and select again if any was not confirmed.
+    could have picked ahead of the rest because it says it has synced, and select again if any
+    of those claims was not confirmed or was left unasked.
 
-    Only candidates are asked, and only those whose claim could win them a place: every
-    candidate making the claim while no group member makes it, and those scoring at least
-    0.60 once a member does. Group members are never asked, and nothing is asked when the
-    selection had no need to look for an indexer to add or swap in. Beyond
-    MAX_CHECKS_PER_SELECTION the best scores are asked and the rest are set aside unchecked.
+    IndexerSelector._note_claims_that_could_win says which candidates those are. Members of
+    the starting group are never asked, and nothing is asked when the selection found no such
+    candidate. Beyond MAX_CHECKS_PER_SELECTION the best scores are asked and the rest are left
+    unasked.
 
-    The second selection counts the group members' claims as given and, among candidates,
+    The second selection counts the starting members' claims as given and, among candidates,
     only the claims that were confirmed. An indexer whose claim is not counted still competes
     on its score.
     """

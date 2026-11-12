@@ -82,11 +82,12 @@ These secrets are created out of band and are never committed:
 - `iisa-sync-check-gateway` (optional, keys `IISA_SYNC_CHECK_GATEWAY_URL` and
   `IISA_SYNC_CHECK_GATEWAY_API_KEY`) - the gateway's base address, such as
   `https://gateway.thegraph.com/api`, and an API key for it. With both, the service checks
-  an indexer's claim to have synced a deployment before selection relies on it. Each check is
-  1 paid query on that key. Group members are never asked, and nothing is asked for a group
-  that needs nobody new. When a selection looks for an indexer to add or swap in, every
-  candidate whose claim would put it ahead is asked at once, up to 50. Without the secret the
-  claim is taken on trust; with only 1 of the 2 keys the service refuses to start.
+  a candidate's claim to have synced a deployment before the claim can win it a place. Each
+  check is 1 paid query on that key. When a selection looks for an indexer to add or swap in,
+  every candidate that could be picked ahead of the rest on its claim is asked at once, up
+  to 50. Indexers already in the group are never asked: their claims count as given. Without
+  the secret every claim is taken on trust; with only 1 of the 2 keys the service refuses to
+  start.
 - `github-registry-secret` - image pull secret for the GitHub container registry.
 
 Each caller should hold only the token it needs. The CronJob and the sync-status fetcher
