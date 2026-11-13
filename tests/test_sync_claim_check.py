@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from iisa import DataManager, sync_check
 from iisa import iisa_http_endpoints as endpoints
+from iisa.freshness import FreshnessStore
 from iisa.iisa_http_endpoints import SelectionRequest, Settings, _select_checking_sync_claims
 from iisa.sync_check import GatewayReply, SyncClaimChecker, post_once
 
@@ -372,7 +373,11 @@ def _state(
     history = DataManager(MagicMock()).transform_scores_df(pd.DataFrame(records or RECORDS))
     sync_status = SimpleNamespace(synced_indexers_for=lambda _deployment: set(claimed))
     return SimpleNamespace(
-        history=history, sync_status=sync_status, sync_checker=checker, is_ready=True
+        history=history,
+        sync_status=sync_status,
+        sync_checker=checker,
+        is_ready=True,
+        freshness=FreshnessStore(),
     )
 
 

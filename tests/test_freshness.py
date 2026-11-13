@@ -209,15 +209,15 @@ class TestStaleIndexers:
 
         assert store.stale_indexers(CHAIN, [INDEXER.upper().replace("0X", "0x")]) == set()
 
-    def test_snapshot_lists_enforced_chains_even_without_indexers(self):
+    def test_snapshot_lists_exempt_chains_even_without_indexers(self):
         store = FreshnessStore()
         _push(store, START, _check("pass"))
 
         chains = store.snapshot(Enforcement(frozenset({"amoy"}), 60, START))["chains"]
 
         assert {chain: body["enforced"] for chain, body in chains.items()} == {
-            "amoy": True,
-            CHAIN: False,
+            "amoy": False,
+            CHAIN: True,
         }
         assert chains["amoy"]["indexers"] == {}
 
@@ -276,14 +276,21 @@ class TestEnforcement:
     def test_a_minute_ahead_of_the_clock_is_current(self):
         assert Enforcement(frozenset({CHAIN}), 60, START).current(START + 3) is True
 
+    def test_every_chain_but_the_exempt_ones_is_enforced(self):
+        enforcement = Enforcement(frozenset({OTHER_CHAIN}), 60, START)
+
+        assert enforcement.enforced(CHAIN) is True
+        assert enforcement.enforced("a-chain-never-seen") is True
+        assert enforcement.enforced(OTHER_CHAIN) is False
+
     def test_snapshot_reports_each_chains_enforcement_and_last_counted_minute(self):
         store = FreshnessStore()
         _push(store, START, _check("pass"), _check("pass", chain=OTHER_CHAIN))
         _push(store, START + 1, _check("void"), _check("void", chain=OTHER_CHAIN))
-        enforced = frozenset({CHAIN, "amoy"})
+        exempt = frozenset({OTHER_CHAIN, "amoy"})
 
         def chains(now: int) -> dict[str, tuple[bool, bool, Optional[str]]]:
-            report = store.snapshot(Enforcement(enforced, 60, now))["chains"]
+            report = store.snapshot(Enforcement(exempt, 60, now))["chains"]
             return {
                 chain: (body["enforced"], body["enforcing"], body["last_counted_minute"])
                 for chain, body in report.items()
@@ -292,7 +299,7 @@ class TestEnforcement:
         assert chains(START + 60) == {
             CHAIN: (True, True, minute_text(START)),
             OTHER_CHAIN: (False, False, minute_text(START)),
-            "amoy": (True, False, None),
+            "amoy": (False, False, None),
         }
         assert chains(START + 61)[CHAIN] == (True, False, minute_text(START))
 
