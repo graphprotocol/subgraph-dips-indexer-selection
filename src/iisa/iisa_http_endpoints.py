@@ -332,7 +332,8 @@ class ScoreRequest(BaseModel):
 
 class ChainScore(BaseModel):
     """An indexer's weighted score and component scores, prices and freshness included, on one
-    chain. Freshness is left out on a chain whose checks don't yet cover 7 days.
+    chain. Freshness is left out on a chain whose checks don't yet cover 7 days or have stopped
+    counting.
 
     Scored against every indexer that supports the chain and has priced it, as selection does
     before it applies a request's budget, blocklist and expected fees.
@@ -1924,15 +1925,29 @@ def _enrich_with_chain_prices(
     return df
 
 
+def _weighed_freshness(chain_id: str) -> Optional[Mapping[str, float]]:
+    """Each indexer's freshness score on ``chain_id``, or None where freshness isn't weighed: on
+    a chain whose checks don't yet cover 7 days, and on one whose last counted check is older
+    than IISA_FRESHNESS_MAX_AGE_MINUTES by this service's clock, which is when enforcement stops
+    trusting its marks too. The scores are worked out at each push, so they stop changing when
+    the prober stops or every check is void. Reads neither through the freshness lock.
+    """
+    scores = _state.freshness.scores_on(chain_id)
+    if scores is None:
+        return None
+    if not _enforcement().current(_state.freshness.last_counted_minute(chain_id)):
+        return None
+    return scores
+
+
 def _with_chain_freshness(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
     """``history`` with each indexer's freshness score on ``chain_id`` in a freshness column,
-    replacing any it held: 0 for an indexer with no record there, and NaN for everyone on a
-    chain whose checks don't yet cover 7 days, so the weighted score leaves freshness out there
-    rather than scoring everyone 0. Reads the scores worked out after the last push, never the
-    freshness lock.
+    replacing any it held: 0 for an indexer with no record there, and NaN for everyone where
+    _weighed_freshness gives no scores, so the weighted score leaves freshness out there rather
+    than scoring everyone 0.
     """
     df = history.copy()
-    scores = _state.freshness.scores_on(chain_id)
+    scores = _weighed_freshness(chain_id)
     if scores is None or "indexer" not in df.columns:
         df["freshness"] = math.nan
         return df

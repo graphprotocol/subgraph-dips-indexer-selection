@@ -230,6 +230,52 @@ class TestSelection:
         )
 
 
+class TestChecksStopCounting:
+    """Freshness is weighed only while a check on the chain counted within
+    IISA_FRESHNESS_MAX_AGE_MINUTES, 60 by default, of the service's clock, as enforcement
+    judges it: the scores are worked out at each push, so they stop changing with the checks.
+    """
+
+    @pytest.mark.parametrize(("age", "weighed"), [(0, True), (60, True), (61, False)])
+    def test_freshness_is_left_out_once_the_prober_stops(self, service, monkeypatch, age, weighed):
+        service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
+        monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: LAST + age)
+
+        freshness = _selector().data.set_index("indexer")["norm_freshness"]
+
+        assert (freshness.notna().all(), freshness.isna().all()) == (weighed, not weighed)
+
+    def test_pushes_holding_only_voids_leave_freshness_out_after_the_limit(
+        self, service, monkeypatch
+    ):
+        service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
+        for minute in range(LAST + 1, LAST + 62):
+            service.freshness.apply(minute, [Check(TWIN, CHAIN, "void")], lambda _: None)
+        monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: LAST + 61)
+
+        assert _selector().data["norm_freshness"].isna().all()
+
+    def test_freshness_comes_back_once_checks_count_again(self, service, monkeypatch):
+        service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
+        monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: LAST + 120)
+        assert _selector().data["norm_freshness"].isna().all()
+
+        service.freshness.apply(LAST + 119, [Check(TWIN, CHAIN, "pass")], lambda _: None)
+
+        data = _selector().data.set_index("indexer")
+        assert data.loc[TWIN, "norm_freshness"] == pytest.approx((18_001 / 20_001) ** 6)
+        assert data.loc[TWIN_TOO, "norm_freshness"] == 0.0
+
+    def test_each_chains_reported_score_leaves_freshness_out_too(self, service, monkeypatch):
+        service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
+        monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: LAST + 61)
+
+        entries = TestClient(iisa_http_endpoints.app).get("/scores/weighted").json()["scores"]
+        twin = next(entry for entry in entries if entry["indexer"] == TWIN)
+
+        assert "freshness" not in twin["chains"][CHAIN]["components"]
+
+
 class TestReportedScores:
     def test_network_wide_scores_leave_freshness_out_and_each_chain_lists_it(self, service):
         service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
