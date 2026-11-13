@@ -29,7 +29,6 @@ from freshness_contract import without_refused
 from freshness_gateway import GatewayClient
 from freshness_registry import NetworksRegistry
 from freshness_rules import (
-    ESCROW_EMPTY,
     KEY_OUT_OF_FUNDS,
     NO_ELIGIBLE_SUBGRAPH,
     NO_EVIDENCE,
@@ -43,7 +42,6 @@ from freshness_rules import (
     Judgement,
     Targets,
     apply_general_fault,
-    blame_refused_payment,
     format_minute,
     is_behind,
     judge,
@@ -54,7 +52,6 @@ from freshness_sources import (
     TargetLoader,
     read_allocated_indexers,
     read_deployments_on_chain,
-    read_escrow_funded,
     read_first_allocations,
     read_open_allocations,
 )
@@ -93,7 +90,8 @@ def minute_start(t: float) -> float:
 
 
 class RateLimitedAlarm:
-    """Logs an error at most once per interval for each key and says how many it held back."""
+    """Logs at most once per interval for each key, at ``level`` (an error unless told
+    otherwise), and says how many it held back."""
 
     def __init__(self, interval: float, clock: Callable[[], float]) -> None:
         self._interval = interval
@@ -101,14 +99,16 @@ class RateLimitedAlarm:
         self._last: dict[Hashable, float] = {}
         self._held: dict[Hashable, int] = {}
 
-    def report(self, key: Hashable, message: str, *args: object) -> None:
+    def report(
+        self, key: Hashable, message: str, *args: object, level: int = logging.ERROR
+    ) -> None:
         now = self._clock()
         last = self._last.get(key)
         if last is not None and now - last < self._interval:
             self._held[key] = self._held.get(key, 0) + 1
             return
         held = self._held.pop(key, 0)
-        logger.error(message + " (%d more since the last report)", *args, held)
+        logger.log(level, message + " (%d more since the last report)", *args, held)
         self._last[key] = now
 
 
@@ -352,8 +352,6 @@ class FreshnessProber:
         push_at: float,
     ) -> Judgement:
         """Turn a failure that isn't the indexer's fault into a void one."""
-        if judgement.reason == PAYMENT_REFUSED:
-            return self._blame_refused_payment(indexer, judgement)
         if is_behind(judgement):
             decide_by = push_at - SEND_SLACK_SECONDS - DECIDE_MARGIN_SECONDS
             if await self._broken.judge_stale(
@@ -361,20 +359,6 @@ class FreshnessProber:
             ):
                 return replace(judgement, outcome=VOID, reason=SUBGRAPH_BROKEN)
         return judgement
-
-    def _blame_refused_payment(self, indexer: str, judgement: Judgement) -> Judgement:
-        targets = self._targets
-        outcome, reason = blame_refused_payment(
-            targets.escrow_funded.get(indexer) if targets else None
-        )
-        if reason == ESCROW_EMPTY:
-            self._alarms.report(
-                ("escrow", indexer),
-                "The gateway's escrow for indexer %s is empty or being withdrawn, so its refused "
-                "payments are void until it is topped up",
-                indexer,
-            )
-        return replace(judgement, outcome=outcome, reason=reason)
 
     def _scrub(self, detail: Optional[str]) -> Optional[str]:
         return detail.replace(self._config.api_key, "<redacted>") if detail else detail
@@ -387,6 +371,13 @@ class FreshnessProber:
                 indexer,
                 deployment,
                 judgement.detail,
+            )
+        elif judgement.reason == PAYMENT_REFUSED:
+            self._alarms.report(
+                ("payment_refused", indexer),
+                "Indexer %s refuses the gateway's payments, so its freshness checks are void",
+                indexer,
+                level=logging.WARNING,
             )
         elif judgement.reason == KEY_OUT_OF_FUNDS:
             self._alarms.report(
@@ -451,12 +442,6 @@ def start_freshness_prober(
         fetch_scores=partial(get_scores, iisa_api_url, token),
         read_allocations=partial(read_open_allocations, subgraph_url),
         read_first_allocations=partial(read_first_allocations, subgraph_url),
-        read_escrow=partial(
-            read_escrow_funded,
-            subgraph_url,
-            payers=config.gateway_payers,
-            collector=config.gateway_collector,
-        ),
         min_allocation_age_seconds=config.min_allocation_age_seconds,
     )
     prober = FreshnessProber(

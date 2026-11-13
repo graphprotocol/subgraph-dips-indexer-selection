@@ -7,7 +7,6 @@ rather than leaving the prober half working.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
@@ -18,7 +17,6 @@ from subgraph import subgraph_url_problem
 # most 60 seconds into the minute, has to finish within it.
 PUSH_DELAY_SECONDS = 30
 
-_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _TRUE = ("true", "1", "yes")
 _FALSE = ("false", "0", "no", "")
 
@@ -44,11 +42,6 @@ class FreshnessConfig:
     networks_registry_url: str = DEFAULT_NETWORKS_REGISTRY_URL
     additional_networks: tuple[str, ...] = ()
     max_concurrency: int = 50
-    # The addresses the gateway pays indexers from, whose escrow decides whose fault a refused
-    # payment is.
-    gateway_payers: tuple[str, ...] = ()
-    # When set, only the payers' escrow accounts under this collector count.
-    gateway_collector: Optional[str] = None
 
     @property
     def min_allocation_age_seconds(self) -> float:
@@ -70,25 +63,6 @@ def _number(environ: Mapping[str, str], name: str, default: float, *, at_least: 
     if not value >= at_least or value == float("inf"):
         raise _ConfigProblem(f"{name} must be a finite number of at least {at_least:g}")
     return value
-
-
-def _payers(environ: Mapping[str, str]) -> tuple[str, ...]:
-    entries = [entry.strip() for entry in environ.get("FRESHNESS_GATEWAY_PAYERS", "").split(",")]
-    payers = [entry for entry in entries if entry]
-    if not payers:
-        raise _ConfigProblem("FRESHNESS_GATEWAY_PAYERS is required")
-    if not all(_ADDRESS.match(payer) for payer in payers):
-        raise _ConfigProblem("FRESHNESS_GATEWAY_PAYERS must be 0x addresses separated by commas")
-    return tuple(dict.fromkeys(payer.lower() for payer in payers))
-
-
-def _collector(environ: Mapping[str, str]) -> Optional[str]:
-    collector = environ.get("FRESHNESS_GATEWAY_COLLECTOR", "").strip()
-    if not collector:
-        return None
-    if not _ADDRESS.match(collector):
-        raise _ConfigProblem("FRESHNESS_GATEWAY_COLLECTOR must be a 0x address")
-    return collector.lower()
 
 
 def _enabled(environ: Mapping[str, str]) -> bool:
@@ -146,8 +120,6 @@ def _read(environ: Mapping[str, str]) -> FreshnessConfig:
         networks_registry_url=_registry_url(environ),
         additional_networks=_additional_networks(environ),
         max_concurrency=int(_number(environ, "FRESHNESS_MAX_CONCURRENCY", 50, at_least=1)),
-        gateway_payers=_payers(environ),
-        gateway_collector=_collector(environ),
     )
 
 
