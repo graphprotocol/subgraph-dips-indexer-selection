@@ -226,6 +226,17 @@ def test_stale_candidates_fill_only_the_places_left_after_the_members(state):
     assert _select(size=2, existing=[FAIR]) == [FAIR, BEST]
 
 
+def test_stale_candidates_filling_places_are_scored_as_on_an_exempt_chain(state, monkeypatch):
+    """Once the stale candidates fill places they are the ones being compared, so they set
+    each metric's scale, as every candidate does on an exempt chain."""
+    _judge(state, ALL_FAIL)
+    _exempt(monkeypatch, CHAIN)
+    plain = _scores(size=3, existing=[FAIR])
+    _exempt(monkeypatch, "")
+
+    assert _scores(size=3, existing=[FAIR]) == plain
+
+
 def test_a_fresh_candidate_is_picked_before_any_stale_one(state):
     """FAIR scores worst, but it is the only fresh candidate."""
     _judge(state, {(BEST, CHAIN): "fail", (GOOD, CHAIN): "fail", (FAIR, CHAIN): "pass"})
