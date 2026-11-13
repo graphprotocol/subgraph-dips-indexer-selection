@@ -141,8 +141,18 @@ egress is limited to DNS, the IISA service and public addresses. Other pods and 
 in the cluster stay out of reach because the policy allows no pod but IISA, and the
 cluster checks the destination pod even when a URL names a Service address. Private and
 link-local ranges, which hold the nodes and the metadata server, are left out of the
-public rule. This only takes effect on a cluster that enforces network policies. The
-score-computation job calls the same URLs but has no egress limit yet.
+public rule. This only takes effect on a cluster that enforces network policies.
+
+The fetcher and the score-computation job also check each address in their own code before
+they connect, on any cluster. A registered URL that names an address which is not public, a
+name that resolves only to such addresses, and a redirect that leads to one are all refused:
+the indexer is treated as unreachable and a warning names it. Redirects are followed 3 times
+at most, and proxy settings are ignored. The job has no egress policy of its own: it also
+reads from Redpanda, at an address each environment sets, which a policy would have to allow.
+
+A local network, whose indexers sit at private addresses, sets
+`INDEXER_URLS_ALLOW_PRIVATE_ADDRESSES=true` on the job and the fetcher. Nothing else should:
+with it on, an indexer can point IISA at any address inside its network.
 
 ## Service discovery
 

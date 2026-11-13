@@ -27,6 +27,13 @@ from carry_over import QUALITY_MEASURED_AT
 from chain_quality import blend
 from escaping import error_for_log, url_for_log
 from escaping import for_log as _for_log
+from indexer_addresses import (
+    AIOHTTP_MAX_REDIRECTS,
+    AddressRule,
+    refusal_behind,
+    refused_url,
+    warn_refused,
+)
 from numpy.linalg import pinv
 from reply_body import read_reply_body
 from scipy.stats import t
@@ -344,12 +351,17 @@ async def _fetch_single_dips_info_async(
     import aiohttp
 
     dips_url = url.rstrip("/") + "/dips/info"
+    refusal = refused_url(dips_url)
+    if refusal is not None:
+        warn_refused(indexer, url, refusal)
+        return _unavailable_dips_info(indexer)
 
     async def do_fetch() -> object:
         async with semaphore:
             async with session.get(
                 dips_url,
                 timeout=aiohttp.ClientTimeout(total=DIPS_INFO_FETCH_TIMEOUT),
+                max_redirects=AIOHTTP_MAX_REDIRECTS,
             ) as resp:
                 if resp.status >= 500:
                     raise aiohttp.ClientResponseError(
@@ -366,6 +378,11 @@ async def _fetch_single_dips_info_async(
         try:
             data = await do_fetch()
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            refusal = refusal_behind(e)
+            if refusal is not None:
+                # The address would be refused again, so the call is not tried again.
+                warn_refused(indexer, url, refusal, while_connecting=True)
+                return _unavailable_dips_info(indexer)
             last_error = e
             if attempt < DIPS_INFO_MAX_RETRIES - 1:
                 delay = min(
@@ -396,11 +413,10 @@ async def _fetch_single_dips_info_async(
 
 async def _fetch_all_dips_info_async(indexer_urls: Dict[str, str]) -> List[dict]:
     """Fetch /dips/info from all indexers concurrently."""
-    import aiohttp
 
     semaphore = asyncio.Semaphore(DIPS_INFO_MAX_CONCURRENCY)
 
-    async with aiohttp.ClientSession() as session:
+    async with AddressRule.from_env().session() as session:
         tasks = [
             _fetch_single_dips_info_async(session, indexer, url, semaphore)
             for indexer, url in indexer_urls.items()
@@ -452,6 +468,7 @@ async def _post_graph_node_status(
             status_url,
             json=payload,
             timeout=aiohttp.ClientTimeout(total=GRAPH_NODE_VERSION_FETCH_TIMEOUT),
+            max_redirects=AIOHTTP_MAX_REDIRECTS,
         ) as resp:
             if resp.status >= 500:
                 raise aiohttp.ClientResponseError(
@@ -509,6 +526,11 @@ async def _fetch_single_graph_node_version_async(
     import aiohttp
 
     status_url = url.rstrip("/") + "/status"
+    unknown = {"indexer": indexer, "graph_node_version": None, "graph_node_commit": None}
+    refusal = refused_url(status_url)
+    if refusal is not None:
+        warn_refused(indexer, url, refusal)
+        return unknown
     last_error: Optional[Exception] = None
     for attempt in range(GRAPH_NODE_VERSION_MAX_RETRIES):
         try:
@@ -526,6 +548,11 @@ async def _fetch_single_graph_node_version_async(
             # nested too deep to read or a malformed shape would otherwise crash the whole run
             # through gather().
             last_error = e
+        refusal = refusal_behind(last_error)
+        if refusal is not None:
+            # The address would be refused again, so the call is not tried again.
+            warn_refused(indexer, url, refusal, while_connecting=True)
+            return unknown
         if _retry_would_not_help(last_error):
             break
         if attempt < GRAPH_NODE_VERSION_MAX_RETRIES - 1:
@@ -539,18 +566,17 @@ async def _fetch_single_graph_node_version_async(
         f"Failed to fetch graph-node version from {url_for_log(url)} for indexer {indexer}: "
         f"{error_for_log(last_error)}"
     )
-    return {"indexer": indexer, "graph_node_version": None, "graph_node_commit": None}
+    return unknown
 
 
 async def _fetch_all_graph_node_versions_async(
     indexer_urls: Dict[str, str],
 ) -> List[dict]:
     """Fan-out graph-node version fetches across the indexer fleet."""
-    import aiohttp
 
     semaphore = asyncio.Semaphore(GRAPH_NODE_VERSION_MAX_CONCURRENCY)
 
-    async with aiohttp.ClientSession() as session:
+    async with AddressRule.from_env().session() as session:
         tasks = [
             _fetch_single_graph_node_version_async(session, indexer, url, semaphore)
             for indexer, url in indexer_urls.items()
