@@ -26,7 +26,7 @@ from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, partial
-from typing import Annotated, Any, Literal, NamedTuple, Optional, Self, Union, cast
+from typing import Annotated, Any, Literal, NamedTuple, Optional, Self, TypeGuard, Union, cast
 
 import pandas as pd
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
@@ -48,6 +48,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from . import score_columns as cols
 from .freshness import (
     HISTORY_DAYS,
     MINUTES_PER_DAY,
@@ -1392,9 +1393,7 @@ def _chain_scores(
         pool, _ = _keep_with_chain_price(pool, chain)
         if pool.empty:
             continue
-        normalized = _normalize_metrics(
-            _with_chain_freshness(_enrich_with_chain_prices(pool, chain), chain)
-        )
+        normalized = _normalize_metrics(_enrich_for_chain(pool, chain))
         for row_indexer, score in _scores_by_indexer(
             normalized, DEFAULT_WEIGHTS, indexer_id
         ).items():
@@ -1962,6 +1961,81 @@ def _with_chain_freshness(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
     return df
 
 
+# The {chain: share} maps the job pushes for uptime and success rate, the column selection reads
+# each from, and how many times the share that column holds it.
+_BY_CHAIN_COLUMNS = (
+    ("uptime_by_chain", cols.SEL_UPTIME_PERCENT, 100.0),
+    ("success_rate_by_chain", cols.SEL_AVERAGE_STATUS, 1.0),
+)
+
+
+def _is_share(value: Any) -> TypeGuard[float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+
+
+def _is_missing(value: Any) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _chain_shares(by_chain: pd.Series, chain_id: str) -> tuple[pd.Series, list[Any]]:
+    """Each row's share on ``chain_id`` from its {chain: share} map, NaN where it has none, and
+    what couldn't be read, which also gives NaN: a value for ``chain_id`` that isn't a number
+    from 0 to 1, or a map that isn't one. A row without a map, as from a job that sends none,
+    is neither.
+    """
+    shares: list[float] = []
+    unusable: list[Any] = []
+    for value in by_chain:
+        share = value.get(chain_id) if isinstance(value, dict) else None
+        if _is_share(share):
+            shares.append(float(share))
+            continue
+        if isinstance(value, dict) and chain_id in value:
+            unusable.append(share)
+        elif not isinstance(value, dict) and not _is_missing(value):
+            unusable.append(value)
+        shares.append(math.nan)
+    return pd.Series(shares, index=by_chain.index, dtype=float), unusable
+
+
+def _with_chain_quality(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
+    """``history`` with each indexer's uptime and success rate on ``chain_id`` where the job
+    pushed one, and its overall values elsewhere, as for scores from a job that pushes none.
+    """
+    df = history.copy()
+    for by_chain, column, factor in _BY_CHAIN_COLUMNS:
+        if by_chain not in df.columns:
+            continue
+        shares, unusable = _chain_shares(df[by_chain], chain_id)
+        if unusable:
+            logger.warning(
+                "%d %s entr(ies) for chain %s can't be read as a share from 0 to 1, so those "
+                "indexers are scored on their overall value, such as %.100r",
+                len(unusable),
+                by_chain,
+                chain_id,
+                unusable[0],
+            )
+        elif shares.isna().all():
+            logger.debug(
+                "No indexer has a %s value on chain %s, so every one is scored on its overall "
+                "value",
+                by_chain,
+                chain_id,
+            )
+        overall = df[column] if column in df.columns else math.nan
+        df[column] = (shares * factor).where(shares.notna(), overall)
+    return df
+
+
+def _enrich_for_chain(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
+    """``history`` with everything that depends on ``chain_id``: its prices, each indexer's
+    freshness there, and its uptime and success rate there where the job measured them.
+    """
+    priced = _enrich_with_chain_prices(history, chain_id)
+    return _with_chain_quality(_with_chain_freshness(priced, chain_id), chain_id)
+
+
 def _indexer_prices(
     history: pd.DataFrame, idx_id: str, chain_id: str
 ) -> tuple[Optional[float], Optional[float]]:
@@ -2301,10 +2375,8 @@ def _prepare_selection(request: SelectionRequest) -> Union[_Selection, Selection
             ),
         )
 
-    # Enrich with the chain's prices and freshness scores for normalization
-    enriched_history = _with_chain_freshness(
-        _enrich_with_chain_prices(filtered_history, request.chain_id), request.chain_id
-    )
+    # Enrich with the chain's prices, freshness, uptime and success rate for normalization
+    enriched_history = _enrich_for_chain(filtered_history, request.chain_id)
     request = _without_stale_candidates(request, enriched_history)
     return _Selection(request, enriched_history, _synced_indexers_for(request.deployment_id))
 

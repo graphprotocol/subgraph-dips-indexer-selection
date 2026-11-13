@@ -24,6 +24,7 @@ import geoip2.errors
 import numpy as np
 import pandas as pd
 from carry_over import QUALITY_MEASURED_AT
+from chain_quality import blend
 from escaping import error_for_log, url_for_log
 from escaping import for_log as _for_log
 from numpy.linalg import pinv
@@ -50,6 +51,19 @@ STANDARD_ERROR_COLUMN = "Standard Error"
 LATENCY_UPPER_BOUND_COLUMN = "Latency Coefficient + Error Confidence Interval"
 REQUEST_STATUS_OK = "200 OK"
 REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK = "Unavailable(MissingBlock)"
+
+# Each indexer's uptime and success rate on each chain it served, as {chain: share} maps.
+UPTIME_BY_CHAIN = "uptime_by_chain"
+SUCCESS_RATE_BY_CHAIN = "success_rate_by_chain"
+_QUALITY_BY_CHAIN_COLUMNS = [
+    "indexer",
+    "uptime_overall",
+    "success_overall",
+    UPTIME_BY_CHAIN,
+    SUCCESS_RATE_BY_CHAIN,
+]
+# The count pass's columns: queries per (deployment, indexer) over the whole replay.
+_COUNT_COLUMNS = {"deployment_hash", "indexer", "num_rows"}
 
 # GeoIP database paths (MaxMind GeoLite2, bundled in Docker image)
 # Attribution: This product includes GeoLite2 data created by MaxMind, available from https://www.maxmind.com
@@ -989,6 +1003,7 @@ def compute_all_scores(
     # GeoIP-independent metrics: always computed from real Redpanda data
     indexer_success_rate = calculate_indexer_success_rate(combined_queries)
     indexer_uptime = calculate_indexer_uptime(data_for_uptime)
+    quality_by_chain = calculate_quality_by_chain(combined_queries, initial_query_results)
 
     stake_lookup_started = utc_now()
     stake_to_fees = provider.fetch_stake_to_fees()
@@ -1006,6 +1021,7 @@ def compute_all_scores(
         drop_missing_latency=geoip_available,
     )
     merged = leave_out_unread(merged, stake_lookup_started)
+    merged = _with_quality_by_chain(merged, quality_by_chain)
 
     # DIP pricing fetched directly from indexers
     merged = _attach_dips_info(merged, indexer_urls)
@@ -1059,6 +1075,10 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
 
     # Success rate
     scores["success_rate"] = merged.get("average_status")
+
+    # Uptime and success rate on each chain, which selection prefers on the request's chain
+    scores[UPTIME_BY_CHAIN] = merged.get(UPTIME_BY_CHAIN)
+    scores[SUCCESS_RATE_BY_CHAIN] = merged.get(SUCCESS_RATE_BY_CHAIN)
 
     # Economic security metrics
     scores["stake_to_fees"] = merged.get("stake_to_fees")
@@ -1644,6 +1664,129 @@ def calculate_indexer_uptime(df: pd.DataFrame, threshold_seconds: int = 120) -> 
     return pd.merge(merged_restricted, merged_full, on="indexer", how="left", validate="m:1")
 
 
+def calculate_quality_by_chain(queries: pd.DataFrame, counts: pd.DataFrame) -> pd.DataFrame:
+    """Each indexer's uptime and success rate overall and on each chain it served, as shares
+    from 0 to 1, from the replayed ``queries`` and the count pass's ``counts``.
+
+    Each chain's value is blended with the indexer's overall value, the query-weighted average
+    over all its chains, by its queries over the whole replay (chain_quality.blend). Rows
+    naming no chain are left out. Columns are _QUALITY_BY_CHAIN_COLUMNS.
+    """
+    chains = queries["subgraph_network"]
+    named = [chain for chain in chains.dropna().unique() if isinstance(chain, str) and chain]
+    columns = ["indexer", "status", "timestamp", "deployment_hash", "subgraph_network"]
+    rows = queries.loc[chains.isin(named), columns].rename(columns={"subgraph_network": "chain"})
+    if rows.empty:
+        logger.warning(
+            "No replayed query names its chain, so no indexer gets uptime or success rate by chain"
+        )
+        return pd.DataFrame(columns=_QUALITY_BY_CHAIN_COLUMNS)
+    return _blended_by_chain(_values_by_chain(rows), _queries_by_chain(rows, counts))
+
+
+def _values_by_chain(rows: pd.DataFrame) -> pd.DataFrame:
+    """Uptime and success rate as shares from 0 to 1, by (indexer, chain)."""
+    answered = rows["status"].isin([REQUEST_STATUS_OK, REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK])
+    success = answered.groupby([rows["indexer"], rows["chain"]]).mean()
+    uptime = pd.concat(
+        calculate_indexer_uptime(part[["indexer", "status", "timestamp"]]).assign(chain=chain)
+        for chain, part in rows.groupby("chain")
+    )
+    shares = uptime.set_index(["indexer", "chain"])["% up_x"] / 100
+    return pd.DataFrame({"uptime": shares, "success": success})
+
+
+def _queries_by_chain(rows: pd.DataFrame, counts: pd.DataFrame) -> pd.Series:
+    """Each (indexer, chain)'s queries over the whole replay: the count pass's counts where
+    each deployment's chain is known from the sampled rows, else the sampled rows.
+    """
+    sampled = rows.groupby(["indexer", "chain"]).size().astype(float)
+    full = _counted_queries_by_chain(rows, counts)
+    if full is None:
+        logger.warning(
+            "The count pass gave no query counts, so each indexer's chains are weighed by its "
+            "sampled queries instead"
+        )
+        return sampled
+    uncounted = len(sampled.index.difference(full.index))
+    if uncounted:
+        logger.info(
+            "%d (indexer, chain) pair(s) have sampled queries but none counted, so they are "
+            "weighed by their sampled queries",
+            uncounted,
+        )
+    return full.reindex(sampled.index).fillna(sampled)
+
+
+def _counted_queries_by_chain(rows: pd.DataFrame, counts: pd.DataFrame) -> Optional[pd.Series]:
+    """The count pass's queries by (indexer, chain), each deployment on the chain most of its
+    sampled rows name, or None when the count pass gave no counts.
+    """
+    if counts is None or counts.empty or not _COUNT_COLUMNS <= set(counts.columns):
+        return None
+    named = rows.groupby(["deployment_hash", "chain"]).size().reset_index(name="rows")
+    named = named.sort_values("rows", ascending=False, kind="stable")
+    chain_of = named.drop_duplicates("deployment_hash").set_index("deployment_hash")["chain"]
+    if len(named) > len(chain_of):
+        logger.info(
+            "%d subgraph(s) have sampled queries naming more than 1 chain; each is counted on "
+            "the chain most of them name",
+            named["deployment_hash"].duplicated().groupby(named["deployment_hash"]).any().sum(),
+        )
+    chains = counts["deployment_hash"].map(chain_of)
+    unknown = counts.loc[chains.isna(), "num_rows"].sum()
+    if unknown:
+        logger.info(
+            "%s of the count pass's %s queries are on subgraphs with no sampled query, so their "
+            "chain is unknown and the counts by chain leave them out",
+            f"{int(unknown):,}",
+            f"{int(counts['num_rows'].sum()):,}",
+        )
+    known = counts.assign(chain=chains).dropna(subset=["chain"])
+    return known.groupby(["indexer", "chain"])["num_rows"].sum().astype(float)
+
+
+def _blended_by_chain(values: pd.DataFrame, queries: pd.Series) -> pd.DataFrame:
+    """The overall and by-chain uptime and success rate of each indexer in ``values``."""
+    records = []
+    for indexer, table in values.groupby(level="indexer"):
+        chains = table.index.get_level_values("chain")
+        weights = {chain: float(queries.get((indexer, chain), 0.0)) for chain in chains}
+        record: dict = {"indexer": indexer}
+        for metric, overall_column, by_chain_column in (
+            ("uptime", "uptime_overall", UPTIME_BY_CHAIN),
+            ("success", "success_overall", SUCCESS_RATE_BY_CHAIN),
+        ):
+            shares = {c: float(v) for c, v in zip(chains, table[metric]) if pd.notna(v)}
+            overall, by_chain = blend(shares, weights)
+            record[overall_column] = math.nan if overall is None else overall
+            record[by_chain_column] = by_chain or None
+        records.append(record)
+    return pd.DataFrame(records, columns=_QUALITY_BY_CHAIN_COLUMNS)
+
+
+def _with_quality_by_chain(merged: pd.DataFrame, quality: pd.DataFrame) -> pd.DataFrame:
+    """``merged`` with each indexer's uptime and success rate set to the query-weighted average
+    over its chains, and its values by chain beside them. An indexer with no query on a named
+    chain keeps the values worked out across all its queries.
+    """
+    merged = merged.merge(quality, on="indexer", how="left", validate="m:1")
+    for overall, column, factor in (
+        ("uptime_overall", "% up_x", 100.0),
+        ("success_overall", "average_status", 1.0),
+    ):
+        shares = merged[overall].astype(float)
+        merged[column] = (shares * factor).where(shares.notna(), merged.get(column))
+    kept = int(merged["uptime_overall"].isna().sum())
+    if kept:
+        logger.info(
+            "%d indexer(s) have no query on a named chain, so their uptime and success rate "
+            "are worked out across all their queries",
+            kept,
+        )
+    return merged.drop(columns=["uptime_overall", "success_overall"])
+
+
 def aggregate_indexer_info(df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate organizational and location info per indexer."""
 
@@ -1776,6 +1919,8 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["observed_duration_seconds"] = None
     scores["uptime_duration_seconds"] = None
     scores["success_rate"] = 1.0
+    scores[UPTIME_BY_CHAIN] = None
+    scores[SUCCESS_RATE_BY_CHAIN] = None
     scores["stake_to_fees"] = None
     scores["norm_stake_to_fees"] = 0.5
     scores["org"] = None

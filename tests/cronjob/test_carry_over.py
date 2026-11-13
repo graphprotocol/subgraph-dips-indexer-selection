@@ -49,6 +49,8 @@ QUALITY_COLUMNS = [
     "observed_duration_seconds",
     "uptime_duration_seconds",
     "success_rate",
+    "uptime_by_chain",
+    "success_rate_by_chain",
     "org",
     "dst_lat",
     "dst_lon",
@@ -154,6 +156,11 @@ class TestAFailedRun:
         columns = [*QUALITY_COLUMNS, *STAKE_COLUMNS, READ_AT, MEASURED_AT]
         assert _by_indexer(pushed, columns) == _by_indexer(measured, columns)
         assert [row["success_rate"] for row in pushed] == [1.0, 0.75, 0.5]
+        assert [row["success_rate_by_chain"] for row in pushed] == [
+            {"arbitrum": 1.0},
+            {"arbitrum": 0.75},
+            {"arbitrum": 0.5},
+        ]
         assert {pd.Timestamp(row[MEASURED_AT]) for row in pushed} == {NOW}
         assert any("mode=carried_over" in r.getMessage() for r in caplog.records)
         warning = _first(caplog.records, "WARNING", "carried over for 3 of today's 3 indexer(s)")

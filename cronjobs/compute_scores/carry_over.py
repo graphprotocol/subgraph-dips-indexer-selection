@@ -39,6 +39,8 @@ QUALITY_COLUMNS = [
     "observed_duration_seconds",
     "uptime_duration_seconds",
     "success_rate",
+    "uptime_by_chain",
+    "success_rate_by_chain",
     "org",
     "dst_lat",
     "dst_lon",
