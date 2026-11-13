@@ -2,7 +2,8 @@
 
 A prober checks every indexer on every chain it offers DIPs on once a minute and pushes that
 minute's outcomes to the service. From them this module keeps, for each indexer and chain, a
-stale mark worked out from the last 10 minutes, and daily counts of passed and counted checks
+stale mark worked out from the last 10 minutes and from when its checks last counted, and daily
+counts of passed and counted checks
 for the last 28 days, from which it scores the indexer's freshness on the chain. Minutes and
 days are counted from the Unix epoch in UTC, so a day here is a UTC day.
 """
@@ -13,9 +14,9 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Self
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from .share_score import shaped_share
 
@@ -36,6 +37,10 @@ OutcomeKind = Literal["pass", "fail", "no_evidence", "void"]
 
 WINDOW_MINUTES = 10
 MIN_COUNTED_MINUTES = 5
+# A pair none of whose checks has counted for more than this many minutes, while checks on other
+# indexers on its chain still count, is marked: with no evidence it is fresh, it isn't picked.
+# Comparing with the chain's checks means an outage that voids every check there marks nobody.
+MAX_SILENT_MINUTES = 60
 HISTORY_DAYS = 28
 MINUTES_PER_DAY = 1_440
 # Freshness is weighed on a chain only once it has this many minutes of checks, 7 days, and an
@@ -101,6 +106,33 @@ class PairState(BaseModel):
     # Counts by UTC day, for the last HISTORY_DAYS days only.
     days: dict[int, DayCount] = Field(default_factory=dict)
     last: LastCheck
+    # The minute of the pair's last outcome that counted, meaning any but void, or None before
+    # it has one.
+    last_counted: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _fill_in_last_counted(self) -> Self:
+        """Work out last_counted for a pair saved before it was kept, as _last_counted_of does."""
+        if self.last_counted is None:
+            self.last_counted = _last_counted_of(self)
+        return self
+
+
+def _last_counted_of(pair: PairState) -> Optional[int]:
+    """The pair's last counted minute from what else it holds: its latest outcome when that
+    counted, else the latest counted minute in its window, else the latest minute it can have
+    been, the end of the latest day it has counted checks on or its latest outcome if earlier.
+    None when it holds no counted outcome at all.
+    """
+    if pair.last.outcome != "void":
+        return pair.last.minute
+    counted = [minute for minute, outcome in pair.minutes.items() if outcome != "void"]
+    if counted:
+        return max(counted)
+    days = [day for day, counts in pair.days.items() if counts.counted]
+    if days:
+        return min((max(days) + 1) * MINUTES_PER_DAY - 1, pair.last.minute)
+    return None
 
 
 class FreshnessState(BaseModel):
@@ -167,6 +199,7 @@ def _record(state: FreshnessState, minute: int, check: Check) -> None:
     pair.minutes[minute] = check.outcome
     _count(pair, minute // MINUTES_PER_DAY, check.outcome)
     if check.outcome != "void":
+        pair.last_counted = minute
         state.last_counted[check.chain] = minute
 
 
@@ -196,15 +229,28 @@ def _trim(pair: PairState, last_minute: int) -> None:
     pair.days = {day: counts for day, counts in pair.days.items() if day >= oldest_day}
 
 
+def _silent(pair: PairState, chain_last_counted: Optional[int]) -> bool:
+    """Whether checks on the pair's chain went on counting for more than MAX_SILENT_MINUTES
+    after the pair's own last counted one. A pair that never counted is never silent: it starts
+    marked anyway.
+    """
+    if pair.last_counted is None or chain_last_counted is None:
+        return False
+    return chain_last_counted - pair.last_counted > MAX_SILENT_MINUTES
+
+
 def _update_marks(state: FreshnessState, last_minute: int) -> None:
     """Judge every pair on record over the window. With too few counted minutes a pair keeps
-    the mark it had.
+    the mark it had, unless it is silent, which marks it.
     """
-    for pairs in state.chains.values():
+    for chain, pairs in state.chains.items():
+        chain_last_counted = state.last_counted.get(chain)
         for pair in pairs.values():
             passed, counted = _window(pair, state.received, last_minute)
             if counted >= MIN_COUNTED_MINUTES:
                 pair.marked = passed * 2 < counted
+            elif _silent(pair, chain_last_counted):
+                pair.marked = True
 
 
 def _report(pair: PairState, received: set[int], last_minute: int) -> dict[str, Any]:
@@ -218,6 +264,9 @@ def _report(pair: PairState, received: set[int], last_minute: int) -> dict[str, 
         "window_passed": passed,
         "window_counted": counted,
         "last": {**pair.last.model_dump(), "minute": minute_text(pair.last.minute)},
+        "last_counted_minute": (
+            minute_text(pair.last_counted) if pair.last_counted is not None else None
+        ),
         "passed_28d": passed_28d,
         "counted_28d": counted_28d,
         "share_28d": passed_28d / counted_28d if counted_28d else None,

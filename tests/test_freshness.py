@@ -194,6 +194,71 @@ class TestStaleMark:
         assert _pair(store, chain=OTHER_CHAIN)["marked"] is True
 
 
+class TestSilentPairs:
+    """A pair none of whose checks has counted for over 60 minutes, while checks on other
+    indexers on its chain still count, is marked: no evidence, no pick.
+    """
+
+    @pytest.mark.parametrize("silence", ["void", None], ids=["void", "left-out"])
+    @pytest.mark.parametrize(("minutes", "marked"), [(60, False), (61, True)])
+    def test_a_pair_silent_for_over_60_minutes_while_others_count_is_marked(
+        self, silence, minutes, marked
+    ):
+        store = FreshnessStore()
+        _run(store, ["pass"] * 10 + [silence] * minutes)
+
+        pair = _pair(store)
+        assert (pair["marked"], pair["judged"]) == (marked, False)
+        assert pair["last_counted_minute"] == minute_text(START + 9)
+
+    def test_a_minute_void_for_every_pair_on_the_chain_marks_nobody(self):
+        """As when the gateway is down or the prober's API key is out of funds."""
+        store = FreshnessStore()
+        minute = _run(store, ["pass"] * 10)
+        for offset in range(120):
+            _push(store, minute + offset, _check("void"), _check("void", indexer=OTHER))
+
+        assert store.stale_indexers(CHAIN, [INDEXER, OTHER]) == set()
+
+    def test_another_chain_counting_does_not_mark_a_pair(self):
+        store = FreshnessStore()
+        minute = _run(store, ["pass"] * 10)
+        for offset in range(61):
+            _push(store, minute + offset, _check("void"), _check("pass", chain=OTHER_CHAIN))
+
+        assert _pair(store)["marked"] is False
+
+    def test_a_silent_pair_clears_once_its_checks_count_again(self):
+        store = FreshnessStore()
+        minute = _run(store, ["pass"] * 10 + ["void"] * 61)
+        assert _pair(store)["marked"] is True
+
+        marks = []
+        for offset in range(5):
+            _push(store, minute + offset, _check("pass"), _check("pass", indexer=OTHER))
+            marks.append(_pair(store)["marked"])
+
+        assert marks == [True, True, True, True, False]
+
+    def test_a_pair_that_never_counted_starts_marked_as_before(self):
+        store = FreshnessStore()
+        _run(store, ["void"] * 120)
+
+        pair = _pair(store)
+        assert pair["marked"] is True
+        assert pair["last_counted_minute"] is None
+
+    @pytest.mark.parametrize("outcome", ["pass", "fail", "no_evidence"])
+    def test_every_outcome_but_void_counts_as_heard_from(self, outcome):
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        store.apply(START, [_check(outcome)], saves.append)
+        store.apply(START + 1, [_check("void")], saves.append)
+
+        assert saves[-1]["chains"][CHAIN][INDEXER]["last_counted"] == START
+        assert _pair(store)["last_counted_minute"] == minute_text(START)
+
+
 class TestStaleIndexers:
     def test_marked_and_unrecorded_indexers_are_stale(self):
         store = FreshnessStore()
@@ -443,6 +508,65 @@ class TestSavedFile:
         assert reloaded.last_counted_minute(CHAIN) is None
         reloaded.apply(START + 5, [_check("pass")], _no_save)
         assert reloaded.last_counted_minute(CHAIN) == START + 5
+
+    @pytest.mark.parametrize(
+        ("history", "derived"),
+        [
+            ({START + i: "pass" for i in range(5)}, START + 4),
+            ({**{START + i: "pass" for i in range(5)}, START + 5: "void"}, START + 4),
+            ({**{START + i: "pass" for i in range(5)}, START + 20: "void"}, START + 20),
+            ({**{START + i: "pass" for i in range(5)}, START + DAY + 20: "void"}, START + DAY - 1),
+            ({START + i: "void" for i in range(5)}, None),
+        ],
+        ids=[
+            "latest-outcome-counted",
+            "counted-in-the-window",
+            "counted-earlier-that-day",
+            "counted-on-an-earlier-day",
+            "never-counted",
+        ],
+    )
+    def test_file_saved_before_pairs_kept_their_last_counted_minute_loads(
+        self, tmp_path, caplog, history, derived
+    ):
+        """Such a pair's last counted minute is its latest outcome when that counted, else the
+        latest counted minute in its window, else the latest minute it can have been: the end of
+        the latest day it has counted checks on, or its latest outcome if earlier. A pair that
+        never counted has none, and keeps starting marked."""
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        for minute, outcome in history.items():
+            store.apply(minute, [_check(outcome)], saves.append)
+        older = json.loads(json.dumps(saves[-1]))
+        for pairs in older["chains"].values():
+            for pair in pairs.values():
+                del pair["last_counted"]
+        path = tmp_path / "freshness.json"
+        path.write_text(json.dumps(older))
+
+        with caplog.at_level(logging.WARNING, logger="iisa.freshness"):
+            reloaded = FreshnessStore(load_state(str(path)))
+
+        assert caplog.records == []
+        expected = minute_text(derived) if derived is not None else None
+        assert _pair(reloaded)["last_counted_minute"] == expected
+
+    def test_a_pair_loaded_from_an_older_file_is_marked_once_silent_long_enough(self, tmp_path):
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        for minute in range(START, START + 10):
+            store.apply(minute, [_check("pass"), _check("pass", indexer=OTHER)], saves.append)
+        older = json.loads(json.dumps(saves[-1]))
+        for pairs in older["chains"].values():
+            for pair in pairs.values():
+                del pair["last_counted"]
+        path = tmp_path / "freshness.json"
+        path.write_text(json.dumps(older))
+        reloaded = FreshnessStore(load_state(str(path)))
+
+        _run(reloaded, ["void"] * 61, start=START + 10)
+
+        assert _pair(reloaded)["marked"] is True
 
     def test_saved_file_keeps_only_the_window(self):
         saves: list[dict[str, Any]] = []

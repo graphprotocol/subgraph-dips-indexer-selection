@@ -197,6 +197,25 @@ def test_every_candidate_marked_picks_nobody_new(state):
     assert _select(size=3, existing=[FAIR]) == [FAIR]
 
 
+@pytest.mark.parametrize(("minutes", "picked"), [(60, BEST), (61, GOOD)])
+def test_a_candidate_whose_checks_stop_counting_for_over_an_hour_is_left_out(
+    state, monkeypatch, minutes, picked
+):
+    """BEST's checks are all void, as when it refuses the prober's payments, while the others
+    pass, so after 60 minutes there is no evidence it is still fresh."""
+    _judge(state, {(BEST, CHAIN): "pass", (GOOD, CHAIN): "pass", (FAIR, CHAIN): "pass"}, LAST)
+    for minute in range(LAST + 1, LAST + 1 + minutes):
+        checks = [
+            Check(BEST, CHAIN, "void", reason="payment_refused"),
+            Check(GOOD, CHAIN, "pass"),
+            Check(FAIR, CHAIN, "pass"),
+        ]
+        state.freshness.apply(minute, checks, lambda _: None)
+    _clock(monkeypatch, LAST + minutes)
+
+    assert _select() == [picked]
+
+
 class TestChecksTooOld:
     """On a chain that isn't exempt the marks decide selection only while a check there
     counted within IISA_FRESHNESS_MAX_AGE_MINUTES, 60 by default, of the service's clock.

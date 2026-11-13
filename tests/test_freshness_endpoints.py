@@ -536,6 +536,7 @@ class TestRead:
                 "deployment": "QmOther",
                 "age_seconds": 1778.9,
             },
+            "last_counted_minute": minute,
             "passed_28d": 0,
             "counted_28d": 1,
             "share_28d": 0.0,
