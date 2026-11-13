@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .score_columns import NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI
+from .share_score import shaped_share
 
 __all__ = [
     "IndexerSelector",
@@ -33,8 +34,6 @@ IndexerId = EthAddressStr
 
 # Module-level logger
 logger = logging.getLogger(__name__)
-
-NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD = 0.97
 
 # Indexers scoring below this threshold are candidates for replacement.
 # They will only be replaced if a significantly better candidate is available.
@@ -276,8 +275,8 @@ class IndexerSelector:
     def _scale_rows(self) -> Optional[pd.Series]:
         """Rows that set each metric's scale: the group plus every indexer this request can pick.
 
-        Blocked and declined indexers are left out even when in the group, so one with the best
-        uptime can't push every real candidate below the 97%-of-best cutoff.
+        Blocked and declined indexers are left out even when in the group, so one with an
+        extreme value can't stretch a metric's scale for every real candidate.
         """
         if "indexer" not in self.data.columns:
             return None
@@ -735,10 +734,10 @@ def _normalize_metrics(
     metrics: list[tuple[str, str, _Normaliser]] = [
         (NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI, _normalize_latency),
         # higher is better
-        ("norm_uptime_score", "% up_x", _normalize_uptime_and_success_rate),
+        ("norm_uptime_score", "% up_x", _normalize_uptime),
         ("norm_stake_to_fees", "stake_to_fees", _normalize_stake_to_fees),
         # higher is better
-        ("norm_success_rate", "average_status", _normalize_uptime_and_success_rate),
+        ("norm_success_rate", "average_status", _normalize_success_rate),
         (
             "norm_base_price_per_epoch",
             "base_price_per_epoch",
@@ -929,29 +928,26 @@ def _normalize_generic(series: pd.Series, scale_rows: Optional[pd.Series] = None
     return cast(pd.Series, normalized)
 
 
-def _normalize_uptime_and_success_rate(
-    series: pd.Series, scale_rows: Optional[pd.Series] = None
+def _normalize_uptime(
+    uptime_percent: pd.Series, _scale_rows: Optional[pd.Series] = None
 ) -> pd.Series:
-    """Piecewise-scale uptime/success rate, rewarding only the top band.
+    """Score uptime on the indexer's own share of time up; ``% up_x`` holds it times 100."""
+    return _normalize_share(uptime_percent / 100)
 
-    Values below NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD of the best
-    indexer's score get 0; from there to the best they scale linearly to 1
-    (e.g. 98.5% of the best maps to ~0.5). A missing value scores 0.
+
+def _normalize_success_rate(
+    success_rate: pd.Series, _scale_rows: Optional[pd.Series] = None
+) -> pd.Series:
+    """Score success rate, already a share from 0 to 1, on the indexer's own share."""
+    return _normalize_share(success_rate)
+
+
+def _normalize_share(share: pd.Series) -> pd.Series:
+    """A share scored on its own, with no reference to the other candidates: clipped to [0, 1]
+    and shaped by shaped_share, so 0.9 scores about 0.53 and 0.8 about 0.26. A missing value
+    scores 0.
     """
-    # Find the best uptime/success rate score in the series first
-    best = _scale_values(series, scale_rows).max()
-
-    # Threshold whereby indexers that have less uptime/success rate than this get no score.
-    threshold = best * NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD
-
-    # Linear score between the threshold and the best. clip() keeps NaN as NaN
-    # (a missing value, or 0 / 0 when the best is 0), so it fills to 0 below.
-    normalized = ((series - threshold) / (best - threshold)).clip(0, 1)
-
-    # Fill NaN's with 0.
-    normalized = normalized.fillna(0)
-
-    return cast(pd.Series, normalized)
+    return shaped_share(share.clip(0, 1)).fillna(0.0)
 
 
 def _normalize_freshness(

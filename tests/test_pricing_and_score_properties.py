@@ -45,7 +45,8 @@ from iisa.indexer_selection import (
     _normalize_metrics,
     _normalize_price_per_entity,
     _normalize_stake_to_fees,
-    _normalize_uptime_and_success_rate,
+    _normalize_success_rate,
+    _normalize_uptime,
 )
 from iisa.score_columns import SEL_LATENCY_CI
 
@@ -377,7 +378,8 @@ float_series = st.lists(any_floats, max_size=10).map(lambda values: pd.Series(va
         _normalize_generic,
         _normalize_latency,
         _normalize_stake_to_fees,
-        _normalize_uptime_and_success_rate,
+        _normalize_uptime,
+        _normalize_success_rate,
     ],
 )
 @given(values=float_series)

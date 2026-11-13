@@ -335,8 +335,7 @@ def _record(indexer: str, success_rate: float, **changes: Any) -> dict[str, Any]
     return {**record, **changes}
 
 
-# By score alone D is the best pick, then C, then B; A is the worst. The rates sit close
-# together because a success rate under 97% of the best scores 0, which would tie A, B and C.
+# By score alone D is the best pick, then C, then B; A is the worst.
 RECORDS = [_record(A, 0.970), _record(B, 0.975), _record(C, 0.980), _record(D, 0.990)]
 # M is a weak indexer scoring under 0.45: less than the 0.60 a synced candidate needs once the
 # group has a synced member, and not enough to replace anyone. Beside it A, B, C and D all score
