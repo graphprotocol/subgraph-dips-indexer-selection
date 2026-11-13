@@ -22,6 +22,7 @@ import logging
 import math
 import numbers
 import os
+import threading
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -656,6 +657,44 @@ logging.basicConfig(
 logger = logging.getLogger("iisa-service")
 
 
+# The warning that freshness isn't enforced on a chain whose checks have stopped passing or
+# failing is logged at most once per chain in this many minutes of the service's clock, since a
+# prober that is down or off would otherwise log 1 on every selection for up to 28 days.
+LAPSE_WARNING_INTERVAL_MINUTES = 10
+
+
+class _PerChainLimit:
+    """Lets a log line through at most once per chain every LAPSE_WARNING_INTERVAL_MINUTES,
+    counting those held back in between, until the chain is reset, which starts it afresh. It
+    has a lock of its own, so selections running on different threads can share it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last: dict[str, int] = {}
+        self._held: dict[str, int] = {}
+
+    def allow(self, chain: str, now: int) -> Optional[int]:
+        """How many lines on ``chain`` were held back since the last one let through, when a
+        line in the minute ``now`` may be logged, or None when it is held back too.
+        """
+        with self._lock:
+            last = self._last.get(chain)
+            if last is not None and now - last < LAPSE_WARNING_INTERVAL_MINUTES:
+                self._held[chain] = self._held.get(chain, 0) + 1
+                return None
+            self._last[chain] = now
+            return self._held.pop(chain, 0)
+
+    def reset(self, chain: str) -> None:
+        """Forget ``chain``'s last line and the count held back since, so its next line goes
+        through and counts only what is held back after it.
+        """
+        with self._lock:
+            self._last.pop(chain, None)
+            self._held.pop(chain, None)
+
+
 class IISAState:
     """
     Holds the IISA service state including initialized providers and cached data.
@@ -668,6 +707,7 @@ class IISAState:
         self._sync_status: Optional["SyncStatusData"] = None
         self.sync_checker: Optional[SyncClaimChecker] = None
         self.freshness = FreshnessStore()
+        self.lapse_warnings = _PerChainLimit()
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -2290,12 +2330,15 @@ def _checks_too_old(request: SelectionRequest, enforcement: Enforcement) -> bool
     """True when no check on the request's chain passed or failed recently enough for its
     marks to be trusted. A no_evidence check doesn't count here, as the prober works it out
     without asking the gateway. A chain whose checks did pass or fail but not within the limit,
-    as when the prober stops or the gateway is down, gets a warning on every selection. A chain
-    with no such check in the HISTORY_DAYS kept, such as one the prober doesn't check, only
-    gets a debug line.
+    as when the prober stops or the gateway is down, gets a warning at most once every
+    LAPSE_WARNING_INTERVAL_MINUTES, saying how many were held back since the last. Once its
+    checks are current again that count starts afresh, so its next lapse warns at once. A chain
+    with no such check in the HISTORY_DAYS kept, such as one the prober doesn't check, only gets
+    a debug line.
     """
     last_answered = _state.freshness.last_answered_minute(request.chain_id)
     if enforcement.current(last_answered):
+        _state.lapse_warnings.reset(request.chain_id)
         return False
     if last_answered is None or enforcement.now - last_answered > HISTORY_DAYS * MINUTES_PER_DAY:
         logger.debug(
@@ -2306,14 +2349,20 @@ def _checks_too_old(request: SelectionRequest, enforcement: Enforcement) -> bool
             HISTORY_DAYS,
         )
         return True
+    held = _state.lapse_warnings.allow(request.chain_id, enforcement.now)
+    if held is None:
+        return True
     logger.warning(
         "deployment=%s chain=%s isn't exempt but freshness isn't enforced there, since no check "
         "on it has passed or failed for %d minutes, over the limit of %d set by "
-        "IISA_FRESHNESS_MAX_AGE_MINUTES; candidates are picked as if the chain were exempt",
+        "IISA_FRESHNESS_MAX_AGE_MINUTES; candidates are picked as if the chain were exempt. "
+        "Logged at most once every %d minutes per chain, with %d held back since the last",
         request.deployment_id,
         request.chain_id,
         enforcement.now - last_answered,
         enforcement.max_age_minutes,
+        LAPSE_WARNING_INTERVAL_MINUTES,
+        held,
     )
     return True
 
