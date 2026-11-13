@@ -3354,6 +3354,46 @@ class TestSelectIndexersEndToEndPricing:
         assert [i["id"] for i in response.json()["indexers"]] == ["0xcheap"]
 
     @pytest.mark.parametrize(
+        ("request_caps", "expected"),
+        [
+            ({"max_grt_per_billion_entities_per_30_days": 2_000.0}, [0.9, 0.25]),
+            ({}, [0.8667, 0.0]),
+        ],
+        ids=["payers-ceiling", "no-ceiling"],
+    )
+    def test_selection_scores_entity_price_against_the_payers_ceiling(self, request_caps, expected):
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import IndexerSelector, app
+
+        iisa_http_endpoints._state._history = pd.DataFrame(
+            [
+                self._row("0xcheap", "arb", 100.0, entity_price=200.0),
+                self._row("0xdear", "arb", 100.0, "EU", "org2", entity_price=1_500.0),
+            ]
+        )
+        iisa_http_endpoints._state._initialized = True
+        built: list[IndexerSelector] = []
+
+        def build(*args, **kwargs):
+            built.append(IndexerSelector(*args, **kwargs))
+            return built[-1]
+
+        with patch.object(iisa_http_endpoints, "IndexerSelector", side_effect=build):
+            response = TestClient(app, raise_server_exceptions=False).post(
+                "/select-indexers",
+                json={
+                    "deployment_id": "QmEntityCeilingTest",
+                    "chain_id": "arb",
+                    "num_candidates": 2,
+                    **request_caps,
+                },
+            )
+
+        assert response.status_code == 200
+        scores = built[0].data.set_index("indexer")["norm_price_per_entity"]
+        assert [scores["0xcheap"], scores["0xdear"]] == pytest.approx(expected, abs=1e-4)
+
+    @pytest.mark.parametrize(
         "field", ["max_grt_per_30_days", "max_grt_per_billion_entities_per_30_days"]
     )
     @pytest.mark.parametrize("ceiling", ["-1", "NaN", "Infinity"])

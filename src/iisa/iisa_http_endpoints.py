@@ -2212,6 +2212,7 @@ def _build_selector(
         price_ceiling=request.max_grt_per_30_days,
         synced_indexers=cast(set[EthAddressStr], synced_indexers),
         stale_indexers=cast(list[EthAddressStr], stale_indexers),
+        entity_price_ceiling=request.max_grt_per_billion_entities_per_30_days,
     )
 
 

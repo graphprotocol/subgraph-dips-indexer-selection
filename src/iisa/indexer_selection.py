@@ -105,11 +105,13 @@ class IndexerSelector:
         price_ceiling: Optional[float] = None,
         synced_indexers: Optional[set[IndexerId]] = None,
         stale_indexers: Optional[list[IndexerId]] = None,
+        entity_price_ceiling: Optional[float] = None,
     ):
         """Initialize the selector and run scoring for one deployment.
         Non-obvious args: optimistic_dips_fees lowers stake_to_fees for indexers
-        that already hold agreements (load-balancing), price_ceiling caps pricing
-        normalisation so one outlier can't compress the rest, synced_indexers
+        that already hold agreements (load-balancing), price_ceiling and
+        entity_price_ceiling, the payer's ceilings on the base and per-entity
+        prices, are what those prices are scored against, synced_indexers
         are preferred so queries serve right after acceptance, and stale_indexers
         are candidates marked stale, picked only for places no other candidate can fill.
         """
@@ -123,6 +125,7 @@ class IndexerSelector:
         self.target_size = target_size
         self.optimistic_dips_fees = optimistic_dips_fees or {}
         self.price_ceiling = price_ceiling
+        self.entity_price_ceiling = entity_price_ceiling
         self.synced_indexers = {s.lower() for s in synced_indexers} if synced_indexers else set()
         self.stale_indexers = list(stale_indexers or [])
         # Set once no other candidate is left, so the stale ones may fill the remaining places.
@@ -255,7 +258,10 @@ class IndexerSelector:
         """
         try:
             normalized_data = _normalize_metrics(
-                self.data, price_ceiling=self.price_ceiling, scale_rows=self._scale_rows()
+                self.data,
+                price_ceiling=self.price_ceiling,
+                scale_rows=self._scale_rows(),
+                entity_price_ceiling=self.entity_price_ceiling,
             )
             logger.debug(
                 "deployment=%s normalized %d indexers",
@@ -761,11 +767,13 @@ def _normalize_metrics(
     merged: pd.DataFrame,
     price_ceiling: Optional[float] = None,
     scale_rows: Optional[pd.Series] = None,
+    entity_price_ceiling: Optional[float] = None,
 ) -> pd.DataFrame:
     """Normalise each metric to [0, 1] where 1 is best (lower-is-better inverted).
 
-    price_ceiling, when given, caps pricing instead of the observed max. scale_rows, when given,
-    marks the rows that set each metric's best and worst; other rows are scored against them.
+    price_ceiling and entity_price_ceiling, when given, are what the base and per-entity prices
+    are scored against instead of the observed max. scale_rows, when given, marks the rows that
+    set each metric's best and worst; other rows are scored against them.
     Missing metrics score 0, except those in _LEFT_OUT_WHEN_MISSING, which stay missing, and a
     value that does not read as a number, such as text, scores 0. Input norm_ columns outside
     _PRECOMPUTED_NORM_COLUMNS are recomputed; those inside score 0 when outside [0, 1].
@@ -783,7 +791,11 @@ def _normalize_metrics(
             "base_price_per_epoch",
             lambda prices, rows: _normalize_base_price_per_epoch(prices, price_ceiling, rows),
         ),
-        ("norm_price_per_entity", "price_per_entity", _normalize_price_per_entity),
+        (
+            "norm_price_per_entity",
+            "price_per_entity",
+            lambda prices, rows: _normalize_price_per_entity(prices, entity_price_ceiling, rows),
+        ),
         # higher is better
         ("norm_freshness", "freshness", _normalize_freshness),
     ]
@@ -930,16 +942,22 @@ def _normalize_base_price_per_epoch(
 
 
 def _normalize_price_per_entity(
-    price_per_entity: pd.Series, scale_rows: Optional[pd.Series] = None
+    price_per_entity: pd.Series,
+    entity_price_ceiling: Optional[float] = None,
+    scale_rows: Optional[pd.Series] = None,
 ) -> pd.Series:
     """Normalize price per entity (lower is better).
 
-    price_ceiling applies to base epoch price; entity pricing uses observed max since there is
-    no separate budget field for it. The service turns a missing price into 0 before this, so
-    a value that is not a finite number >= 0 is unreadable and gets 0, the worst score.
+    With the payer's ceiling above 0, a price scores 1 - price / ceiling, so 0 at the ceiling.
+    Without it, the observed max takes its place. The service turns a missing price into 0
+    before this, so a value that is not a finite number >= 0 is unreadable and gets 0, the
+    worst score.
     """
     prices = pd.to_numeric(price_per_entity, errors="coerce").astype(float)
     prices = prices.where(np.isfinite(prices) & (prices >= 0))
+    if entity_price_ceiling is not None and entity_price_ceiling > 0:
+        against_ceiling = (1 - prices / entity_price_ceiling).clip(0, 1)
+        return cast(pd.Series, against_ceiling.where(prices.notna(), 0.0))
     scale = _scale_values(prices, scale_rows)
     ceiling = scale.max()
     if ceiling > 0 and ceiling > scale.min():

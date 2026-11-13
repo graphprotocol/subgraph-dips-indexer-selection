@@ -1522,6 +1522,37 @@ class TestNormalizeMetrics:
         # 200 GRT: 1 - (200/200) = 0.0
         assert scores.iloc[2] == pytest.approx(0.0)
 
+    def test_entity_price_is_scored_against_the_payers_ceiling(self):
+        """The priciest candidate no longer scores 0 when it is under the payer's ceiling."""
+        df = pd.DataFrame({"price_per_entity": [200.0, 500.0, 1_500.0]})
+
+        result = _normalize_metrics(df, entity_price_ceiling=2_000.0)
+
+        assert result["norm_price_per_entity"].tolist() == pytest.approx([0.9, 0.75, 0.25])
+
+    def test_an_entity_price_at_the_ceiling_scores_0(self):
+        df = pd.DataFrame({"price_per_entity": [500.0, 2_000.0]})
+
+        result = _normalize_metrics(df, entity_price_ceiling=2_000.0)
+
+        assert result["norm_price_per_entity"].tolist() == pytest.approx([0.75, 0.0])
+
+    @pytest.mark.parametrize("ceiling", [None, 0.0])
+    def test_without_a_usable_entity_ceiling_the_observed_max_is_kept(self, ceiling):
+        """A ceiling of 0 sets no scale, as for the base price, so the priciest scores 0."""
+        df = pd.DataFrame({"price_per_entity": [0.0, 500.0, 1_000.0]})
+
+        result = _normalize_metrics(df, entity_price_ceiling=ceiling)
+
+        assert result["norm_price_per_entity"].tolist() == pytest.approx([1.0, 0.5, 0.0])
+
+    def test_an_unusable_entity_price_scores_0_against_a_ceiling_too(self):
+        df = pd.DataFrame({"price_per_entity": [500.0, np.nan, -5.0]})
+
+        result = _normalize_metrics(df, entity_price_ceiling=2_000.0)
+
+        assert result["norm_price_per_entity"].tolist() == pytest.approx([0.75, 0.0, 0.0])
+
     @pytest.mark.parametrize(
         "prices, expected",
         [

@@ -401,9 +401,9 @@ def test_base_price_scores_stay_within_unit_range(prices, ceiling):
     _assert_unit_interval(scores, allow_nan=True)
 
 
-@given(prices=price_inputs)
-def test_entity_price_scores_are_finite_and_within_unit_range(prices):
-    scores = _normalize_price_per_entity(pd.Series(prices, dtype=object))
+@given(prices=price_inputs, ceiling=st.one_of(st.none(), any_floats))
+def test_entity_price_scores_are_finite_and_within_unit_range(prices, ceiling):
+    scores = _normalize_price_per_entity(pd.Series(prices, dtype=object), ceiling)
     assert len(scores) == len(prices)
     _assert_unit_interval(scores)
 
