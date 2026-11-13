@@ -614,3 +614,27 @@ class TestLapseWarningLimit:
         assert len(warnings) == 2
         assert f"chain={CHAIN} " in warnings[0]
         assert f"chain={OTHER_CHAIN} " in warnings[1]
+
+    def test_a_chain_that_recovers_starts_its_next_lapse_afresh(self, state, monkeypatch, caplog):
+        """With a 1-minute limit the second lapse begins within 10 minutes of the first one's
+        warning, so only a recovery that forgets the first lapse lets it warn at once, and with
+        none of the first lapse's lines counted as held back.
+        """
+        monkeypatch.setenv("IISA_FRESHNESS_MAX_AGE_MINUTES", "1")
+        iisa_http_endpoints.get_settings.cache_clear()
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            _clock(monkeypatch, LAST + 2)
+            for _ in range(3):
+                assert _select() == [BEST]
+            state.freshness.apply(LAST + 3, [Check(GOOD, CHAIN, "pass")], lambda _: None)
+            _clock(monkeypatch, LAST + 3)
+            assert _select() == [GOOD]
+            _clock(monkeypatch, LAST + 5)
+            assert _select() == [BEST]
+
+        first, second = _not_enforced(caplog)
+        assert "0 held back" in first
+        assert "for 2 minutes" in second
+        assert "0 held back" in second

@@ -665,8 +665,8 @@ LAPSE_WARNING_INTERVAL_MINUTES = 10
 
 class _PerChainLimit:
     """Lets a log line through at most once per chain every LAPSE_WARNING_INTERVAL_MINUTES,
-    counting those held back in between. It has a lock of its own, so selections running on
-    different threads can share it.
+    counting those held back in between, until the chain is reset, which starts it afresh. It
+    has a lock of its own, so selections running on different threads can share it.
     """
 
     def __init__(self) -> None:
@@ -685,6 +685,14 @@ class _PerChainLimit:
                 return None
             self._last[chain] = now
             return self._held.pop(chain, 0)
+
+    def reset(self, chain: str) -> None:
+        """Forget ``chain``'s last line and the count held back since, so its next line goes
+        through and counts only what is held back after it.
+        """
+        with self._lock:
+            self._last.pop(chain, None)
+            self._held.pop(chain, None)
 
 
 class IISAState:
@@ -2323,12 +2331,14 @@ def _checks_too_old(request: SelectionRequest, enforcement: Enforcement) -> bool
     marks to be trusted. A no_evidence check doesn't count here, as the prober works it out
     without asking the gateway. A chain whose checks did pass or fail but not within the limit,
     as when the prober stops or the gateway is down, gets a warning at most once every
-    LAPSE_WARNING_INTERVAL_MINUTES, saying how many were held back since the last. A chain with
-    no such check in the HISTORY_DAYS kept, such as one the prober doesn't check, only gets a
-    debug line.
+    LAPSE_WARNING_INTERVAL_MINUTES, saying how many were held back since the last. Once its
+    checks are current again that count starts afresh, so its next lapse warns at once. A chain
+    with no such check in the HISTORY_DAYS kept, such as one the prober doesn't check, only gets
+    a debug line.
     """
     last_answered = _state.freshness.last_answered_minute(request.chain_id)
     if enforcement.current(last_answered):
+        _state.lapse_warnings.reset(request.chain_id)
         return False
     if last_answered is None or enforcement.now - last_answered > HISTORY_DAYS * MINUTES_PER_DAY:
         logger.debug(
