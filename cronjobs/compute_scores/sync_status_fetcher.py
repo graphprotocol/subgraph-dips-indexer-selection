@@ -35,6 +35,13 @@ if TYPE_CHECKING:
 from escaping import error_for_log, url_for_log
 from freshness_config import FreshnessConfig, load_freshness_config
 from iisa_client import IISAPushError, get_push_token, post_sync_status
+from indexer_addresses import (
+    AIOHTTP_MAX_REDIRECTS,
+    AddressRule,
+    refusal_behind,
+    refused_url,
+    warn_refused,
+)
 from reply_body import read_reply_body
 from subgraph import (
     discover_indexers_from_network_subgraph,
@@ -113,6 +120,10 @@ async def _fetch_single_status(
     import aiohttp
 
     status_url = url.rstrip("/") + "/status"
+    refusal = refused_url(status_url)
+    if refusal is not None:
+        warn_refused(indexer, url, refusal)
+        return None
     payload = json.dumps({"query": STATUS_QUERY}).encode()
 
     async def do_fetch() -> object:
@@ -122,6 +133,7 @@ async def _fetch_single_status(
                 data=payload,
                 headers={"Content-Type": JSON_CONTENT_TYPE},
                 timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT),
+                max_redirects=AIOHTTP_MAX_REDIRECTS,
             ) as resp:
                 if resp.status >= 500:
                     raise aiohttp.ClientResponseError(
@@ -151,6 +163,11 @@ async def _fetch_single_status(
             )
             return None
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            refusal = refusal_behind(e)
+            if refusal is not None:
+                # The address would be refused again, so the call is not tried again.
+                warn_refused(indexer, url, refusal)
+                return None
             last_error = e
             if attempt < MAX_RETRIES - 1:
                 delay = min(
@@ -172,12 +189,11 @@ async def _fetch_all_statuses(
     indexer_urls: Dict[str, str],
 ) -> dict[str, dict]:
     """Fetch /status from all indexers concurrently."""
-    import aiohttp
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
     now = datetime.now(timezone.utc).isoformat()
 
-    async with aiohttp.ClientSession() as session:
+    async with AddressRule.from_env().session() as session:
         tasks = [
             _fetch_single_status(session, indexer, url, semaphore)
             for indexer, url in indexer_urls.items()
