@@ -6,22 +6,22 @@ import pandas as pd
 import pytest
 
 from iisa.indexer_selection import (
-    DEFAULT_WEIGHTS,
+    VALUE_WEIGHTS,
     DeploymentId,
     IndexerId,
     IndexerSelector,
-    _calculate_weighted_scores,
     _normalize_generic,
     _normalize_metrics,
     _normalize_success_rate,
     _normalize_uptime,
+    _weighted_average,
 )
 
 
 def _row_wise_weighted_score(row: pd.Series, weights: dict) -> float:
     """Reference oracle: the obvious row-at-a-time weighted average.
 
-    _calculate_weighted_scores does the same sum as one matrix multiply; the
+    _weighted_average, behind quality and value, does the same sum as one matrix multiply; the
     equivalence tests below check the vectorised version against this simple,
     correct-by-inspection version. Absent/NaN columns drop from the denominator.
     """
@@ -268,65 +268,38 @@ class TestIndexerSelector:
         assert result == []
 
     @patch("iisa.indexer_selection._normalize_metrics")
-    @patch("iisa.indexer_selection._calculate_weighted_scores")
+    @patch("iisa.indexer_selection._score_factors")
     def test_normalize_and_score(
-        self, mock_calculate_scores, mock_normalize, sample_data, mock__provider
+        self, mock_score_factors, mock_normalize, sample_data, mock__provider
     ):
-        """_normalize_and_score normalises, then scores every indexer in one call.
+        """_normalize_and_score normalises, then works out every indexer's factors in one call.
 
-        Checks normalize_metrics gets the raw data, the vectorised scorer is
-        called once with the full weights dict, and the result carries a
-        weighted_score column.
+        Checks normalize_metrics gets the raw data, the factors are worked out once from the
+        normalised frame, and the result carries each factor and their product, the total.
         """
-        # Create a IndexerSelector instance
         with patch("iisa.indexer_selection.IndexerSelector._process_data"):
             processor = IndexerSelector(
                 history=sample_data,
                 deployment_id=DeploymentId("test_subgraph"),
             )
 
-        # Set up mock return values
         normalized_data = sample_data.copy()
-        for metric in [
-            "stake_to_fees",
-            "base_price_per_epoch",
-            "lat_lin_reg_coefficient",
-            "uptime_score",
-            "success_rate",
-            "price_per_entity",
-        ]:
-            normalized_data[f"norm_{metric}"] = normalized_data.get(metric, 0.5)
         mock_normalize.return_value = normalized_data
-        mock_calculate_scores.return_value = pd.Series(0.8, index=normalized_data.index)
+        mock_score_factors.return_value = pd.DataFrame(
+            {"uptime": 0.5, "freshness": 1.0, "quality": 0.8, "value": 0.5},
+            index=normalized_data.index,
+        )
 
-        # Act
         result = processor._normalize_and_score()
 
-        # normalize_metrics was called with the raw data
         mock_normalize.assert_called_once()
         pd.testing.assert_frame_equal(mock_normalize.call_args[0][0], sample_data)
+        mock_score_factors.assert_called_once()
+        assert mock_score_factors.call_args[0][0] is normalized_data
 
-        # The vectorised scorer is called once, with (normalized_frame, weights)
-        mock_calculate_scores.assert_called_once()
-        args, _ = mock_calculate_scores.call_args
-        assert len(args) == 2
-        weights = args[1]
-        assert isinstance(weights, dict)
-        expected_metrics = [
-            "stake_to_fees",
-            "base_price_per_epoch",
-            "lat_lin_reg_coefficient",
-            "uptime_score",
-            "success_rate",
-            "price_per_entity",
-        ]
-        assert all(metric in weights for metric in expected_metrics)
-        assert pytest.approx(sum(weights.values())) == 1.0
-
-        # weighted_score column exists with the scorer's values
-        assert "weighted_score" in result.columns
+        assert (result["factor_quality"] == 0.8).all()
         expected_scores = pd.Series(
-            [0.8] * len(sample_data), name="weighted_score", index=result.index
+            [0.2] * len(sample_data), name="weighted_score", index=result.index
         )
         pd.testing.assert_series_equal(result["weighted_score"], expected_scores)
 
@@ -794,16 +767,20 @@ class TestReplaceUnderperformingIndexersOrder:
             processor._replace_underperforming_indexers()
 
         assert processor.current_group == ["C", "D", "E"]
-        threshold_line = (
-            "deployment=test_subgraph indexer C score=0.5000 >= threshold=0.15, "
-            "no replacement needed"
-        )
+
+        def threshold_line(threshold: str) -> str:
+            return (
+                f"deployment=test_subgraph indexer C score=0.5000 >= threshold={threshold}, "
+                "no replacement needed"
+            )
+
+        # The threshold is 15% of the best candidate left: D's 0.80, then E's 0.75, then B's 0.08.
         assert _selection_log(caplog, *self.LOOP_LOG) == [
-            threshold_line,
+            threshold_line("0.1200"),
             "deployment=test_subgraph replaced indexer A with D (improvement=0.7500)",
-            threshold_line,
+            threshold_line("0.1125"),
             "deployment=test_subgraph replaced indexer B with E (improvement=0.6700)",
-            threshold_line,
+            threshold_line("0.0120"),
             "deployment=test_subgraph no more beneficial replacements found",
         ]
 
@@ -839,9 +816,11 @@ class TestSwapHelpers:
         "existing, scores, expected",
         [
             ("A", SCORES, ("A", "D", 0.75)),
-            ("C", SCORES, None),  # at or above MIN_INDEXER_SCORE
+            ("C", SCORES, None),  # at or above MIN_INDEXER_SCORE of the best candidate, D
             ("X", SCORES, None),  # no row
-            ("A", {**SCORES, "D": 0.55}, None),  # gain within REPLACEMENT_MARGIN
+            # The margin is half the best candidate's total, so with D at 0.55 a gain of 0.50
+            # is enough, where a fixed margin of 0.50 kept A.
+            ("A", {**SCORES, "D": 0.55}, ("A", "D", 0.50)),
         ],
     )
     def test_swap_for(self, existing, scores, expected):
@@ -856,11 +835,12 @@ class TestSwapHelpers:
             assert swap[2] == pytest.approx(expected[2])
 
     def test_swap_for_passes_over_a_synced_candidate_that_gains_too_little(self):
-        """C is synced, so it is tried first, but it gains only 0.45 on A. D is not synced and
-        gains 0.75, so D replaces A: the preferred candidate falling short must not keep a
-        failing indexer in place.
+        """C is synced, so it is tried first, but it gains only 0.35 on A, not more than half
+        of D's 0.80. D is not synced and gains 0.75, so D replaces A: the preferred candidate
+        falling short must not keep a failing indexer in place.
         """
-        processor = _selector_with_scores(self.SCORES, ["A", "B", "X"], synced_indexers={"c"})
+        scores = {**self.SCORES, "C": 0.40}
+        processor = _selector_with_scores(scores, ["A", "B", "X"], synced_indexers={"c"})
 
         swap = processor._swap_for("A")
 
@@ -876,16 +856,17 @@ class TestSwapHelpers:
 
         assert swap is not None and swap[:2] == ("A", "C")
 
-    def test_swap_for_makes_no_swap_when_nobody_gains_enough(self):
-        """C is synced and D is not, and neither gains more than 0.50 on A, so A stays."""
-        scores = {**self.SCORES, "D": 0.55}
+    def test_swap_for_makes_no_swap_for_a_member_at_15_percent_of_the_best(self):
+        """D, the best candidate, totals 0.60, so A at 0.10 is not failing, however much C,
+        which is synced, or D would gain on it."""
+        scores = {**self.SCORES, "A": 0.10, "D": 0.60}
         processor = _selector_with_scores(scores, ["A", "B", "X"], synced_indexers={"c"})
 
         assert processor._swap_for("A") is None
 
     def test_a_synced_candidate_that_gains_too_little_does_not_block_the_replacement(self):
         """The whole replacement step: A is failing, synced C gains too little, D replaces A."""
-        scores = {"A": 0.05, "C": 0.50, "D": 0.80, "E": 0.90}
+        scores = {"A": 0.05, "C": 0.40, "D": 0.80, "E": 0.90}
         processor = _selector_with_scores(scores, ["A", "E"], synced_indexers={"c"})
 
         processor._replace_underperforming_indexers()
@@ -1693,8 +1674,8 @@ class TestSyncedIndexerPreference:
     def five_indexers(self):
         """Five indexers with distinct orgs/locations and descending scores.
 
-        Raw metrics are varied so normalisation produces different
-        weighted_scores. A is best, E is worst, all above 0.6.
+        Raw metrics are varied so normalisation produces different totals: A 0.73, B 0.60,
+        C 0.49, D 0.39, and E 0, the worst on every part of value.
         """
         return pd.DataFrame(
             {
@@ -1718,7 +1699,7 @@ class TestSyncedIndexerPreference:
         )
 
     def test_prefers_synced_over_higher_scored_unsynced(self, five_indexers):
-        """Synced indexer C (score 0.7) chosen over unsynced A (0.9)."""
+        """Synced indexer C (total 0.49) chosen over unsynced A (0.73)."""
         processor = IndexerSelector(
             history=five_indexers,
             deployment_id="hash1",
@@ -1839,20 +1820,35 @@ class TestSyncedIndexerPreference:
 
     def test_first_synced_preferred_regardless_of_score(self, five_indexers):
         """First synced pick ignores threshold to guarantee availability."""
-        # E scores 0.20 (below 0.6) but is the only synced option
-        # and no synced indexer is in the group yet — gets preferred
+        # E is the worst on every part of value, so it totals 0, but it is the only synced
+        # option and no synced indexer is in the group yet, so the add step picks it. The
+        # replace step that follows is held back here, as the next test shows why.
+        with patch.object(IndexerSelector, "_replace_underperforming_indexers"):
+            processor = IndexerSelector(
+                history=five_indexers,
+                deployment_id="hash1",
+                target_size=1,
+                synced_indexers={"E"},
+            )
+        assert "E" in processor.current_group
+
+    def test_a_first_synced_pick_under_15_percent_of_the_best_is_replaced_at_once(
+        self, five_indexers
+    ):
+        """E gets in on its claim, but its total of 0 is under 15% of A's, the best candidate,
+        and A beats it by more than half of that, so the replace step swaps A in."""
         processor = IndexerSelector(
             history=five_indexers,
             deployment_id="hash1",
             target_size=1,
             synced_indexers={"E"},
         )
-        assert "E" in processor.current_group
+        assert processor.current_group == ["A"]
 
     def test_second_synced_below_threshold_not_preferred(self, five_indexers):
         """After first synced pick, threshold applies to subsequent ones."""
-        # Need 3 slots. C (0.72) and E (0.20) are synced. C takes the first
-        # synced slot; E is below 0.6 so the threshold applies and E competes
+        # Need 3 slots. C (0.49) and E (0) are synced. C takes the first
+        # synced slot; E is below 60% of the best candidate's total, so it competes
         # on merit in the unsynced pool, losing to A and B.
         processor = IndexerSelector(
             history=five_indexers,
@@ -1997,8 +1993,8 @@ class TestRowWiseWeightedScoreReference:
         assert np.isclose(result, expected)
 
 
-class TestCalculateWeightedScoresVectorized:
-    """Vectorised _calculate_weighted_scores matches the row-wise scalar version."""
+class TestWeightedAverageVectorized:
+    """Vectorised _weighted_average matches the row-wise scalar version."""
 
     @staticmethod
     def _row_wise(df, weights):
@@ -2014,18 +2010,15 @@ class TestCalculateWeightedScoresVectorized:
             {
                 "norm_stake_to_fees": [0.1, 0.9, 0.5],
                 "norm_base_price_per_epoch": [0.8, 0.2, 0.4],
-                "norm_lat_lin_reg_coefficient": [0.3, 0.7, 0.6],
-                "norm_uptime_score": [0.95, 0.6, 0.99],
-                "norm_success_rate": [0.9, 0.5, 0.85],
                 "norm_price_per_entity": [0.2, 0.4, 0.7],
             }
         )
 
         # Act
-        vectorised = _calculate_weighted_scores(df, DEFAULT_WEIGHTS)
+        vectorised = _weighted_average(df, VALUE_WEIGHTS, frozenset())
 
         # Assert
-        pd.testing.assert_series_equal(vectorised, self._row_wise(df, DEFAULT_WEIGHTS))
+        pd.testing.assert_series_equal(vectorised, self._row_wise(df, VALUE_WEIGHTS))
 
     def test_nan_cells_drop_from_denominator_like_scalar(self):
         """A NaN metric per row renormalises over the rest, matching the scalar."""
@@ -2038,7 +2031,7 @@ class TestCalculateWeightedScoresVectorized:
         )
         weights = {"a": 0.5, "b": 0.3, "c": 0.2}
 
-        vectorised = _calculate_weighted_scores(df, weights)
+        vectorised = _weighted_average(df, weights, frozenset())
 
         pd.testing.assert_series_equal(vectorised, self._row_wise(df, weights))
 
@@ -2047,7 +2040,7 @@ class TestCalculateWeightedScoresVectorized:
         df = pd.DataFrame({"norm_a": [0.6, 0.2], "norm_b": [0.4, 0.8]})
         weights = {"a": 0.5, "b": 0.3, "c": 0.2}  # norm_c is absent
 
-        vectorised = _calculate_weighted_scores(df, weights)
+        vectorised = _weighted_average(df, weights, frozenset())
 
         pd.testing.assert_series_equal(vectorised, self._row_wise(df, weights))
 
@@ -2057,4 +2050,4 @@ class TestCalculateWeightedScoresVectorized:
         weights = {"a": 0.5, "b": 0.5}
 
         with pytest.raises(ValueError, match="Total weight cannot be 0"):
-            _calculate_weighted_scores(df, weights)
+            _weighted_average(df, weights, frozenset())

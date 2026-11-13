@@ -1,14 +1,15 @@
 """
 Indexer selection algorithm for IISA.
 
-Selects the best indexers for subgraphs based on weighted scoring of multiple
-metrics including latency, uptime, freshness, success rate, and economic security.
+Selects the best indexers for subgraphs by a total score, uptime x freshness x quality x
+value, built from latency, uptime, freshness, success rate, economic security and prices.
 """
 
 import logging
 import time
+from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any, Callable, NewType, Optional, TypedDict, Union, cast
+from typing import Any, Callable, NewType, Optional, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -37,60 +38,54 @@ IndexerId = EthAddressStr
 # Module-level logger
 logger = logging.getLogger(__name__)
 
-# Indexers scoring below this threshold are candidates for replacement.
-# They will only be replaced if a significantly better candidate is available.
+# Selection's 3 cut-offs are fractions of B, the best total a request can pick from, since a
+# product runs low (a good indexer totals about 0.5) and fixed numbers would bite too hard.
+# A group member totalling under this fraction of B can be replaced...
 MIN_INDEXER_SCORE = 0.15
 
-# Minimum score improvement required to justify replacing an underperforming indexer.
-# Candidate must score at least (current_score + REPLACEMENT_MARGIN) to replace.
+# ...but only by a candidate whose total beats the member's by more than this fraction of B.
 REPLACEMENT_MARGIN = 0.50
 
-# Minimum weighted score for a synced indexer to be preferred over unsynced
-# candidates. Below this threshold, sync status is ignored and the indexer
-# competes on merit in the unsynced pool.
+# Once the group has a synced indexer, a candidate that says it has synced keeps its head start
+# over the others only while its total is at least this fraction of B; below it, it competes on
+# its total alone.
 MIN_SYNCED_THRESHOLD = 0.60
 
+# An indexer's total is uptime x freshness x quality x value, each in [0, 1]; docs/scoring.md
+# sets the formula out in full. Quality and value are weighted averages of their parts.
+QUALITY_SUCCESS_RATE_WEIGHT = 0.2
+QUALITY_LATENCY_WEIGHT = 0.8
+VALUE_STAKE_TO_FEES_WEIGHT = 0.45
+VALUE_BASE_PRICE_WEIGHT = 0.45
+VALUE_ENTITY_PRICE_WEIGHT = 0.10
 
-class WeightsDict(TypedDict, total=False):
-    """
-    A dictionary containing weights for each metric used in the weighted score calculation.
-    """
-
-    stake_to_fees: float
-    base_price_per_epoch: float
-    lat_lin_reg_coefficient: float
-    uptime_score: float
-    freshness: float
-    success_rate: float
-    price_per_entity: float
-
-
-DEFAULT_WEIGHTS = cast(
-    WeightsDict,
-    MappingProxyType(
-        {
-            "stake_to_fees": 0.25,
-            "base_price_per_epoch": 0.25,
-            "lat_lin_reg_coefficient": 0.10,
-            "uptime_score": 0.15,
-            "freshness": 0.15,
-            "success_rate": 0.05,
-            "price_per_entity": 0.05,
-        }
-    ),
+# Each part's weight within its factor, by the metric its norm_ column is named after.
+QUALITY_WEIGHTS: Mapping[str, float] = MappingProxyType(
+    {
+        "success_rate": QUALITY_SUCCESS_RATE_WEIGHT,
+        "lat_lin_reg_coefficient": QUALITY_LATENCY_WEIGHT,
+    }
 )
+VALUE_WEIGHTS: Mapping[str, float] = MappingProxyType(
+    {
+        "stake_to_fees": VALUE_STAKE_TO_FEES_WEIGHT,
+        "base_price_per_epoch": VALUE_BASE_PRICE_WEIGHT,
+        "price_per_entity": VALUE_ENTITY_PRICE_WEIGHT,
+    }
+)
+
+# The parts that depend on the request's chain, which the network-wide scores leave out.
+CHAIN_PARTS = frozenset({"base_price_per_epoch", "price_per_entity", "freshness"})
+
+# The 4 factors whose product is the total, in the order they are reported.
+SCORE_FACTORS = ("uptime", "freshness", "quality", "value")
 
 
 class IndexerSelector:
-    """Score and pick the best indexers for one subgraph deployment.
-
-    Takes the DataManager's metrics, normalises them, combines them into a
-    weighted score, and assigns or replaces indexers, honouring the denylist
-    and decentralisation floor.
-
-    One job lifetime: built for a single add-or-replace then discarded; whether
-    it adds or replaces depends on how many indexers already serve the subgraph
-    and how their quality compares to the best alternative.
+    """Score and pick the best indexers for one subgraph deployment, honouring the denylist and
+    decentralisation floor. Built for a single add-or-replace, then discarded: whether it adds
+    or replaces depends on how many indexers already serve the subgraph and how their quality
+    compares to the best alternative.
     """
 
     def __init__(
@@ -101,7 +96,6 @@ class IndexerSelector:
         pending_agreements: Optional[dict[DeploymentId, list[IndexerId]]] = None,
         declined_indexers: Optional[dict[DeploymentId, list[IndexerId]]] = None,
         indexer_denylist: Optional[list[IndexerId]] = None,
-        weights: Optional[WeightsDict] = None,
         target_size: int = 3,
         optimistic_dips_fees: Optional[dict[str, float]] = None,
         price_ceiling: Optional[float] = None,
@@ -109,13 +103,10 @@ class IndexerSelector:
         stale_indexers: Optional[list[IndexerId]] = None,
         entity_price_ceiling: Optional[float] = None,
     ):
-        """Initialize the selector and run scoring for one deployment.
-        Non-obvious args: optimistic_dips_fees lowers stake_to_fees for indexers
-        that already hold agreements (load-balancing), price_ceiling and
-        entity_price_ceiling, the payer's ceilings on the base and per-entity
-        prices, are what those prices are scored against, synced_indexers
-        are preferred so queries serve right after acceptance, and stale_indexers
-        are candidates marked stale, picked only for places no other candidate can fill.
+        """Run scoring for one deployment. optimistic_dips_fees lowers stake_to_fees for indexers
+        that already hold agreements (load-balancing); price_ceiling and entity_price_ceiling are
+        the payer's ceilings the 2 prices are scored against; synced_indexers are preferred so
+        queries serve right after acceptance; stale_indexers fill only places nobody else can.
         """
         self.data = pd.DataFrame(history)
         self.deployment_id = deployment_id
@@ -123,7 +114,6 @@ class IndexerSelector:
         self.pending_agreements = pending_agreements or {}
         self.declined_indexers = declined_indexers or {}
         self.indexer_denylist = indexer_denylist or []
-        self.weights = {**DEFAULT_WEIGHTS, **(weights or {})}
         self.target_size = target_size
         self.optimistic_dips_fees = optimistic_dips_fees or {}
         self.price_ceiling = price_ceiling
@@ -189,7 +179,7 @@ class IndexerSelector:
 
     def _process_data(self):
         """
-        Process data by normalizing metrics and calculating weighted scores.
+        Process data by normalizing metrics and calculating total scores.
         """
         # Add dipper's expected fees from accepted agreements to the query fees
         # before normalisation, so stake_to_fees can tell indexers apart even
@@ -253,7 +243,8 @@ class IndexerSelector:
         return list(self.existing_agreements.get(self.deployment_id, []))
 
     def _normalize_and_score(self):
-        """Normalise quality metrics and compute the weighted score per indexer.
+        """Normalise the metrics and work out each indexer's total, kept in weighted_score, the
+        name the total has always had, beside its 4 factors in factor_ columns.
 
         Returns the processed DataFrame; on a normalisation or scoring error it
         falls back to raw data / NaN scores rather than raising.
@@ -278,11 +269,12 @@ class IndexerSelector:
             normalized_data = self.data
 
         try:
-            normalized_data["weighted_score"] = _calculate_weighted_scores(
-                normalized_data, self.weights
-            )
+            factors = _score_factors(normalized_data)
+            for factor in SCORE_FACTORS:
+                normalized_data[f"factor_{factor}"] = factors[factor]
+            normalized_data["weighted_score"] = factors.prod(axis=1)
         except Exception as e:
-            logger.error(f"Unexpected error when trying calculate_weighted_score: {e}")
+            logger.error(f"Unexpected error when trying to score the indexers: {e}")
             normalized_data["weighted_score"] = np.nan
 
         return normalized_data
@@ -304,7 +296,7 @@ class IndexerSelector:
 
     def _assign_indexers_to_subgraph(self):
         """
-        Assign indexers to subgraph based on weighted scores and decentralization requirements.
+        Assign indexers to subgraph based on total scores and decentralization requirements.
 
         Use the methods _add_indexers_to_group and _replace_underperforming_indexers to
         assign indexers to the subgraph in question.
@@ -369,12 +361,9 @@ class IndexerSelector:
 
     def _start_filling_with_stale(self) -> bool:
         """Let the stale candidates fill the group's remaining places, and score everyone again
-        with them setting each metric's scale, since they are now the ones being compared.
-        False when they already may, or there are none.
-
-        A group short of its target is worth more to the request than a group of fresh
-        indexers only, so a stale candidate gets a place no fresh one can take. It never
-        replaces a member: see _find_best_replacement_or_select_best_indexer.
+        with them setting each metric's scale. False when they already may, or there are none.
+        A full group is worth more than a group of fresh indexers only, so a stale candidate
+        gets a place no fresh one can take, but never replaces a member.
         """
         if self._filling_with_stale or not self.stale_indexers:
             return False
@@ -522,8 +511,19 @@ class IndexerSelector:
                 )
                 break  # No more beneficial replacements available
 
+    def _best_candidate_total(self, candidates: Optional[pd.DataFrame] = None) -> float:
+        """B: the best total among the candidates the pick at hand can choose from, which
+        scales the cut-offs, or 0 when there is none. ``candidates`` are those for an add, which
+        are the stale ones once they fill the places no fresh candidate can. By default they are
+        those a replacement can draw on, which are never stale.
+        """
+        if candidates is None:
+            candidates = self.data[~self.data["indexer"].isin(self._unpickable_indexers())]
+        best = candidates["weighted_score"].max()
+        return float(best) if pd.notna(best) else 0.0
+
     def _score_of(self, indexer: IndexerId) -> Optional[float]:
-        """Weighted score from the indexer's first row, or None when it has no row."""
+        """Total from the indexer's first row, or None when it has no row."""
         rows = self.data[self.data["indexer"] == indexer]
         if rows.empty:
             return None
@@ -550,26 +550,24 @@ class IndexerSelector:
     def _swap_for(
         self, existing_indexer: IndexerId
     ) -> Optional[tuple[IndexerId, IndexerId, float]]:
-        """Return (existing_indexer, candidate, improvement) when existing_indexer
-        scores below MIN_INDEXER_SCORE and a candidate beats it by more than
-        REPLACEMENT_MARGIN; None otherwise.
-
-        A synced candidate is preferred. When that one gains too little, the best candidate
-        whatever its sync status is tried, so a synced candidate that falls short does not
-        end the search for this indexer's replacement.
+        """Return (existing_indexer, candidate, improvement) when existing_indexer scores below
+        MIN_INDEXER_SCORE of B and a candidate beats it by more than REPLACEMENT_MARGIN of B;
+        None otherwise. A synced candidate is tried first, and when it gains too little the best
+        candidate whatever its sync status is tried, so the search doesn't end there.
         """
         current_score = self._score_of(existing_indexer)
         if current_score is None:
             return None
 
+        best = self._best_candidate_total()
         # Only consider replacing indexers below the minimum threshold
-        if current_score >= MIN_INDEXER_SCORE:
+        if current_score >= MIN_INDEXER_SCORE * best:
             logger.debug(
-                "deployment=%s indexer %s score=%.4f >= threshold=%.2f, no replacement needed",
+                "deployment=%s indexer %s score=%.4f >= threshold=%.4f, no replacement needed",
                 self.deployment_id,
                 existing_indexer[:10],
                 current_score,
-                MIN_INDEXER_SCORE,
+                MIN_INDEXER_SCORE * best,
             )
             return None
 
@@ -583,7 +581,8 @@ class IndexerSelector:
                 continue
             candidate_score = self._score_of(candidate)
             # Only replace if candidate is significantly better
-            if candidate_score is not None and candidate_score > current_score + REPLACEMENT_MARGIN:
+            margin = REPLACEMENT_MARGIN * best
+            if candidate_score is not None and candidate_score > current_score + margin:
                 return existing_indexer, candidate, candidate_score - current_score
         return None
 
@@ -616,12 +615,10 @@ class IndexerSelector:
     def _note_claims_that_could_win(
         self, candidates: pd.DataFrame, replacing_indexer: Optional[IndexerId]
     ) -> None:
-        """Record the candidates that this pick could choose because they say they have synced.
-
-        They are the candidates drawn from first (see _synced_first) that would also leave the
-        group meeting the decentralisation requirements and, when a member is being replaced,
-        beat it by more than REPLACEMENT_MARGIN. Any other candidate can only be picked on its
-        score, so whether its claim is true changes nothing here.
+        """Record the candidates this pick could choose because they say they have synced: those
+        drawn from first (see _synced_first) that also keep the group decentralised and, when a
+        member is being replaced, beat it by more than REPLACEMENT_MARGIN of B. Any other
+        candidate is picked on its score alone, so its claim changes nothing here.
         """
         if not self.synced_indexers:
             return
@@ -630,7 +627,8 @@ class IndexerSelector:
             replaced_score = self._score_of(replacing_indexer)
             if replaced_score is None:
                 return
-            ahead = ahead[ahead["weighted_score"] > replaced_score + REPLACEMENT_MARGIN]
+            margin = REPLACEMENT_MARGIN * self._best_candidate_total(candidates)
+            ahead = ahead[ahead["weighted_score"] > replaced_score + margin]
         self._preferred_on_a_claim.update(
             indexer
             for indexer in ahead["indexer"]
@@ -640,13 +638,10 @@ class IndexerSelector:
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None, prefer_synced: bool = True
     ) -> Optional[IndexerId]:
-        """Pick the highest-scoring eligible indexer to add or to replace one.
-        Skips indexers already in the group, on the denylist, with pending
-        (unaccepted) agreements, that previously declined this subgraph, or marked
-        stale, unless the pick fills a place no other candidate can.
-        replacing_indexer, when set, simulates the swap for the decentralisation
-        check. prefer_synced, when False, ranks candidates on score alone, as if
-        none were synced. Returns the best indexer ID, or None if none qualify.
+        """Pick the highest-scoring eligible indexer to add, or to replace replacing_indexer
+        (whose swap the decentralisation check then simulates), or None if none qualify.
+        Unpickable indexers are skipped (see _unpickable_indexers). prefer_synced, when False,
+        ranks candidates on score alone, as if none were synced.
         """
         # A stale candidate can fill an empty place once no other is left, but never replace.
         fill_in = self._filling_with_stale and replacing_indexer is None
@@ -663,7 +658,7 @@ class IndexerSelector:
         # The candidates we could select are those that are not unpickable
         candidates = self.data[~self.data["indexer"].isin(unpickable_indexers)]
 
-        # Sort the candidates by weighted score, highest score first
+        # Sort the candidates by total, highest first
         candidates = candidates.sort_values(by="weighted_score", ascending=False)
         self._note_claims_that_could_win(candidates, replacing_indexer)
         logger.debug(
@@ -717,7 +712,7 @@ class IndexerSelector:
 
         Prefer already-synced candidates so queries serve right after
         acceptance: the first synced indexer gets in at any score, later ones
-        must beat MIN_SYNCED_THRESHOLD or fall back to competing on merit.
+        must reach MIN_SYNCED_THRESHOLD of B or fall back to competing on merit.
         """
         if not self.synced_indexers:
             return [("all", candidates)]
@@ -744,17 +739,15 @@ class IndexerSelector:
         ]
         if self._group_has_synced():
             # Already have a synced indexer: threshold applies
-            return all_synced_candidates[
-                all_synced_candidates["weighted_score"] >= MIN_SYNCED_THRESHOLD
-            ]
+            threshold = MIN_SYNCED_THRESHOLD * self._best_candidate_total(candidates)
+            return all_synced_candidates[all_synced_candidates["weighted_score"] >= threshold]
         # No synced indexer yet: first one gets in at any score
         return all_synced_candidates
 
 
 # Norm columns the CronJob ships already normalised and the selector keeps: latency, for scores
-# without latency_ms, and stake_to_fees in degraded mode (a neutral 0.5). Every other metric in
-# _normalize_metrics is recomputed from its raw value, so a pre-scaled copy can't replace the
-# selector's own scaling.
+# without latency_ms, and stake_to_fees in degraded mode (a neutral 0.5). Every other metric is
+# recomputed from its raw value, so a pre-scaled copy can't replace the selector's own scaling.
 _PRECOMPUTED_NORM_COLUMNS = frozenset({NORM_LAT_LIN_REG_COEFFICIENT, "norm_stake_to_fees"})
 
 # Latency in ms is scored on a fixed curve, the shape of the gateway's own latency score made
@@ -769,8 +762,8 @@ LATENCY_FLOOR_SCORE = 0.001
 LATENCY_FALLBACK_WARNING_MINUTES = 10
 _LATENCY_FALLBACK_WARNINGS = LogLimit(LATENCY_FALLBACK_WARNING_MINUTES)
 
-# Norm columns left missing rather than scored 0 when there is nothing to score, so the weighted
-# score leaves them out: freshness, on a chain whose checks don't yet cover 7 days.
+# Norm columns left missing rather than scored 0 when there is nothing to score, so the total
+# leaves them out: freshness, on a chain whose checks don't yet cover 7 days, counts as 1.
 _LEFT_OUT_WHEN_MISSING = frozenset({"norm_freshness"})
 
 # A normaliser takes a metric's values and, optionally, a mask of the rows whose values set its
@@ -784,13 +777,10 @@ def _normalize_metrics(
     scale_rows: Optional[pd.Series] = None,
     entity_price_ceiling: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Normalise each metric to [0, 1] where 1 is best (lower-is-better inverted).
-
-    price_ceiling and entity_price_ceiling, when given, are what the base and per-entity prices
-    are scored against instead of the observed max. scale_rows, when given, marks the rows that
-    set each metric's best and worst; other rows are scored against them.
-    Missing metrics score 0, except those in _LEFT_OUT_WHEN_MISSING, which stay missing, and a
-    value that does not read as a number, such as text, scores 0. Input norm_ columns outside
+    """Normalise each metric to [0, 1], where 1 is best. The 2 ceilings, when given, replace the
+    observed max for the 2 prices; scale_rows, when given, are the rows that set each metric's
+    best and worst. A missing metric scores 0, except those in _LEFT_OUT_WHEN_MISSING, which stay
+    missing; an unreadable one, such as text, always scores 0. Norm columns outside
     _PRECOMPUTED_NORM_COLUMNS are recomputed; those inside score 0 when outside [0, 1].
     """
     latency, precomputed = _latency_metric(merged)
@@ -847,11 +837,9 @@ def _latency_metric(
     merged: pd.DataFrame,
 ) -> tuple[tuple[str, str, _Normaliser], frozenset[str]]:
     """The latency metric, as (norm column, source column, normaliser), and the norm columns to
-    keep as pushed. latency_ms is scored on the fixed curve. Scores without it keep the latency
-    score from before it, with a warning: the job's pushed lat_normalized_score, scaled across
-    every indexer the job measured, or else the regression's upper bound scaled against the
-    candidates. A run without GeoIP and a degraded run measure no latency in ms, and nor did a
-    job older than latency_ms.
+    keep as pushed. latency_ms is scored on the fixed curve. Scores without it (a run without
+    GeoIP, a degraded run or an older job) keep, with a warning, the job's pushed
+    lat_normalized_score, or else the regression's upper bound scaled against the candidates.
     """
     if LATENCY_MS in merged.columns:
         # No row sets a scale here, as no indexer's score depends on another's.
@@ -1011,12 +999,9 @@ def _normalize_price_per_entity(
     entity_price_ceiling: Optional[float] = None,
     scale_rows: Optional[pd.Series] = None,
 ) -> pd.Series:
-    """Normalize price per entity (lower is better).
-
-    With the payer's ceiling above 0, a price scores 1 - price / ceiling, so 0 at the ceiling.
-    Without it, the observed max takes its place. The service turns a missing price into 0
-    before this, so a value that is not a finite number >= 0 is unreadable and gets 0, the
-    worst score.
+    """Normalize price per entity (lower is better): 1 - price / ceiling with the payer's ceiling
+    above 0, else against the observed max. The service turns a missing price into 0 before
+    this, so a value that is not a finite number >= 0 is unreadable and gets 0, the worst score.
     """
     prices = pd.to_numeric(price_per_entity, errors="coerce").astype(float)
     prices = prices.where(np.isfinite(prices) & (prices >= 0))
@@ -1083,35 +1068,61 @@ def _normalize_freshness(
     return freshness.clip(0, 1)
 
 
-def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Series:
-    """Weighted average of each row's present norm_* metrics by `weights`.
-    NaN cells drop out of both the numerator and the per-row weight total, so each
-    row renormalises over the metrics it has. Both sums add their terms in the same
-    order, so scores within [0, 1] cannot round to an average above 1.
-    Raises ValueError if any row has no usable column.
+def _score_factors(df: pd.DataFrame, left_out: frozenset[str] = frozenset()) -> pd.DataFrame:
+    """Each row's 4 factors, whose product is its total, from its norm_ columns: uptime, 0 when
+    missing; freshness, 1 when missing or in ``left_out``, as on a chain where it isn't weighed;
+    and quality and value, each the weighted average of its parts present, so a part missing or
+    in ``left_out`` drops out and the others are rescaled. Raises ValueError if a row has no
+    part of quality or of value.
     """
-    columns = []
-    column_weights = []
-    missing_columns = []
-    for metric, weight in cast(dict[str, float], weights).items():
-        column_name = f"norm_{metric}"
-        if column_name in df.columns:
-            columns.append(column_name)
-            column_weights.append(weight)
-        else:
-            missing_columns.append(column_name)
+    if "freshness" in left_out:
+        freshness = pd.Series(1.0, index=df.index)
+    else:
+        freshness = _norm_column(df, "freshness").fillna(1.0)
+    return pd.DataFrame(
+        {
+            "uptime": _norm_column(df, "uptime_score").fillna(0.0),
+            "freshness": freshness,
+            "quality": _weighted_average(df, QUALITY_WEIGHTS, left_out),
+            "value": _weighted_average(df, VALUE_WEIGHTS, left_out),
+        },
+        index=df.index,
+    )
 
-    if missing_columns:
-        logger.warning(f"Missing columns in input data: {', '.join(missing_columns)}")
 
-    weight_vector = np.array(column_weights, dtype=float)
-    matrix = df[columns].to_numpy(dtype=float)
+def _calculate_scores(df: pd.DataFrame, left_out: frozenset[str] = frozenset()) -> pd.Series:
+    """Each row's total, uptime x freshness x quality x value (see _score_factors)."""
+    return _score_factors(df, left_out).prod(axis=1)
+
+
+def _norm_column(df: pd.DataFrame, metric: str) -> pd.Series:
+    """The norm_ column for ``metric`` as floats, or NaN with a warning when it is missing."""
+    column = f"norm_{metric}"
+    if column not in df.columns:
+        logger.warning("Missing column in input data: %s", column)
+        return pd.Series(np.nan, index=df.index)
+    return df[column].astype(float)
+
+
+def _weighted_average(
+    df: pd.DataFrame, weights: Mapping[str, float], left_out: frozenset[str]
+) -> pd.Series:
+    """Weighted average of each row's present parts by ``weights``, leaving out ``left_out``.
+    NaN cells drop out of both the numerator and the per-row weight total, so each row
+    renormalises over the parts it has. Both sums add their terms in the same order, so parts
+    within [0, 1] cannot round to an average above 1. Raises ValueError if a row has no part.
+    """
+    parts = [(metric, weight) for metric, weight in weights.items() if metric not in left_out]
+    matrix = np.column_stack(
+        [_norm_column(df, metric).to_numpy(dtype=float) for metric, _ in parts]
+    )
+    weight_vector = np.array([weight for _, weight in parts], dtype=float)
     present = ~np.isnan(matrix)
     weighted_sum = (np.where(present, matrix, 0.0) * weight_vector).sum(axis=1)
-    weight_total = (present * weight_vector).sum(axis=1)  # weights of the columns each row has
+    weight_total = (present * weight_vector).sum(axis=1)  # weights of the parts each row has
 
     if (weight_total == 0).any():
-        logger.error("Total sum of weights is 0. Sum of weights should be non-zero, ideally 1.")
+        logger.error("A row has none of the parts %s", [metric for metric, _ in parts])
         raise ValueError("Total weight cannot be 0.")
 
     return pd.Series(weighted_sum / weight_total, index=df.index)

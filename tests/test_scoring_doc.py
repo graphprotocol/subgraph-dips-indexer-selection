@@ -1,0 +1,163 @@
+"""Keep docs/scoring.md from drifting away from the code.
+
+The page explains the score for readers who would rather check the maths than the code. Its
+constants table names the code constant behind every number, and this test checks each one the
+service owns; the score job's are checked by test_scoring_doc_job_constants.py among the
+cronjob tests. It also checks the weights written in the equations for quality and value, and
+recomputes the page's worked example and latency table with the code. The prose is not checked.
+"""
+
+import importlib
+import math
+import re
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from iisa.freshness import freshness_score
+from iisa.indexer_selection import (
+    QUALITY_WEIGHTS,
+    VALUE_WEIGHTS,
+    _score_factors,
+    _score_latency_ms,
+)
+from iisa.share_score import shaped_share
+
+PAGE = Path(__file__).resolve().parents[1] / "docs" / "scoring.md"
+# Modules of the score job, which tests here may not load.
+JOB_MODULES = {"chain_quality", "processing"}
+
+
+def _tables(markdown: str) -> list[list[list[str]]]:
+    """Every table on the page, as rows of cells, without the header's separator row."""
+    tables: list[list[list[str]]] = []
+    current: list[list[str]] = []
+    for line in [*markdown.splitlines(), ""]:
+        if line.strip().startswith("|"):
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if not all(re.fullmatch(r"-+", cell) for cell in cells):
+                current.append(cells)
+        elif current:
+            tables.append(current)
+            current = []
+    return tables
+
+
+def _table(header_start: str) -> list[list[str]]:
+    """The body rows of the table whose header's first cell is ``header_start``."""
+    for table in _tables(PAGE.read_text()):
+        if table[0][0] == header_start:
+            return table[1:]
+    raise AssertionError(f"docs/scoring.md has no table headed {header_start!r}")
+
+
+def _number(text: str) -> float:
+    return float(text.replace(",", "").removesuffix("%").removesuffix(" ms"))
+
+
+CONSTANTS = [(row[1].strip("`"), row[2]) for row in _table("Constant")]
+
+
+def test_every_constant_names_code_a_test_checks():
+    unchecked = [
+        code
+        for code, _ in CONSTANTS
+        if not code.startswith("iisa.") and code.split(".")[0] not in JOB_MODULES
+    ]
+    assert CONSTANTS and unchecked == []
+
+
+@pytest.mark.parametrize(
+    ("code", "value"), [(code, value) for code, value in CONSTANTS if code.startswith("iisa.")]
+)
+def test_each_constant_matches_the_code(code, value):
+    module, name = code.rsplit(".", 1)
+    actual = getattr(importlib.import_module(module), name)
+
+    assert math.isclose(float(actual), _number(value)), f"{code} is {actual}, the page says {value}"
+
+
+# The page's letter for each part of quality and value, by the metric it is.
+LETTERS = {
+    "S": "success_rate",
+    "L": "lat_lin_reg_coefficient",
+    "K": "stake_to_fees",
+    "P": "base_price_per_epoch",
+    "E": "price_per_entity",
+}
+
+
+def _equation(start: str) -> str:
+    """The 1 line of the page's maths that starts with ``start``."""
+    lines = [line for line in PAGE.read_text().splitlines() if line.startswith(start)]
+    assert len(lines) == 1, f"docs/scoring.md should have 1 line starting {start!r}"
+    return lines[0]
+
+
+def _weights(terms: str) -> dict[str, float]:
+    """{metric: weight} from terms written like ``0.45 \\, K + 0.45 \\, P``."""
+    pairs = re.findall(r"([0-9.]+) \\, ([A-Z])", terms)
+    return {LETTERS[letter]: float(weight) for weight, letter in pairs}
+
+
+@pytest.mark.parametrize(
+    ("start", "weights"), [("Q = 0", QUALITY_WEIGHTS), ("V = 0", VALUE_WEIGHTS)]
+)
+def test_the_quality_and_value_equations_match_the_code(start, weights):
+    assert _weights(_equation(start)) == pytest.approx(dict(weights))
+
+
+def test_the_rescaled_value_equation_matches_the_code():
+    """Value without the price per billion entities: the other 2 weights over their sum."""
+    match = re.fullmatch(r"V = \\frac\{(.*)\}\{([0-9.]+)\}", _equation("V = \\frac"))
+    assert match, "docs/scoring.md's rescaled value equation no longer reads as a fraction"
+    parts = _weights(match.group(1))
+
+    assert parts == pytest.approx({key: VALUE_WEIGHTS[key] for key in parts})
+    assert set(parts) == set(VALUE_WEIGHTS) - {"price_per_entity"}
+    assert float(match.group(2)) == pytest.approx(sum(parts.values()))
+
+
+def test_the_latency_table_matches_the_curve():
+    rows = _table("Latency")
+    latencies = pd.Series([_number(latency) for latency, _ in rows])
+
+    scores = _score_latency_ms(latencies).round(3).tolist()
+
+    assert scores == [float(score) for _, score in rows]
+
+
+def test_the_worked_example_adds_up():
+    """The page gives each indexer's raw readings and K, P and E; the code works out the rest."""
+    rows = {row[0]: row[1:] for row in _table("")}
+
+    def readings(column: int) -> dict[str, float]:
+        def read(label: str) -> float:
+            return _number(rows[label][column])
+
+        return {
+            "norm_uptime_score": shaped_share(read("Uptime") / 100),
+            "norm_freshness": freshness_score(round(read("Freshness checks passed") * 200), 20_000),
+            "norm_success_rate": shaped_share(read("Success rate") / 100),
+            "norm_lat_lin_reg_coefficient": float(
+                _score_latency_ms(pd.Series([read("Latency")])).iloc[0]
+            ),
+            "norm_stake_to_fees": read("K, economic security"),
+            "norm_base_price_per_epoch": read("P, price per 30 days"),
+            "norm_price_per_entity": read("E, price per billion entities"),
+        }
+
+    factors = _score_factors(pd.DataFrame([readings(0), readings(1)]))
+    factors["total"] = factors.prod(axis=1)
+
+    labels = {
+        "uptime": "U, uptime",
+        "freshness": "F, freshness",
+        "quality": "Q, quality",
+        "value": "V, value",
+        "total": "Total",
+    }
+    for column, label in labels.items():
+        stated = [float(value) for value in rows[label]]
+        assert factors[column].round(3).tolist() == stated, f"the page's {label} row is wrong"

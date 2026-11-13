@@ -36,9 +36,11 @@ from iisa.iisa_http_endpoints import (
     _supports_chain,
 )
 from iisa.indexer_selection import (
-    DEFAULT_WEIGHTS,
+    CHAIN_PARTS,
+    QUALITY_WEIGHTS,
+    VALUE_WEIGHTS,
     IndexerSelector,
-    _calculate_weighted_scores,
+    _calculate_scores,
     _normalize_base_price_per_epoch,
     _normalize_generic,
     _normalize_latency,
@@ -55,7 +57,9 @@ OTHER_CHAIN = "mainnet"
 DEPLOYMENT = "QmPropertyTestDeployment"
 ENTITY_COLUMN = "dips_min_grt_per_billion_entities_per_30_days"
 INDEXER_IDS = [f"0x{number:040x}" for number in range(1, 9)]
-NORM_COLUMNS = [f"norm_{metric}" for metric in DEFAULT_WEIGHTS]
+NORM_COLUMNS = [
+    f"norm_{metric}" for metric in ["uptime_score", "freshness", *QUALITY_WEIGHTS, *VALUE_WEIGHTS]
+]
 # Left out rather than scored 0 where there is nothing to score: freshness, on a chain whose
 # checks don't yet cover 7 days, or a table without a freshness column.
 LEFT_OUT_WHEN_MISSING = {"norm_freshness"}
@@ -520,12 +524,6 @@ def test_a_missing_latency_uptime_or_success_rate_scores_0(column, values):
 
 
 norm_values = st.one_of(st.floats(min_value=0, max_value=1), st.just(math.nan))
-weights = st.one_of(
-    st.just(dict(DEFAULT_WEIGHTS)),
-    st.fixed_dictionaries(
-        {metric: st.floats(min_value=0, max_value=1) for metric in DEFAULT_WEIGHTS}
-    ),
-)
 
 
 @given(
@@ -534,20 +532,24 @@ weights = st.one_of(
         min_size=1,
         max_size=8,
     ),
-    weights=weights,
+    left_out=st.sampled_from([frozenset(), CHAIN_PARTS]),
 )
 # The two sums of a weighted average were added up in different orders, so a row of full
 # scores with gaps came out just above 1.
-@example(rows=[[1.0, 1.0, math.nan, math.nan, math.nan, 1.0, 1.0]], weights=dict(DEFAULT_WEIGHTS))
-@example(rows=[[1.0, 1.0, math.nan, 1.0, math.nan, 1.0, math.nan]], weights=dict(DEFAULT_WEIGHTS))
-def test_weighted_scores_are_finite_and_within_unit_range(rows, weights):
+@example(rows=[[1.0, 1.0, math.nan, 1.0, 1.0, math.nan, 1.0]], left_out=frozenset())
+@example(rows=[[1.0, math.nan, 1.0, 1.0, math.nan, 1.0, 1.0]], left_out=frozenset())
+def test_totals_are_finite_and_within_unit_range(rows, left_out):
     norms = pd.DataFrame(rows, columns=NORM_COLUMNS)
-    weight_vector = np.array([weights[metric] for metric in DEFAULT_WEIGHTS])
-    if ((norms.notna().to_numpy() @ weight_vector) == 0).any():
+
+    def lacks_every_part(weights):
+        parts = [f"norm_{metric}" for metric in weights if metric not in left_out]
+        return norms[parts].isna().all(axis=1).any()
+
+    if lacks_every_part(QUALITY_WEIGHTS) or lacks_every_part(VALUE_WEIGHTS):
         with pytest.raises(ValueError):
-            _calculate_weighted_scores(norms, weights)
+            _calculate_scores(norms, left_out)
         return
-    _assert_unit_interval(_calculate_weighted_scores(norms, weights))
+    _assert_unit_interval(_calculate_scores(norms, left_out))
 
 
 # --- Selection end to end ------------------------------------------------------------------

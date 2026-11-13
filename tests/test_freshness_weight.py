@@ -23,7 +23,7 @@ from iisa.freshness import (
     minute_index,
 )
 from iisa.iisa_http_endpoints import IISAState, SelectionRequest, Settings, _select_with_processor
-from iisa.indexer_selection import DEFAULT_WEIGHTS, IndexerSelector, _calculate_weighted_scores
+from iisa.indexer_selection import IndexerSelector, _calculate_scores
 from iisa.share_score import SHARE_EXPONENT, shaped_share
 
 CHAIN = "arbitrum-one"
@@ -226,20 +226,20 @@ class TestSelection:
 
     @pytest.mark.parametrize("records", ["under-7-days", "none"])
     def test_freshness_is_left_out_rather_than_scored_0(self, service, records):
-        """With less than 7 days of checks on the chain, or none at all, the weighted score is
-        the average of the other 6 metrics."""
+        """With less than 7 days of checks on the chain, or none at all, freshness counts as 1,
+        so the total is the product of the other 3 factors."""
         if records == "under-7-days":
             service.freshness = _store(
                 {(TWIN, CHAIN): (100, 100), (TWIN_TOO, CHAIN): (0, 100)}, days_of_checks=6
             )
 
         data = _selector().data
-        others = {k: v for k, v in DEFAULT_WEIGHTS.items() if k != "freshness"}
 
         assert data["norm_freshness"].isna().all()
         assert not math.isnan(data["weighted_score"].iloc[0])
+        assert (data["factor_freshness"] == 1.0).all()
         assert list(data["weighted_score"]) == pytest.approx(
-            list(_calculate_weighted_scores(data.drop(columns="norm_freshness"), others))
+            list(_calculate_scores(data, frozenset({"freshness"})))
         )
 
 
