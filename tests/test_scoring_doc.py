@@ -3,8 +3,8 @@
 The page explains the score for readers who would rather check the maths than the code. Its
 constants table names the code constant behind every number, and this test checks each one the
 service owns; the score job's are checked by test_scoring_doc_job_constants.py among the
-cronjob tests. It also
-recomputes the page's worked example and latency table with the code.
+cronjob tests. It also checks the weights written in the equations for quality and value, and
+recomputes the page's worked example and latency table with the code. The prose is not checked.
 """
 
 import importlib
@@ -16,7 +16,12 @@ import pandas as pd
 import pytest
 
 from iisa.freshness import freshness_score
-from iisa.indexer_selection import _score_factors, _score_latency_ms
+from iisa.indexer_selection import (
+    QUALITY_WEIGHTS,
+    VALUE_WEIGHTS,
+    _score_factors,
+    _score_latency_ms,
+)
 from iisa.share_score import shaped_share
 
 PAGE = Path(__file__).resolve().parents[1] / "docs" / "scoring.md"
@@ -71,6 +76,47 @@ def test_each_constant_matches_the_code(code, value):
     actual = getattr(importlib.import_module(module), name)
 
     assert math.isclose(float(actual), _number(value)), f"{code} is {actual}, the page says {value}"
+
+
+# The page's letter for each part of quality and value, by the metric it is.
+LETTERS = {
+    "S": "success_rate",
+    "L": "lat_lin_reg_coefficient",
+    "K": "stake_to_fees",
+    "P": "base_price_per_epoch",
+    "E": "price_per_entity",
+}
+
+
+def _equation(start: str) -> str:
+    """The 1 line of the page's maths that starts with ``start``."""
+    lines = [line for line in PAGE.read_text().splitlines() if line.startswith(start)]
+    assert len(lines) == 1, f"docs/scoring.md should have 1 line starting {start!r}"
+    return lines[0]
+
+
+def _weights(terms: str) -> dict[str, float]:
+    """{metric: weight} from terms written like ``0.45 \\, K + 0.45 \\, P``."""
+    pairs = re.findall(r"([0-9.]+) \\, ([A-Z])", terms)
+    return {LETTERS[letter]: float(weight) for weight, letter in pairs}
+
+
+@pytest.mark.parametrize(
+    ("start", "weights"), [("Q = 0", QUALITY_WEIGHTS), ("V = 0", VALUE_WEIGHTS)]
+)
+def test_the_quality_and_value_equations_match_the_code(start, weights):
+    assert _weights(_equation(start)) == pytest.approx(dict(weights))
+
+
+def test_the_rescaled_value_equation_matches_the_code():
+    """Value without the price per billion entities: the other 2 weights over their sum."""
+    match = re.fullmatch(r"V = \\frac\{(.*)\}\{([0-9.]+)\}", _equation("V = \\frac"))
+    assert match, "docs/scoring.md's rescaled value equation no longer reads as a fraction"
+    parts = _weights(match.group(1))
+
+    assert parts == pytest.approx({key: VALUE_WEIGHTS[key] for key in parts})
+    assert set(parts) == set(VALUE_WEIGHTS) - {"price_per_entity"}
+    assert float(match.group(2)) == pytest.approx(sum(parts.values()))
 
 
 def test_the_latency_table_matches_the_curve():

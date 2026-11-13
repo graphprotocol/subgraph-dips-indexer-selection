@@ -1,6 +1,6 @@
 # How an indexer is scored
 
-When IISA picks indexers for a deployment, it gives every candidate a total score between 0 and 1 and prefers the higher totals. This page sets out how that total is worked out, for anyone who would rather check the maths than read the code. Every number in it is a constant in the code, listed in the last section, and a test fails if the two ever disagree.
+When IISA picks indexers for a deployment, it gives every candidate a total score between 0 and 1 and prefers the higher totals. This page sets out how that total is worked out, for anyone who would rather check the maths than read the code. Tests check the page against the code: the weights in the equations for quality and value, including value with a part left out, every row of the constants table in the last section, the latency table and the worked example's table. The prose is not checked, so a figure written only in a sentence, such as the 0.85 in the cut-offs section or the sums written out under the worked example, could fall out of date unnoticed.
 
 ## The formula
 
