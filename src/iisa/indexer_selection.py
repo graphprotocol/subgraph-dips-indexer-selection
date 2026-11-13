@@ -735,9 +735,8 @@ LATENCY_MIDPOINT_MS = 250
 LATENCY_WIDTH_MS = 80
 LATENCY_FLOOR_SCORE = 0.001
 
-# Scores from a job that pushes no latency_ms keep latency scaled against the candidates, and
-# say so in a warning logged at most once in this many minutes, since every selection and score
-# read would otherwise repeat it.
+# Scores without latency_ms keep the job's own latency score, and say so in a warning logged at
+# most once in this many minutes, since every selection and score read would otherwise repeat it.
 LATENCY_FALLBACK_WARNING_MINUTES = 10
 _LATENCY_FALLBACK_WARNINGS = LogLimit(LATENCY_FALLBACK_WARNING_MINUTES)
 
@@ -819,9 +818,11 @@ def _latency_metric(
     merged: pd.DataFrame,
 ) -> tuple[tuple[str, str, _Normaliser], frozenset[str]]:
     """The latency metric, as (norm column, source column, normaliser), and the norm columns to
-    keep as pushed. latency_ms is scored on the fixed curve. Scores without it, from a job older
-    than it, keep the latency score from before it: the job's pushed score, or else the
-    regression's upper bound scaled against the candidates, with a warning.
+    keep as pushed. latency_ms is scored on the fixed curve. Scores without it keep the latency
+    score from before it, with a warning: the job's pushed lat_normalized_score, scaled across
+    every indexer the job measured, or else the regression's upper bound scaled against the
+    candidates. A run without GeoIP and a degraded run measure no latency in ms, and nor did a
+    job older than latency_ms.
     """
     if LATENCY_MS in merged.columns:
         # No row sets a scale here, as no indexer's score depends on another's.
@@ -830,9 +831,11 @@ def _latency_metric(
     held = _LATENCY_FALLBACK_WARNINGS.allow(LATENCY_MS, _current_minute())
     if held is not None:
         logger.warning(
-            "The loaded scores have no %s, as from a score job older than it, so latency is "
-            "scored against the candidates instead of on the fixed curve. Logged at most once "
-            "every %d minutes, with %d held back since the last",
+            "The loaded scores have no %s, so latency is scored from the job's pushed "
+            "lat_normalized_score, scaled across every indexer the job measured, instead of on "
+            "the fixed curve. Check the score job's last run: one without GeoIP or a degraded "
+            "run measures no latency in ms, and nor does a job older than the field. Logged at "
+            "most once every %d minutes, with %d held back since the last",
             LATENCY_MS,
             LATENCY_FALLBACK_WARNING_MINUTES,
             held,
