@@ -172,10 +172,14 @@ class TestReplacingTheGroupsSyncedMember:
         processor = _selector(
             {"E": 0.02, "M": 0.9, "S": 0.58, "A": 1.0}, ["E", "M"], synced={"e", "s"}
         )
+        processor.initial_group = list(processor.current_group)
+        processor._preferred_on_a_claim.clear()
 
         swap = processor._swap_for("E")
 
         assert swap is not None and swap[:2] == ("E", "S")
+        # S won the place on its claim, so the claim must be listed for the gateway check.
+        assert processor.preferred_on_a_claim() == ["S"]
 
     def test_another_synced_member_still_holds_a_synced_challenger_to_60_percent(self):
         """T, also synced, stays in the group, so S needs 60% of A's total to stay ahead."""
