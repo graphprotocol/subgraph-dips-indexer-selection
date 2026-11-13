@@ -180,13 +180,12 @@ def test_post_scores_takes_the_maps_as_they_are_and_serves_them_back(service):
     assert _shares(CHAIN)[FIRST] == (1.0, 0.95)
 
 
-def test_each_chains_reported_score_uses_its_values_and_the_network_score_the_overall(service):
+def test_each_chains_reported_score_uses_its_values_or_else_the_overall(service):
     service.load_scores_from_records(
         [_record(FIRST, 0.9, 0.8, {CHAIN: 1.0}, {CHAIN: 1.0}), _record(SECOND, 0.7, 0.6)]
     )
 
     body = TestClient(iisa_http_endpoints.app).post("/get-score", json={"indexer_id": FIRST}).json()
 
-    assert body["components"]["uptime"] == pytest.approx(0.9**6)
     assert body["chains"][CHAIN]["components"]["uptime"] == pytest.approx(1.0)
     assert body["chains"][OTHER_CHAIN]["components"]["uptime"] == pytest.approx(0.9**6)

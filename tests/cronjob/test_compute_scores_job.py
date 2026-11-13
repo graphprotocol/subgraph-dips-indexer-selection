@@ -9,6 +9,7 @@ import hashlib
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -224,6 +225,19 @@ class TestTransformToScoresSchema:
         values = result["lat_normalized_score"].dropna()
         assert all(0 <= v <= 1 for v in values), "lat_normalized_score has values outside [0, 1]"
 
+    def test_transform_pushes_latency_in_ms(self, sample_merged_df):
+        sample_merged_df["latency_ms"] = [120.0, 250.0, 0.0]
+
+        result = transform_to_scores_schema(sample_merged_df)
+
+        assert list(result["latency_ms"]) == [120.0, 250.0, 0.0]
+
+    def test_transform_pushes_no_latency_in_ms_without_a_regression(self, sample_merged_df):
+        """Without GeoIP the job runs no regression, so it has no latency to push."""
+        result = transform_to_scores_schema(sample_merged_df)
+
+        assert result["latency_ms"].isna().all()
+
     def test_transform_query_count_preserved(self, sample_merged_df):
         # Act
         result = transform_to_scores_schema(sample_merged_df)
@@ -249,6 +263,7 @@ class TestComputeDegradedScores:
         # only 1.0 is neutral: it scores everyone 1, where 0.5 would score everyone 0.016.
         assert list(result["uptime_score"]) == [1.0, 1.0]
         assert list(result["success_rate"]) == [1.0, 1.0]
+        assert result["latency_ms"].isna().all()
         assert "norm_uptime_score" not in result.columns
         assert "norm_success_rate" not in result.columns
 
@@ -908,6 +923,72 @@ class TestPerformLinearRegression:
         coefficient = rankings.set_index("indexer")["Latency Coefficient"]
         assert coefficient["0xfast"] == pytest.approx(-100, abs=2)
         assert coefficient["0xslow"] == pytest.approx(100, abs=2)
+
+    @staticmethod
+    def _latency_ms(
+        true_ms: dict[str, float],
+        shares: Optional[list[float]] = None,
+        rows: int = 4_000,
+        noise: float = 5.0,
+    ) -> dict[str, float]:
+        """Each indexer's latency_ms from a regression over ``rows`` queries, each indexer
+        taking its ``shares`` of them (even by default) and answering in its true latency in ms
+        plus noise."""
+        rng = np.random.default_rng(7)
+        indexer = rng.choice(list(true_ms), rows, p=shares)
+        df = pd.DataFrame(
+            {
+                "indexer": indexer,
+                "deployment_hash": rng.choice(["deployment_1", "deployment_2"], rows),
+                "indexer_network": "arbitrum",
+                "distance_miles": rng.uniform(0, 1000, rows),
+                "fee": rng.uniform(0.000001, 0.01, rows),
+                "response_time_ms": [true_ms[ix] for ix in indexer] + rng.normal(0, noise, rows),
+            }
+        )
+        rankings, _ = perform_latency_linear_regression(
+            df,
+            ["response_time_ms"],
+            ["indexer", "deployment_hash", "indexer_network"],
+            ["distance_miles", "fee"],
+        )
+        return rankings.set_index("indexer")["latency_ms"].to_dict()
+
+    def test_latency_in_ms_is_each_indexers_own_latency(self):
+        true_ms = {"0xfast": 100.0, "0xmid": 300.0, "0xslow": 500.0}
+
+        assert self._latency_ms(true_ms) == pytest.approx(true_ms, abs=3)
+
+    def test_latency_in_ms_is_floored_at_0(self):
+        """Real response times are never below 0, but an estimate can be; this indexer's are
+        made negative so its estimate is."""
+        latency = self._latency_ms({"0xnegative": -50.0, "0xa": 100.0, "0xb": 200.0})
+
+        assert latency == pytest.approx({"0xnegative": 0.0, "0xa": 100.0, "0xb": 200.0}, abs=3)
+
+    def test_latency_in_ms_is_each_indexers_own_with_most_traffic_on_the_faster(self):
+        """The gateway sends most queries to fast indexers, so the median query is a fast one,
+        while the regression measures each indexer from the median indexer."""
+        true_ms = {"0xfast": 100.0, "0xslow": 500.0}
+
+        assert self._latency_ms(true_ms, [0.9, 0.1]) == pytest.approx(true_ms, abs=3)
+
+    def test_latency_in_ms_is_each_indexers_own_with_80_percent_on_the_2_fastest(self):
+        true_ms = {"0xa": 80.0, "0xb": 120.0, "0xc": 300.0, "0xd": 450.0, "0xe": 900.0}
+
+        latency = self._latency_ms(true_ms, [0.45, 0.35, 0.10, 0.06, 0.04])
+
+        assert latency == pytest.approx(true_ms, abs=3)
+
+    def test_a_fast_indexer_with_most_of_the_traffic_is_not_floored(self):
+        """Most queries go to an indexer that answers in 1ms, so the median query takes about
+        1ms while the median indexer takes 1,000ms; anchoring on the median query would put
+        the fast indexer below 0 and the others about 1,000ms too fast."""
+        true_ms = {"0xinstant": 1.0, "0xslow": 1_000.0, "0xslower": 2_000.0}
+
+        latency = self._latency_ms(true_ms, [0.6, 0.2, 0.2], rows=3_000, noise=0.5)
+
+        assert latency == pytest.approx(true_ms, abs=2)
 
     @pytest.mark.filterwarnings(
         "ignore:divide by zero encountered:RuntimeWarning",

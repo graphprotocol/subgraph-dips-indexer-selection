@@ -6,12 +6,13 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - POST /scores - Push computed indexer scores from the cronjob (push token)
 - GET /scores - Return the current scores snapshot (read token)
 - GET /scores/status - Return when the loaded scores were computed, for monitoring (read token)
-- GET /scores/weighted - Bulk weighted scores for every loaded indexer (read token)
+- GET /scores/weighted - Every loaded indexer's total scores, 1 per chain it has priced (read token)
 - GET /dips-indexers - Indexers offering DIPs on a required ?chain (read token)
 - POST /sync-status - Push sync-status snapshot from the fetcher (push token)
 - POST /freshness - Push 1 minute of freshness outcomes from the prober (push token)
 - GET /freshness - Return each indexer's stale mark and freshness counts, by chain (read token)
-- POST /get-score - Return weighted score and components for one indexer (read token)
+- POST /get-score - Return 1 indexer's total score, factors and components on each chain it has
+  priced (read token)
 - POST /select-indexers - Select optimal indexers for a deployment
 """
 
@@ -22,7 +23,6 @@ import logging
 import math
 import numbers
 import os
-import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -61,6 +61,7 @@ from .freshness import (
     minute_text,
 )
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
+from .log_limit import LogLimit
 from .score_loader import (
     STALE_SCORES_CRITICAL_HOURS,
     DataManager,
@@ -335,30 +336,34 @@ class ScoreRequest(BaseModel):
 
 
 class ChainScore(BaseModel):
-    """An indexer's weighted score and component scores, prices and freshness included, on one
-    chain. Freshness is left out on a chain whose checks don't yet cover 7 days or have stopped
+    """An indexer's score on one chain, prices and freshness included. weighted_score is the
+    total, the product of the 4 factors (uptime, freshness, quality and value), and components
+    are the parts the factors are made from. Freshness is left out of components, and counts
+    as 1 among the factors, on a chain whose checks don't yet cover 7 days or have stopped
     counting.
 
     Scored against every indexer that supports the chain and has priced it, as selection does
-    before it applies a request's budget, blocklist and expected fees.
+    before it applies a request's budget, blocklist and expected fees. queries is the indexer's
+    queries on the chain from the score job's queries_by_chain, null when the job sent none, so
+    a reader can weigh the indexer's chain totals into 1 number of its own.
     """
 
     weighted_score: Optional[float] = None
     components: dict[str, float] = {}
+    factors: dict[str, float] = {}
+    queries: Optional[int] = None
 
 
 class ScoreResponse(BaseModel):
     """
     Response for the /get-score endpoint.
 
-    weighted_score and components compare the indexer with every loaded indexer and leave out
-    prices and freshness, which depend on the chain. chains has the full score for each chain
-    it has priced.
+    An indexer is scored on each chain, since its prices and freshness only exist there, so
+    chains has its score on each chain it has priced, and there is no score across chains.
+    chains is null when the indexer isn't loaded.
     """
 
     indexer_id: str
-    weighted_score: Optional[float] = None
-    components: Optional[dict[str, float]] = None
     chains: Optional[dict[str, ChainScore]] = None
     found: bool
 
@@ -396,16 +401,14 @@ class ScoresSnapshotResponse(BaseModel):
 
 
 class WeightedScoreEntry(BaseModel):
-    """One indexer's scores, shaped like the /get-score response."""
+    """One indexer's scores on each chain it has priced, shaped like the /get-score response."""
 
     indexer: str
-    weighted_score: Optional[float] = None
-    components: dict[str, float] = {}
     chains: dict[str, ChainScore] = {}
 
 
 class WeightedScoresResponse(BaseModel):
-    """Response for GET /scores/weighted: bulk weighted-scores snapshot.
+    """Response for GET /scores/weighted: bulk total-scores snapshot.
 
     Same per-row shape as POST /get-score but for every loaded indexer in
     a single call. `computed_at` mirrors the underlying push so callers
@@ -664,38 +667,6 @@ logger = logging.getLogger("iisa-service")
 LAPSE_WARNING_INTERVAL_MINUTES = 10
 
 
-class _PerChainLimit:
-    """Lets a log line through at most once per chain every LAPSE_WARNING_INTERVAL_MINUTES,
-    counting those held back in between, until the chain is reset, which starts it afresh. It
-    has a lock of its own, so selections running on different threads can share it.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._last: dict[str, int] = {}
-        self._held: dict[str, int] = {}
-
-    def allow(self, chain: str, now: int) -> Optional[int]:
-        """How many lines on ``chain`` were held back since the last one let through, when a
-        line in the minute ``now`` may be logged, or None when it is held back too.
-        """
-        with self._lock:
-            last = self._last.get(chain)
-            if last is not None and now - last < LAPSE_WARNING_INTERVAL_MINUTES:
-                self._held[chain] = self._held.get(chain, 0) + 1
-                return None
-            self._last[chain] = now
-            return self._held.pop(chain, 0)
-
-    def reset(self, chain: str) -> None:
-        """Forget ``chain``'s last line and the count held back since, so its next line goes
-        through and counts only what is held back after it.
-        """
-        with self._lock:
-            self._last.pop(chain, None)
-            self._held.pop(chain, None)
-
-
 class IISAState:
     """
     Holds the IISA service state including initialized providers and cached data.
@@ -708,7 +679,7 @@ class IISAState:
         self._sync_status: Optional["SyncStatusData"] = None
         self.sync_checker: Optional[SyncClaimChecker] = None
         self.freshness = FreshnessStore()
-        self.lapse_warnings = _PerChainLimit()
+        self.lapse_warnings = LogLimit(LAPSE_WARNING_INTERVAL_MINUTES)
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -1345,43 +1316,33 @@ def scores_snapshot(
     )
 
 
-# Prices and freshness only exist once a chain is chosen, so the network-wide score leaves
-# these weights out.
-_CHAIN_WEIGHTS = ("base_price_per_epoch", "price_per_entity", "freshness")
-
-
 def _scores_by_indexer(
-    normalized: pd.DataFrame,
-    weights: Mapping[str, object],
-    indexer_id: Optional[str] = None,
+    normalized: pd.DataFrame, chain: str, indexer_id: Optional[str] = None
 ) -> dict[str, ChainScore]:
-    """Weighted score and component scores for each indexer in an already normalised table.
+    """Total, factors, component scores and queries on ``chain`` for each indexer in an already
+    normalised table of the indexers on it.
 
-    Only the metrics in ``weights`` count. ``indexer_id``, when given, scores just that indexer.
-    An indexer with more than 1 row is scored from its first.
+    ``indexer_id``, when given, scores just that indexer. An indexer with more than 1 row is
+    scored from its first. Queries that can't be read are reported as null, with a warning.
     """
-    from .indexer_selection import WeightsDict, _calculate_weighted_scores
+    from .indexer_selection import _score_factors
 
     if indexer_id is not None:
         normalized = normalized[normalized["indexer"] == indexer_id]
     if normalized.empty:
         return {}
 
-    # Score every indexer in one vectorised pass. _normalize_metrics fills every
-    # weighted norm_ column, so the zero-weight case can't arise here; degrade to
-    # unscored rather than 500 if it somehow does.
+    # Score every indexer in one vectorised pass. _normalize_metrics fills every norm_ column,
+    # so a row with no part of quality or value can't arise here; degrade to unscored rather
+    # than 500 if it somehow does.
     try:
-        weighted_scores = _calculate_weighted_scores(
-            normalized, cast(WeightsDict, dict(weights))
-        ).to_numpy()
+        factors: Optional[pd.DataFrame] = _score_factors(normalized)
     except ValueError as e:
-        logger.warning("weighted scoring failed: %s", e)
-        weighted_scores = pd.Series(float("nan"), index=normalized.index).to_numpy()
+        logger.warning("scoring failed: %s", e)
+        factors = None
 
-    reported = [
-        (col, name) for col, name in _BREAKDOWN_COMPONENTS if col.removeprefix("norm_") in weights
-    ]
     scores: dict[str, ChainScore] = {}
+    unreadable: list[Any] = []
     for position, (_, row) in enumerate(normalized.iterrows()):
         row_indexer = row.get("indexer")
         if row_indexer is None or (isinstance(row_indexer, float) and pd.isna(row_indexer)):
@@ -1390,27 +1351,67 @@ def _scores_by_indexer(
         if str(row_indexer) in scores:
             logger.warning("indexer %s has more than 1 score row; using the first", row_indexer)
             continue
-
-        score = weighted_scores[position]
-        scores[str(row_indexer)] = ChainScore(
-            weighted_score=float(score) if pd.notna(score) else None,
-            components={
-                name: float(row[col])
-                for col, name in reported
-                if col in row.index and pd.notna(row[col])
-            },
+        queries = _queries_on(row.get("queries_by_chain"), chain, unreadable)
+        scores[str(row_indexer)] = _chain_score(row, factors, position, queries)
+    if unreadable:
+        logger.warning(
+            "%d queries_by_chain entr(ies) for chain %s can't be read as a count of 0 or more, "
+            "so those indexers' queries there are reported as null, such as %.100r",
+            len(unreadable),
+            chain,
+            unreadable[0],
         )
     return scores
 
 
-def _network_scores(
-    history: pd.DataFrame, indexer_id: Optional[str] = None
-) -> dict[str, ChainScore]:
-    """Each indexer scored against every loaded indexer, with prices and freshness left out."""
-    from .indexer_selection import DEFAULT_WEIGHTS, _normalize_metrics
+def _chain_score(
+    row: pd.Series, factors: Optional[pd.DataFrame], position: int, queries: Optional[int]
+) -> ChainScore:
+    """1 indexer's ChainScore with ``queries``: its row's components, and its total and factors
+    from row ``position`` of ``factors``, or none when scoring failed.
+    """
+    from .indexer_selection import SCORE_FACTORS
 
-    weights = {k: v for k, v in DEFAULT_WEIGHTS.items() if k not in _CHAIN_WEIGHTS}
-    return _scores_by_indexer(_normalize_metrics(history.copy()), weights, indexer_id)
+    components = {
+        name: float(row[col])
+        for col, name in _BREAKDOWN_COMPONENTS
+        if col in row.index and pd.notna(row[col])
+    }
+    if factors is None:
+        return ChainScore(weighted_score=None, components=components, queries=queries)
+    own = {name: float(factors[name].iloc[position]) for name in SCORE_FACTORS}
+    return ChainScore(
+        weighted_score=math.prod(own.values()),
+        components=components,
+        factors=own,
+        queries=queries,
+    )
+
+
+def _queries_on(queries_by_chain: Any, chain: str, unreadable: list[Any]) -> Optional[int]:
+    """The queries on ``chain`` in an indexer's pushed queries_by_chain, or None when there are
+    none. What the job sent that can't be read, a map that isn't one or a value for ``chain``
+    that isn't a whole count of 0 or more, is added to ``unreadable``. A row without a map, as
+    from a job that sends none, or a map without ``chain`` is not.
+    """
+    if not isinstance(queries_by_chain, dict):
+        if not _is_missing(queries_by_chain):
+            unreadable.append(queries_by_chain)
+        return None
+    if chain not in queries_by_chain:
+        return None
+    count = queries_by_chain[chain]
+    if _is_count(count):
+        return int(count)
+    unreadable.append(count)
+    return None
+
+
+def _is_count(value: Any) -> bool:
+    """Whether ``value`` is a whole number of 0 or more, as an int or a float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0 and value == int(value)
 
 
 def _priced_chains(history: pd.DataFrame) -> list[str]:
@@ -1433,7 +1434,7 @@ def _chain_scores(
     history: pd.DataFrame, chains: list[str], indexer_id: Optional[str] = None
 ) -> dict[str, dict[str, ChainScore]]:
     """Scores by indexer, then by chain, each chain scored like a selection with no budget."""
-    from .indexer_selection import DEFAULT_WEIGHTS, _normalize_metrics
+    from .indexer_selection import _normalize_metrics
 
     scores: dict[str, dict[str, ChainScore]] = {}
     for chain in chains:
@@ -1444,9 +1445,7 @@ def _chain_scores(
         if pool.empty:
             continue
         normalized = _normalize_metrics(_enrich_for_chain(pool, chain))
-        for row_indexer, score in _scores_by_indexer(
-            normalized, DEFAULT_WEIGHTS, indexer_id
-        ).items():
+        for row_indexer, score in _scores_by_indexer(normalized, chain, indexer_id).items():
             scores.setdefault(row_indexer, {})[chain] = score
     return scores
 
@@ -1457,9 +1456,9 @@ def _chain_scores(
 def scores_weighted(
     authorization: Optional[str] = Header(None),
 ) -> WeightedScoresResponse:
-    """Bulk weighted-score snapshot — same shape as /get-score, every indexer.
+    """Every loaded indexer's total scores, 1 per chain it has priced, shaped like /get-score.
 
-    Single pass across the loaded snapshot — saves N round-trips to /get-score.
+    Single pass across the loaded snapshot, which saves N round-trips to /get-score.
     Selection can pass `max_grt_per_30_days` as a `price_ceiling`; this endpoint
     cannot, so each chain's prices are normalised against its observed max instead.
     """
@@ -1477,13 +1476,8 @@ def scores_weighted(
 
     by_chain = _chain_scores(snap.data, _priced_chains(snap.data))
     entries = [
-        WeightedScoreEntry(
-            indexer=indexer_id,
-            weighted_score=score.weighted_score,
-            components=score.components,
-            chains=by_chain.get(indexer_id, {}),
-        )
-        for indexer_id, score in _network_scores(snap.data).items()
+        WeightedScoreEntry(indexer=indexer_id, chains=by_chain.get(indexer_id, {}))
+        for indexer_id in _loaded_indexers(snap.data)
     ]
 
     return WeightedScoresResponse(
@@ -1491,6 +1485,17 @@ def scores_weighted(
         count=len(entries),
         scores=entries,
     )
+
+
+def _loaded_indexers(history: pd.DataFrame) -> list[str]:
+    """Every indexer in the loaded scores once, in order, leaving out rows without one."""
+    indexers: dict[str, None] = {}
+    for value in history.get("indexer", pd.Series(dtype=object)):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            logger.debug("skipping row with missing indexer field")
+            continue
+        indexers.setdefault(str(value), None)
+    return list(indexers)
 
 
 @app.get("/dips-indexers", response_model=DipsIndexersResponse, responses=_documented_errors(401))
@@ -1637,7 +1642,8 @@ async def get_score(
     request: ScoreRequest,
     authorization: Optional[str] = Header(None),
 ) -> ScoreResponse:
-    """Return one indexer's weighted score plus the component scores feeding it.
+    """Return one indexer's total score on each chain it has priced, with the factors and
+    component scores feeding each.
 
     Useful for debugging selection decisions and monitoring per-indexer
     performance without running a full selection request.
@@ -1657,11 +1663,8 @@ async def get_score(
     if match.empty:
         return ScoreResponse(indexer_id=request.indexer_id, found=False)
 
-    network = _network_scores(history, indexer_id)[indexer_id]
     return ScoreResponse(
         indexer_id=request.indexer_id,
-        weighted_score=network.weighted_score,
-        components=network.components,
         chains=_chain_scores(history, _priced_chains(match), indexer_id).get(indexer_id, {}),
         found=True,
     )
@@ -1673,10 +1676,10 @@ async def get_score(
     responses=_documented_errors(400, 413, 503),
 )
 async def select_indexers(request: SelectionRequest) -> SelectionResponse:
-    """Select N indexers for a deployment via weighted scoring.
+    """Select N indexers for a deployment by their total scores.
 
     Returns the SHOULD-be-assigned set; caller diffs against current state.
-    Picks the top N by weighted aggregate, preferring >1 unique org / location
+    Picks the top N by total score, preferring >1 unique org / location
     when N > 1 (best-effort). Pass existing_indexers=[] for a fresh selection.
     """
     if not _state.is_ready or _state.history is None:
@@ -2212,12 +2215,11 @@ def _build_selector(
         price_ceiling=request.max_grt_per_30_days,
         synced_indexers=cast(set[EthAddressStr], synced_indexers),
         stale_indexers=cast(list[EthAddressStr], stale_indexers),
+        entity_price_ceiling=request.max_grt_per_billion_entities_per_30_days,
     )
 
 
-# Normalised metric columns paired with the label each is logged under. The weight
-# key for each metric is its column name without the "norm_" prefix, which matches
-# the keys in IndexerSelector.weights / DEFAULT_WEIGHTS.
+# Normalised metric columns paired with the label each is logged and reported under.
 _BREAKDOWN_COMPONENTS = (
     ("norm_stake_to_fees", "stake_to_fees"),
     ("norm_base_price_per_epoch", "base_price"),
@@ -2230,35 +2232,29 @@ _BREAKDOWN_COMPONENTS = (
 
 
 def _score_breakdown(
-    row: pd.Series, weights: Mapping[str, object]
-) -> tuple[Optional[float], dict[str, float], dict[str, float], dict[str, float]]:
-    """Return (weighted_score, components, weights, contributions) for one scored
-    indexer row, rounded for logging. Metrics the row lacks or that carry no
-    weight are left out; weighted_score is None when the row has none.
+    row: pd.Series,
+) -> tuple[Optional[float], dict[str, float], dict[str, float]]:
+    """Return (total, factors, components) for one scored indexer row, rounded for logging.
+    Factors and components the row lacks are left out; total is None when it has none.
     """
-    # Each present metric, paired with its normalised value and its active weight.
-    present = [
-        (label, float(row[col]), float(cast(float, weights[col[len("norm_") :]])))
-        for col, label in _BREAKDOWN_COMPONENTS
-        if col in row.index and pd.notna(row[col]) and col[len("norm_") :] in weights
-    ]
-    components = {label: round(value, 3) for label, value, _ in present}
-    present_weights = {label: round(weight, 3) for label, _, weight in present}
-    # Each metric's weighted contribution to the score: value * weight
-    # renormalised over the weights of the metrics this indexer has, so the
-    # contributions sum to the logged score (mirrors _calculate_weighted_scores).
-    weight_total = sum(weight for _, _, weight in present)
-    contributions = {
-        label: round(value * weight / weight_total, 4)
-        for label, value, weight in present
-        if weight_total > 0
+    from .indexer_selection import SCORE_FACTORS
+
+    factors = {
+        name: round(float(row[f"factor_{name}"]), 3)
+        for name in SCORE_FACTORS
+        if f"factor_{name}" in row.index and pd.notna(row[f"factor_{name}"])
     }
-    weighted = (
+    components = {
+        label: round(float(row[col]), 3)
+        for col, label in _BREAKDOWN_COMPONENTS
+        if col in row.index and pd.notna(row[col])
+    }
+    total = (
         round(float(row["weighted_score"]), 4)
         if "weighted_score" in row.index and pd.notna(row["weighted_score"])
         else None
     )
-    return weighted, components, present_weights, contributions
+    return total, factors, components
 
 
 def _log_selection_reasoning(processor: IndexerSelector, deployment_id: str) -> None:
@@ -2268,15 +2264,13 @@ def _log_selection_reasoning(processor: IndexerSelector, deployment_id: str) -> 
 
     scored = processor.data[processor.data["indexer"].isin(processor.current_group)]
     for _, row in scored.iterrows():
-        weighted, components, weights, contributions = _score_breakdown(row, processor.weights)
+        total, factors, components = _score_breakdown(row)
         logger.info(
-            "selected indexer=%s score=%.4f components=%s weights=%s contributions=%s "
-            "deployment=%s",
+            "selected indexer=%s score=%.4f factors=%s components=%s deployment=%s",
             row["indexer"],
-            weighted if weighted is not None else 0.0,
+            total if total is not None else 0.0,
+            factors,
             components,
-            weights,
-            contributions,
             deployment_id,
         )
 
@@ -2466,9 +2460,10 @@ def _warn_about_stale_picks(
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """Run IndexerSelector and return a SelectionResponse for the deployment.
 
-    The selector weights stake-to-fees, base price, latency, uptime, freshness,
-    success rate, and price-per-entity; lower is better for prices and
-    latency, higher for the rest.
+    The selector scores each indexer as uptime x freshness x quality x value,
+    from stake-to-fees, base price, latency, uptime, freshness, success rate
+    and price-per-entity; lower is better for prices and latency, higher for
+    the rest.
     """
     selection = _prepare_selection(request)
     if isinstance(selection, SelectionResponse):

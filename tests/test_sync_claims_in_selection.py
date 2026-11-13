@@ -19,6 +19,9 @@ CHAIN = "arbitrum-one"
 DEPLOYMENT = "QmDeployment"
 STRONG = ["0x" + digit * 40 for digit in "1234"]
 WEAK = "0x" + "9" * 40
+# Well below the strong indexers, yet its total stays above 15% of theirs, the cut-off under
+# which a group member is replaced in the same selection by a much better candidate.
+WEAK_QUALITY = 0.8
 
 
 def _score_record(indexer: str, quality: float) -> dict:
@@ -70,7 +73,7 @@ def _select_1(synced_on_deployment: list[str]) -> str:
     state = iisa_http_endpoints.IISAState()
     state.initialize(iisa_http_endpoints.get_settings())
     state.load_scores_from_records(
-        [_score_record(indexer, 0.95) for indexer in STRONG] + [_score_record(WEAK, 0.2)]
+        [_score_record(indexer, 0.95) for indexer in STRONG] + [_score_record(WEAK, WEAK_QUALITY)]
     )
     fetched_at = datetime.now(timezone.utc).isoformat()
     state.load_sync_status_from_dict(

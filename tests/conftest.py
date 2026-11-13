@@ -19,13 +19,16 @@ from faker.providers import BaseProvider, geo, internet
 from faker_airtravel import AirTravelProvider
 from hypothesis import HealthCheck, settings
 
+from iisa import indexer_selection
 from iisa.indexer_selection import (
+    LATENCY_FALLBACK_WARNING_MINUTES,
     DeploymentId,
     EthAddressStr,
     IndexerId,
     IpfsHashStr,
     QueryIdStr,
 )
+from iisa.log_limit import LogLimit
 
 # Property tests: few enough examples to keep the suite fast, a fixed seed on CI so a failure
 # there repeats, and HYPOTHESIS_PROFILE=thorough for a much deeper search locally.
@@ -106,3 +109,16 @@ def faker() -> Faker:
     faker.add_provider(AirTravelProvider)
     faker.add_provider(CustomFakerProvider)
     return faker
+
+
+@pytest.fixture(autouse=True)
+def fresh_latency_fallback_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test its own limit on the warning that latency falls back to the old score.
+    The limit is shared by the whole process, so without this whether a test sees the warning
+    would depend on which tests ran before it.
+    """
+    monkeypatch.setattr(
+        indexer_selection,
+        "_LATENCY_FALLBACK_WARNINGS",
+        LogLimit(LATENCY_FALLBACK_WARNING_MINUTES),
+    )

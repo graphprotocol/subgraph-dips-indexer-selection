@@ -6,7 +6,7 @@ so it leans on the indexer's overall value, the query-weighted average over all 
 one included: its own value counts in full from FULL_WEIGHT_QUERIES queries, and below that with
 weight n / (n + PRIOR_QUERIES), the overall value making up the rest. Leaning on the other chains
 alone would let 2 small chains swap values. The overall value is also what a chain the indexer
-has no data on and the network-wide scores use.
+has no data on uses.
 """
 
 from __future__ import annotations
