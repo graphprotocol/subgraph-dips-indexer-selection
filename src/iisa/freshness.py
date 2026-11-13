@@ -131,14 +131,19 @@ class PairState(BaseModel):
     def _fill_in_for_an_older_file(self) -> Self:
         """A pair saved before last_counted and recent were kept gets them from the counted
         minutes in its window, each taken as answered at 0, the count every chain starts from
-        when loaded from such a file. A pair that was judged fine then stays fine.
+        when loaded from such a file. A pair saved unmarked with fewer than MIN_COUNTED_MINUTES
+        of them gets passes before them up to that many, so a pair that was fine then stays
+        fine until its own outcomes replace them or RECENT_ANSWERED_MINUTES answered minutes
+        go by. A pair saved marked starts from its own outcomes only.
         """
         counted = sorted((m, outcome) for m, outcome in self.minutes.items() if outcome != "void")
         if "recent" not in self.model_fields_set:
-            self.recent = [
+            own = [
                 RecentOutcome(passed=outcome == "pass", answered=0)
                 for _, outcome in counted[-MIN_COUNTED_MINUTES:]
             ]
+            missing = 0 if self.marked else MIN_COUNTED_MINUTES - len(own)
+            self.recent = [RecentOutcome(passed=True, answered=0) for _ in range(missing)] + own
         if "last_counted" not in self.model_fields_set and counted:
             self.last_counted = counted[-1][0]
         return self

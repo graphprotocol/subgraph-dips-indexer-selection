@@ -8,6 +8,7 @@ from typing import Any, Optional
 import pytest
 
 from iisa.freshness import (
+    RECENT_ANSWERED_MINUTES,
     Check,
     Enforcement,
     FreshnessStore,
@@ -680,9 +681,11 @@ class TestSavedFile:
         assert _pair(reloaded)["window_counted"] == 2
         assert _pair(reloaded)["last_counted_minute"] == minute_text(START + 9)
 
-    def test_an_older_files_pair_with_nothing_counted_in_its_window_is_marked(self, tmp_path):
-        """It counted before, as its daily counts show, but holds no recent outcome, so the
-        first answered minute marks it rather than letting it keep its mark for ever."""
+    def test_an_older_files_pair_with_nothing_counted_in_its_window_is_marked_in_time(
+        self, tmp_path
+    ):
+        """It was fine when saved, so it starts from 5 passes, but its checks stay void, so it
+        is marked once those are over 60 answered minutes old rather than kept fine for ever."""
         saves: list[dict[str, Any]] = []
         store = FreshnessStore()
         for minute in range(START, START + 10):
@@ -692,9 +695,69 @@ class TestSavedFile:
 
         reloaded = _old_file(tmp_path, saves[-1])
         assert _pair(reloaded)["marked"] is False
-        _push(reloaded, START + 21, _check("void"), _check("pass", indexer=OTHER))
+        after = _run(reloaded, ["void"] * RECENT_ANSWERED_MINUTES, start=START + 21)
+        assert _pair(reloaded)["marked"] is False
+        _run(reloaded, ["void"], start=after)
 
         assert _pair(reloaded)["marked"] is True
+
+    def test_an_older_files_pair_refusing_most_payments_stays_pickable(self, tmp_path):
+        """INDEXER refuses 7 of every 10 payments, which are void, and passes the rest, so its
+        window never holds 5 counted minutes, and it was fine when saved. It loads with its 3
+        passes in the window and passes before them up to 5, so it isn't marked after loading.
+        """
+        cycle = ["void", "void", "pass", "void", "void", "void", "pass", "void", "pass", "void"]
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        for offset, outcome in enumerate(["pass"] * 30 + cycle * 3):
+            store.apply(
+                START + offset, [_check(outcome), _check("pass", indexer=OTHER)], saves.append
+            )
+        assert _pair(store)["marked"] is False
+
+        reloaded = _old_file(tmp_path, saves[-1])
+        marks = []
+        for offset, outcome in enumerate(cycle):
+            _push(reloaded, START + 63 + offset, _check(outcome), _check("pass", indexer=OTHER))
+            marks.append(_pair(reloaded)["marked"])
+
+        assert marks == [False] * len(cycle)
+
+    def test_an_older_file_saved_straight_after_a_gateway_outage_marks_nobody(self, tmp_path):
+        """Every check was void for the last 8 minutes before the save, leaving 2 counted
+        minutes in each window, and nobody was marked then, nor while checks pass again."""
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        for minute in range(START, START + 30):
+            store.apply(minute, [_check("pass"), _check("pass", indexer=OTHER)], saves.append)
+        for minute in range(START + 30, START + 38):
+            store.apply(minute, [_check("void"), _check("void", indexer=OTHER)], saves.append)
+        assert store.stale_indexers(CHAIN, [INDEXER, OTHER]) == set()
+
+        reloaded = _old_file(tmp_path, saves[-1])
+        stale = []
+        for minute in range(START + 41, START + 47):
+            _push(reloaded, minute, _check("pass"), _check("pass", indexer=OTHER))
+            stale.append(reloaded.stale_indexers(CHAIN, [INDEXER, OTHER]))
+
+        assert stale == [set()] * 6
+
+    def test_an_older_files_marked_pair_starts_from_its_own_outcomes_only(self, tmp_path):
+        """INDEXER failed until the outage, so it was marked when saved, and only passes added
+        for a pair that was fine could clear it."""
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        for minute in range(START, START + 30):
+            store.apply(minute, [_check("fail"), _check("pass", indexer=OTHER)], saves.append)
+        for minute in range(START + 30, START + 38):
+            store.apply(minute, [_check("void"), _check("void", indexer=OTHER)], saves.append)
+
+        reloaded = _old_file(tmp_path, saves[-1])
+        _push(reloaded, START + 41, _check("void"), _check("pass", indexer=OTHER))
+
+        assert (_pair(reloaded)["recent_counted"], _pair(reloaded)["recent_passed"]) == (2, 0)
+        assert _pair(reloaded)["marked"] is True
+        assert _pair(reloaded, OTHER)["marked"] is False
 
     def test_saved_file_keeps_only_the_window(self):
         saves: list[dict[str, Any]] = []
