@@ -101,8 +101,9 @@ class Settings(BaseSettings):
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
     freshness_file_path: str = "/app/scores/freshness.json"
-    # Chains, comma-separated, on which a stale mark is only recorded and reported. On every
-    # other chain an indexer marked stale isn't picked for new agreements.
+    # Chains, comma-separated, on which a stale mark is only recorded and reported and freshness
+    # isn't weighed. On every other chain an indexer marked stale isn't picked for new
+    # agreements.
     freshness_exempt_chains: Annotated[frozenset[str], NoDecode] = frozenset()
     # How many minutes behind this service's clock a chain's last counted check may be. Past
     # that its marks are too old to trust, and selection there ignores them.
@@ -332,7 +333,8 @@ class ScoreRequest(BaseModel):
 
 class ChainScore(BaseModel):
     """An indexer's weighted score and component scores, prices and freshness included, on one
-    chain. Freshness is left out on a chain whose checks don't yet cover 7 days.
+    chain. Freshness is left out on a chain whose checks don't yet cover 7 days or have stopped
+    counting.
 
     Scored against every indexer that supports the chain and has priced it, as selection does
     before it applies a request's budget, blocklist and expected fees.
@@ -927,6 +929,20 @@ _state = IISAState()
 # =============================================================================
 
 
+# The opt-in list of enforced chains that IISA_FRESHNESS_EXEMPT_CHAINS replaced. Startup warns
+# when it is still set, as whoever set it may expect only the chains it lists to be enforced.
+_RETIRED_ENFORCED_CHAINS = "IISA_FRESHNESS_ENFORCED_CHAINS"
+
+
+def _warn_about_retired_settings(environ: Mapping[str, str]) -> None:
+    if _RETIRED_ENFORCED_CHAINS in environ:
+        logger.warning(
+            "%s is set but no longer read: freshness is enforced on every chain not listed in "
+            "IISA_FRESHNESS_EXEMPT_CHAINS",
+            _RETIRED_ENFORCED_CHAINS,
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """FastAPI lifespan: load settings, init loader + DataManager, recover the
@@ -964,6 +980,8 @@ async def lifespan(_app: FastAPI):
             "IISA_READ_TOKEN is the same as IISA_PUSH_TOKEN, so whoever holds it can push "
             "scores and sync status too. Give readers a token of their own."
         )
+
+    _warn_about_retired_settings(os.environ)
 
     # Initialize providers
     if not _state.initialize(settings):
@@ -1908,15 +1926,31 @@ def _enrich_with_chain_prices(
     return df
 
 
+def _weighed_freshness(chain_id: str) -> Optional[Mapping[str, float]]:
+    """Each indexer's freshness score on ``chain_id``, or None where freshness isn't weighed: on
+    an exempt chain, whose checks are taken as untrustworthy or impossible to pass, on a chain
+    whose checks don't yet cover 7 days, and on one whose last counted check is older than
+    IISA_FRESHNESS_MAX_AGE_MINUTES by this service's clock, which is when enforcement stops
+    trusting its marks too. The scores are worked out at each push, so they stop changing when
+    the prober stops or every check is void. Reads neither through the freshness lock.
+    """
+    scores = _state.freshness.scores_on(chain_id)
+    enforcement = _enforcement()
+    if scores is None or not enforcement.enforced(chain_id):
+        return None
+    if not enforcement.current(_state.freshness.last_counted_minute(chain_id)):
+        return None
+    return scores
+
+
 def _with_chain_freshness(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
     """``history`` with each indexer's freshness score on ``chain_id`` in a freshness column,
-    replacing any it held: 0 for an indexer with no record there, and NaN for everyone on a
-    chain whose checks don't yet cover 7 days, so the weighted score leaves freshness out there
-    rather than scoring everyone 0. Reads the scores worked out after the last push, never the
-    freshness lock.
+    replacing any it held: 0 for an indexer with no record there, and NaN for everyone where
+    _weighed_freshness gives no scores, so the weighted score leaves freshness out there rather
+    than scoring everyone 0.
     """
     df = history.copy()
-    scores = _state.freshness.scores_on(chain_id)
+    scores = _weighed_freshness(chain_id)
     if scores is None or "indexer" not in df.columns:
         df["freshness"] = math.nan
         return df

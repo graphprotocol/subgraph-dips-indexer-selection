@@ -390,10 +390,31 @@ class TestExemptChainsSetting:
 
         assert Settings().freshness_exempt_chains == frozenset()
 
-    def test_the_old_opt_in_setting_is_gone(self, monkeypatch):
-        monkeypatch.setenv("IISA_FRESHNESS_ENFORCED_CHAINS", "amoy")
+    @pytest.mark.parametrize("value", ["amoy", ""])
+    def test_the_old_opt_in_setting_is_gone_with_a_warning_at_startup(
+        self, state, monkeypatch, caplog, value
+    ):
+        """Even set empty, it once meant nothing was enforced, where now every chain is."""
+        monkeypatch.setenv("IISA_FRESHNESS_ENFORCED_CHAINS", value)
+        iisa_http_endpoints.get_settings.cache_clear()
 
+        with caplog.at_level(logging.WARNING, logger="iisa-service"), TestClient(app):
+            pass
+
+        (warning,) = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "IISA_FRESHNESS_ENFORCED_CHAINS" in r.getMessage()
+        ]
+        assert "no longer read" in warning
+        assert "every chain not listed in IISA_FRESHNESS_EXEMPT_CHAINS" in warning
         assert not hasattr(Settings(), "freshness_enforced_chains")
+
+    def test_startup_says_nothing_of_the_old_setting_when_it_is_unset(self, state, caplog):
+        with caplog.at_level(logging.WARNING, logger="iisa-service"), TestClient(app):
+            pass
+
+        assert "IISA_FRESHNESS_ENFORCED_CHAINS" not in caplog.text
 
 
 class TestMaxAgeSetting:
