@@ -160,3 +160,40 @@ class TestRelativeCutOffs:
         ahead = processor._synced_first(candidates)
 
         assert ("C" in set(ahead["indexer"])) is kept_ahead
+
+
+class TestCutOffsWhileFillingWithStale:
+    """Once no fresh candidate is left, the stale ones fill the remaining places but never
+    replace a member. B is the best total the pick at hand can choose from: the best stale
+    candidate for a fill-in, and the best fresh one, of which there is none, for a replacement.
+    """
+
+    @staticmethod
+    def _filling(scores: dict[str, float], group: list[str], stale: list[str], synced=None):
+        processor = _selector(scores, group, synced=synced)
+        processor.stale_indexers = stale
+        processor._filling_with_stale = True
+        return processor
+
+    @pytest.mark.parametrize(("synced_score", "picked"), [(0.241, "C"), (0.239, "D")])
+    def test_a_synced_stale_candidate_needs_60_percent_of_the_best_stale_one(
+        self, synced_score, picked
+    ):
+        """B in the group says it has synced, so C, which says so too, keeps its head start only
+        at 60% of D's 0.40, the best stale candidate, or more."""
+        processor = self._filling(
+            {"A": 0.3, "B": 0.3, "C": synced_score, "D": 0.40},
+            ["A", "B"],
+            stale=["C", "D"],
+            synced={"b", "c"},
+        )
+
+        assert processor._find_best_replacement_or_select_best_indexer() == picked
+
+    def test_a_stale_candidate_never_replaces_a_member(self):
+        """A totals far under 15% of D's, but D is stale, so nothing replaces A."""
+        processor = self._filling(
+            {"A": 0.01, "B": 0.3, "C": 0.3, "D": 0.40}, ["A", "B", "C"], stale=["D"]
+        )
+
+        assert processor._swap_for("A") is None

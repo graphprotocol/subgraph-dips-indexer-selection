@@ -523,12 +523,15 @@ class IndexerSelector:
                 )
                 break  # No more beneficial replacements available
 
-    def _best_candidate_total(self) -> float:
-        """B: the best total among the candidates this request can pick from right now, which
-        scales the cut-offs, or 0 when there is none.
+    def _best_candidate_total(self, candidates: Optional[pd.DataFrame] = None) -> float:
+        """B: the best total among the candidates the pick at hand can choose from, which
+        scales the cut-offs, or 0 when there is none. ``candidates`` are those for an add, which
+        are the stale ones once they fill the places no fresh candidate can. By default they are
+        those a replacement can draw on, which are never stale.
         """
-        pickable = ~self.data["indexer"].isin(self._unpickable_indexers())
-        best = self.data.loc[pickable, "weighted_score"].max()
+        if candidates is None:
+            candidates = self.data[~self.data["indexer"].isin(self._unpickable_indexers())]
+        best = candidates["weighted_score"].max()
         return float(best) if pd.notna(best) else 0.0
 
     def _score_of(self, indexer: IndexerId) -> Optional[float]:
@@ -641,7 +644,7 @@ class IndexerSelector:
             replaced_score = self._score_of(replacing_indexer)
             if replaced_score is None:
                 return
-            margin = REPLACEMENT_MARGIN * self._best_candidate_total()
+            margin = REPLACEMENT_MARGIN * self._best_candidate_total(candidates)
             ahead = ahead[ahead["weighted_score"] > replaced_score + margin]
         self._preferred_on_a_claim.update(
             indexer
@@ -756,7 +759,7 @@ class IndexerSelector:
         ]
         if self._group_has_synced():
             # Already have a synced indexer: threshold applies
-            threshold = MIN_SYNCED_THRESHOLD * self._best_candidate_total()
+            threshold = MIN_SYNCED_THRESHOLD * self._best_candidate_total(candidates)
             return all_synced_candidates[all_synced_candidates["weighted_score"] >= threshold]
         # No synced indexer yet: first one gets in at any score
         return all_synced_candidates

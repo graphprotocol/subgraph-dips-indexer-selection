@@ -98,6 +98,8 @@ A group member can be replaced only when its total is under $0.15 \, B$, and onl
 
 Since $B$ is the best candidate's own total, the best candidate always beats a member under $0.15 \, B$ by more than $0.85 \, B$. The margin therefore matters only when a lower candidate is tried first, as a synced one is. It also means a synced indexer that gets into a group on its claim alone is swapped out in the same selection if its total is under $0.15 \, B$.
 
+On a chain that enforces freshness, a candidate marked stale is passed over while a fresh one is left. Once none is, the stale candidates with the best totals fill the remaining places, and for those picks $B$ is the best stale candidate's total, since they are what the pick can choose from. A stale candidate never replaces a member, so a replacement's $B$ is always the best fresh candidate's total, and with no fresh candidate left nothing is replaced.
+
 ## A worked example
 
 2 indexers on the same chain, with the same success rate and latency:
