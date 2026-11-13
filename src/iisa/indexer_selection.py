@@ -104,12 +104,14 @@ class IndexerSelector:
         optimistic_dips_fees: Optional[dict[str, float]] = None,
         price_ceiling: Optional[float] = None,
         synced_indexers: Optional[set[IndexerId]] = None,
+        stale_indexers: Optional[list[IndexerId]] = None,
     ):
         """Initialize the selector and run scoring for one deployment.
         Non-obvious args: optimistic_dips_fees lowers stake_to_fees for indexers
         that already hold agreements (load-balancing), price_ceiling caps pricing
-        normalisation so one outlier can't compress the rest, and synced_indexers
-        are preferred so queries serve right after acceptance.
+        normalisation so one outlier can't compress the rest, synced_indexers
+        are preferred so queries serve right after acceptance, and stale_indexers
+        are candidates marked stale, picked only for places no other candidate can fill.
         """
         self.data = pd.DataFrame(history)
         self.deployment_id = deployment_id
@@ -122,6 +124,9 @@ class IndexerSelector:
         self.optimistic_dips_fees = optimistic_dips_fees or {}
         self.price_ceiling = price_ceiling
         self.synced_indexers = {s.lower() for s in synced_indexers} if synced_indexers else set()
+        self.stale_indexers = list(stale_indexers or [])
+        # Set once no other candidate is left, so the stale ones may fill the remaining places.
+        self._filling_with_stale = False
         self.current_group: list[IndexerId] = []
         self.initial_group: list[IndexerId] = []
         # Every candidate that could, at some pick, have been chosen ahead of the rest because
@@ -213,7 +218,9 @@ class IndexerSelector:
             len(self.current_group),
         )
 
-        # Normalize metrics and calculate scores
+        # Normalize metrics and calculate scores, keeping the inputs to score again should the
+        # stale candidates have to fill places.
+        self._unscored = self.data.copy()
         self.data = self._normalize_and_score()
 
         if not self.data.empty and "weighted_score" in self.data.columns:
@@ -283,7 +290,8 @@ class IndexerSelector:
         blocked = set(self.indexer_denylist) | set(
             self.declined_indexers.get(self.deployment_id, [])
         )
-        excluded = (self._unpickable_indexers() - set(self.current_group)) | blocked
+        unpickable = self._unpickable_indexers(for_a_fill_in=self._filling_with_stale)
+        excluded = (unpickable - set(self.current_group)) | blocked
         return ~self.data["indexer"].isin(excluded)
 
     def _assign_indexers_to_subgraph(self):
@@ -337,6 +345,10 @@ class IndexerSelector:
                     self.target_size,
                 )
 
+            # With no other candidate left, the stale ones fill what remains.
+            elif self._start_filling_with_stale():
+                continue
+
             # If there are no indexers available, do nothing.
             else:
                 logger.info(
@@ -346,6 +358,29 @@ class IndexerSelector:
                     self.target_size,
                 )
                 break
+
+    def _start_filling_with_stale(self) -> bool:
+        """Let the stale candidates fill the group's remaining places, and score everyone again
+        with them setting each metric's scale, since they are now the ones being compared.
+        False when they already may, or there are none.
+
+        A group short of its target is worth more to the request than a group of fresh
+        indexers only, so a stale candidate gets a place no fresh one can take. It never
+        replaces a member: see _find_best_replacement_or_select_best_indexer.
+        """
+        if self._filling_with_stale or not self.stale_indexers:
+            return False
+        self._filling_with_stale = True
+        self.data = self._unscored.copy()
+        self.data = self._normalize_and_score()
+        logger.info(
+            "deployment=%s no fresh candidate left, group is %d/%d; filling from %d stale",
+            self.deployment_id,
+            len(self.current_group),
+            self.target_size,
+            len(self.stale_indexers),
+        )
+        return True
 
     def _meets_decentralization_requirements(
         self, new_indexer: IndexerId, replacing_indexer: Optional[IndexerId] = None
@@ -544,15 +579,17 @@ class IndexerSelector:
                 return existing_indexer, candidate, candidate_score - current_score
         return None
 
-    def _unpickable_indexers(self) -> set[IndexerId]:
+    def _unpickable_indexers(self, for_a_fill_in: bool = False) -> set[IndexerId]:
         """Indexers this request can't pick: already in the group, on the denylist, with a
-        pending (unaccepted) agreement on any subgraph, or that declined this subgraph.
+        pending (unaccepted) agreement on any subgraph, that declined this subgraph, or marked
+        stale, unless the pick is to fill a place no other candidate can.
         """
         return set(
             self.current_group
             + self.indexer_denylist
             + [indexer for pending in self.pending_agreements.values() for indexer in pending]
             + self.declined_indexers.get(self.deployment_id, [])
+            + ([] if for_a_fill_in else self.stale_indexers)
         )
 
     def preferred_on_a_claim(self) -> list[IndexerId]:
@@ -602,7 +639,9 @@ class IndexerSelector:
         check. prefer_synced, when False, ranks candidates on score alone, as if
         none were synced. Returns the best indexer ID, or None if none qualify.
         """
-        unpickable_indexers = self._unpickable_indexers()
+        # A stale candidate can fill an empty place once no other is left, but never replace.
+        fill_in = self._filling_with_stale and replacing_indexer is None
+        unpickable_indexers = self._unpickable_indexers(for_a_fill_in=fill_in)
         logger.debug(
             "deployment=%s unpickable: %d in_group, %d denylisted, %d pending, %d declined",
             self.deployment_id,

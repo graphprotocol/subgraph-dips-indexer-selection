@@ -202,11 +202,53 @@ def test_stale_group_member_is_scored_as_if_the_chain_were_exempt(state, monkeyp
     assert _scores(size=2, existing=[BEST]) == plain
 
 
-def test_every_candidate_marked_picks_nobody_new(state):
-    _judge(state, {(BEST, CHAIN): "fail", (GOOD, CHAIN): "fail", (FAIR, CHAIN): "no_evidence"})
+ALL_FAIL = {(BEST, CHAIN): "fail", (GOOD, CHAIN): "fail", (FAIR, CHAIN): "no_evidence"}
 
-    assert _select(size=3) == []
-    assert _select(size=3, existing=[FAIR]) == [FAIR]
+
+def test_with_every_candidate_marked_the_best_scorers_fill_the_places(state, caplog):
+    """Dipper needs the number of indexers it asked for, so with no fresh candidate left the
+    places go to the stale ones, best score first, with a warning naming the chain."""
+    _judge(state, ALL_FAIL)
+
+    with caplog.at_level(logging.WARNING, logger="iisa-service"):
+        assert _select(size=2) == [BEST, GOOD]
+
+    (warning,) = [r.getMessage() for r in caplog.records if "marked stale" in r.getMessage()]
+    assert f"chain={CHAIN}" in warning
+    assert "2 of 2" in warning
+
+
+def test_stale_candidates_fill_only_the_places_left_after_the_members(state):
+    _judge(state, ALL_FAIL)
+
+    assert _select(size=3, existing=[FAIR]) == [FAIR, BEST, GOOD]
+    assert _select(size=2, existing=[FAIR]) == [FAIR, BEST]
+
+
+def test_a_fresh_candidate_is_picked_before_any_stale_one(state):
+    """FAIR scores worst, but it is the only fresh candidate."""
+    _judge(state, {(BEST, CHAIN): "fail", (GOOD, CHAIN): "fail", (FAIR, CHAIN): "pass"})
+
+    assert _select(size=1) == [FAIR]
+    assert _select(size=2) == [FAIR, BEST]
+
+
+def test_no_warning_when_fresh_candidates_fill_every_place(state, caplog):
+    _judge(state, ALL_PASS_BUT_BEST)
+
+    with caplog.at_level(logging.WARNING, logger="iisa-service"):
+        assert _select(size=2) == [GOOD, FAIR]
+
+    assert not any("marked stale" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(("best", "group"), [("pass", [BEST]), ("fail", [FAIR])])
+def test_a_stale_candidate_never_replaces_a_member(state, best, group):
+    """FAIR scores far below BEST, so a fresh BEST takes its place; a stale one never does,
+    since the group is already full."""
+    _judge(state, {(BEST, CHAIN): best, (GOOD, CHAIN): "fail", (FAIR, CHAIN): "pass"})
+
+    assert _select(size=1, existing=[FAIR]) == group
 
 
 @pytest.mark.parametrize(("minutes", "picked"), [(56, BEST), (57, GOOD)])
@@ -406,6 +448,18 @@ def test_select_indexers_over_http_leaves_out_the_marked_candidate(state):
 
     assert response.status_code == 200, response.text
     assert [indexer["id"] for indexer in response.json()["indexers"]] == [GOOD]
+
+
+def test_select_indexers_over_http_fills_the_places_with_stale_candidates(state):
+    _judge(state, ALL_FAIL)
+
+    response = TestClient(app).post(
+        "/select-indexers",
+        json={"deployment_id": DEPLOYMENT, "chain_id": CHAIN, "num_candidates": 2},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [indexer["id"] for indexer in response.json()["indexers"]] == [BEST, GOOD]
 
 
 def test_selection_does_not_wait_for_a_push_being_applied(state):

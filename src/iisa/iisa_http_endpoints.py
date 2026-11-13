@@ -23,7 +23,7 @@ import math
 import numbers
 import os
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, partial
@@ -2184,6 +2184,7 @@ def _build_selector(
     request: SelectionRequest,
     enriched_history: pd.DataFrame,
     synced_indexers: set[str],
+    stale_indexers: list[str],
 ) -> IndexerSelector:
     """Construct the IndexerSelector for this request; it selects on construction."""
     # Build existing_agreements dict from request
@@ -2208,6 +2209,7 @@ def _build_selector(
         optimistic_dips_fees=request.optimistic_dips_fees,
         price_ceiling=request.max_grt_per_30_days,
         synced_indexers=cast(set[EthAddressStr], synced_indexers),
+        stale_indexers=cast(list[EthAddressStr], stale_indexers),
     )
 
 
@@ -2390,29 +2392,16 @@ def _stale_candidates(request: SelectionRequest, candidates: pd.DataFrame) -> li
     return stale
 
 
-def _without_stale_candidates(
-    request: SelectionRequest, candidates: pd.DataFrame
-) -> SelectionRequest:
-    """The request with its stale candidates added to the indexers that declined its
-    deployment, which keeps them from being picked and from setting each metric's scale.
-    """
-    stale = _stale_candidates(request, candidates)
-    if not stale:
-        return request
-    declined = dict(request.declined_indexers or {})
-    declined[request.deployment_id] = [*declined.get(request.deployment_id, []), *stale]
-    return request.model_copy(update={"declined_indexers": declined})
-
-
 class _Selection(NamedTuple):
-    """A selection ready to score: the request without its failing members and with its stale
-    candidates ruled out, the candidates' history with this chain's prices, and the indexers
-    that say they have synced the deployment.
+    """A selection ready to score: the request without its failing members, the candidates'
+    history with this chain's prices, the indexers that say they have synced the deployment,
+    and the candidates marked stale, which can only fill places no fresh candidate can.
     """
 
     request: SelectionRequest
     history: pd.DataFrame
     synced: set[str]
+    stale: list[str]
 
 
 def _prepare_selection(request: SelectionRequest) -> Union[_Selection, SelectionResponse]:
@@ -2437,18 +2426,39 @@ def _prepare_selection(request: SelectionRequest) -> Union[_Selection, Selection
 
     # Enrich with the chain's prices, freshness, uptime and success rate for normalization
     enriched_history = _enrich_for_chain(filtered_history, request.chain_id)
-    request = _without_stale_candidates(request, enriched_history)
-    return _Selection(request, enriched_history, _synced_indexers_for(request.deployment_id))
+    stale = _stale_candidates(request, enriched_history)
+    return _Selection(request, enriched_history, _synced_indexers_for(request.deployment_id), stale)
 
 
 def _selection_response(selection: _Selection, processor: IndexerSelector) -> SelectionResponse:
     """The answer for the group the selector settled on, with each member's pricing."""
     request = selection.request
     _log_selection_reasoning(processor, request.deployment_id)
+    _warn_about_stale_picks(request, processor.current_group, selection.stale)
     selected = _build_selected_indexers(
         list(processor.current_group), selection.history, request.chain_id
     )
     return SelectionResponse(deployment_id=request.deployment_id, indexers=selected)
+
+
+def _warn_about_stale_picks(
+    request: SelectionRequest, group: Sequence[str], stale: list[str]
+) -> None:
+    """Warn when places went to candidates marked stale, as they do once no fresh candidate
+    is left, naming the chain so an operator can check its freshness checks."""
+    marked = {indexer.lower() for indexer in stale}
+    picked = [indexer for indexer in group if indexer.lower() in marked]
+    if not picked:
+        return
+    logger.warning(
+        "deployment=%s chain=%s no fresh candidate was left, so %d of %d places went to "
+        "indexers marked stale: %s",
+        request.deployment_id,
+        request.chain_id,
+        len(picked),
+        request.num_candidates,
+        ", ".join(picked),
+    )
 
 
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
@@ -2461,7 +2471,9 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     selection = _prepare_selection(request)
     if isinstance(selection, SelectionResponse):
         return selection
-    processor = _build_selector(selection.request, selection.history, selection.synced)
+    processor = _build_selector(
+        selection.request, selection.history, selection.synced, selection.stale
+    )
     return _selection_response(selection, processor)
 
 
@@ -2472,7 +2484,9 @@ async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionRe
     selection = _prepare_selection(request)
     if isinstance(selection, SelectionResponse):
         return selection
-    processor = _build_selector(selection.request, selection.history, selection.synced)
+    processor = _build_selector(
+        selection.request, selection.history, selection.synced, selection.stale
+    )
     if _state.sync_checker is not None:
         processor = await _with_claims_checked(selection, processor, _state.sync_checker)
     return _selection_response(selection, processor)
@@ -2507,7 +2521,9 @@ async def _with_claims_checked(
     members = {indexer.lower() for indexer in processor.initial_group}
     claims = {indexer.lower() for indexer in selection.synced}
     confirmed = set(asked) - unconfirmed.keys()
-    return _build_selector(request, selection.history, (claims & members) | confirmed)
+    return _build_selector(
+        request, selection.history, (claims & members) | confirmed, selection.stale
+    )
 
 
 def _log_claim_checks(
