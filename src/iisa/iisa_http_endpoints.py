@@ -2208,6 +2208,7 @@ def _build_selector(
         optimistic_dips_fees=request.optimistic_dips_fees,
         price_ceiling=request.max_grt_per_30_days,
         synced_indexers=cast(set[EthAddressStr], synced_indexers),
+        entity_price_ceiling=request.max_grt_per_billion_entities_per_30_days,
     )
 
 
