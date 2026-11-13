@@ -22,7 +22,6 @@ import logging
 import math
 import numbers
 import os
-import threading
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -61,6 +60,7 @@ from .freshness import (
     minute_text,
 )
 from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
+from .log_limit import LogLimit
 from .score_loader import (
     STALE_SCORES_CRITICAL_HOURS,
     DataManager,
@@ -663,38 +663,6 @@ logger = logging.getLogger("iisa-service")
 LAPSE_WARNING_INTERVAL_MINUTES = 10
 
 
-class _PerChainLimit:
-    """Lets a log line through at most once per chain every LAPSE_WARNING_INTERVAL_MINUTES,
-    counting those held back in between, until the chain is reset, which starts it afresh. It
-    has a lock of its own, so selections running on different threads can share it.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._last: dict[str, int] = {}
-        self._held: dict[str, int] = {}
-
-    def allow(self, chain: str, now: int) -> Optional[int]:
-        """How many lines on ``chain`` were held back since the last one let through, when a
-        line in the minute ``now`` may be logged, or None when it is held back too.
-        """
-        with self._lock:
-            last = self._last.get(chain)
-            if last is not None and now - last < LAPSE_WARNING_INTERVAL_MINUTES:
-                self._held[chain] = self._held.get(chain, 0) + 1
-                return None
-            self._last[chain] = now
-            return self._held.pop(chain, 0)
-
-    def reset(self, chain: str) -> None:
-        """Forget ``chain``'s last line and the count held back since, so its next line goes
-        through and counts only what is held back after it.
-        """
-        with self._lock:
-            self._last.pop(chain, None)
-            self._held.pop(chain, None)
-
-
 class IISAState:
     """
     Holds the IISA service state including initialized providers and cached data.
@@ -707,7 +675,7 @@ class IISAState:
         self._sync_status: Optional["SyncStatusData"] = None
         self.sync_checker: Optional[SyncClaimChecker] = None
         self.freshness = FreshnessStore()
-        self.lapse_warnings = _PerChainLimit()
+        self.lapse_warnings = LogLimit(LAPSE_WARNING_INTERVAL_MINUTES)
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
