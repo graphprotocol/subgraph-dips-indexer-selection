@@ -779,9 +779,9 @@ def _normalize_metrics(
 ) -> pd.DataFrame:
     """Normalise each metric to [0, 1], where 1 is best. The 2 ceilings, when given, replace the
     observed max for the 2 prices; scale_rows, when given, are the rows that set each metric's
-    best and worst. A missing or unreadable metric scores 0, except those in
-    _LEFT_OUT_WHEN_MISSING, which stay missing. Norm columns outside _PRECOMPUTED_NORM_COLUMNS
-    are recomputed; those inside score 0 when outside [0, 1].
+    best and worst. A missing metric scores 0, except those in _LEFT_OUT_WHEN_MISSING, which stay
+    missing; an unreadable one, such as text, always scores 0. Norm columns outside
+    _PRECOMPUTED_NORM_COLUMNS are recomputed; those inside score 0 when outside [0, 1].
     """
     latency, precomputed = _latency_metric(merged)
     # (norm column, source column, normaliser), in the order the columns are added.
