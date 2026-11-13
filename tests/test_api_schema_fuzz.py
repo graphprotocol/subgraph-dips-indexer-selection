@@ -172,8 +172,8 @@ def _start_from_seeded_state() -> None:
 
 @pytest.fixture(scope="module")
 def app_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
-    """The push token, cache paths and freshness-enforced chain the app reads, set for the
-    whole module, with the cache files in a temporary folder. Puts the app's state back after.
+    """The push token, cache paths and freshness-exempt chain the app reads, set for the whole
+    module, with the cache files in a temporary folder. Puts the app's state back after.
     """
     cache_dir = tmp_path_factory.mktemp("iisa-cache")
     with pytest.MonkeyPatch.context() as mp:
@@ -181,7 +181,7 @@ def app_settings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
         mp.delenv("IISA_REQUIRE_PUSH_TOKEN", raising=False)
         mp.setenv("IISA_SYNC_STATUS_FILE_PATH", str(cache_dir / "sync_status.json"))
         mp.setenv("IISA_FRESHNESS_FILE_PATH", str(cache_dir / "freshness.json"))
-        mp.setenv("IISA_FRESHNESS_ENFORCED_CHAINS", CHAIN)
+        mp.setenv("IISA_FRESHNESS_EXEMPT_CHAINS", OTHER_CHAIN)
         mp.setattr(score_loader, "SCORES_FILE_PATH", str(cache_dir / "indexer_scores.json"))
         iisa_http_endpoints.get_settings.cache_clear()
         try:

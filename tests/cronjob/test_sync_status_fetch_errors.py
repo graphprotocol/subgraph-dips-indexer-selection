@@ -20,6 +20,10 @@ from sync_status_fetcher import (  # noqa: E402
     run_fetch_cycle,
 )
 
+# Some of these tests serve replies from a server on this machine, which IISA would refuse to
+# call as an indexer.
+pytestmark = pytest.mark.usefixtures("local_indexers_allowed")
+
 
 def _session_returning(body):
     """A session whose POST answers 200 with the given raw bytes, or the given value as JSON."""

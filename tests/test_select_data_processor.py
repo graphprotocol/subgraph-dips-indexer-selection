@@ -13,7 +13,8 @@ from iisa.indexer_selection import (
     _calculate_weighted_scores,
     _normalize_generic,
     _normalize_metrics,
-    _normalize_uptime_and_success_rate,
+    _normalize_success_rate,
+    _normalize_uptime,
 )
 
 
@@ -927,7 +928,8 @@ class TestOptimisticDipsFees:
 
 
 class TestUptimeAndSuccessRateScaling:
-    """Selection scores uptime and success rate against 97% of the best candidate."""
+    """Selection scores uptime and success rate on each indexer's own share, raised to the 6th
+    power, with no reference to the other candidates."""
 
     def test_selector_ignores_pre_scaled_uptime_and_success_rate(self):
         history = pd.DataFrame(
@@ -946,8 +948,48 @@ class TestUptimeAndSuccessRateScaling:
         processor = IndexerSelector(history=history, deployment_id=DeploymentId("test_subgraph"))
 
         data = processor.data.set_index("indexer")
-        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.5, 0.0])
-        assert list(data["norm_success_rate"]) == pytest.approx([1.0, 0.5, 0.0])
+        shaped = [1.0, 0.985**6, 0.9**6]
+        assert list(data["norm_uptime_score"]) == pytest.approx(shaped)
+        assert list(data["norm_success_rate"]) == pytest.approx(shaped)
+
+    @pytest.mark.parametrize(("share", "score"), [(1.0, 1.0), (0.9, 0.531), (0.8, 0.262)])
+    def test_a_share_scores_its_6th_power(self, share, score):
+        uptime = _normalize_uptime(pd.Series([share * 100]))
+        success = _normalize_success_rate(pd.Series([share]))
+
+        assert uptime.tolist() == pytest.approx([score], abs=5e-4)
+        assert success.tolist() == pytest.approx([score], abs=5e-4)
+
+    def test_a_score_does_not_change_when_a_better_candidate_joins(self):
+        def scores(uptime: list[float], status: list[float]) -> pd.DataFrame:
+            count = len(uptime)
+            history = pd.DataFrame(
+                {
+                    "indexer": ["B", "C", "A"][:count],
+                    "destination_loc": ["loc2", "loc3", "loc1"][:count],
+                    "org": ["org2", "org3", "org1"][:count],
+                    "% up_x": uptime,
+                    "average_status": status,
+                }
+            )
+            selector = IndexerSelector(history=history, deployment_id=DeploymentId("sg"))
+            return selector.data.set_index("indexer")[["norm_uptime_score", "norm_success_rate"]]
+
+        before = scores([90.0, 80.0], [0.9, 0.8])
+        after = scores([90.0, 80.0, 100.0], [0.9, 0.8, 1.0])
+
+        pd.testing.assert_frame_equal(after.loc[["B", "C"]], before)
+
+    @pytest.mark.parametrize(
+        ("uptime", "status", "score"),
+        [(-5.0, -0.1, 0.0), (250.0, 2.5, 1.0), (np.nan, np.nan, 0.0)],
+        ids=["below-0", "above-1", "missing"],
+    )
+    def test_a_share_outside_0_to_1_is_clipped_and_a_missing_one_scores_0(
+        self, uptime, status, score
+    ):
+        assert _normalize_uptime(pd.Series([uptime])).tolist() == [score]
+        assert _normalize_success_rate(pd.Series([status])).tolist() == [score]
 
 
 class TestScaleSetByPickableIndexers:
@@ -973,21 +1015,21 @@ class TestScaleSetByPickableIndexers:
         ],
         ids=["blocked", "declined", "pending"],
     )
-    def test_unpickable_indexer_does_not_set_the_uptime_bar(self, exclusion):
-        """A at 100% can't be picked, so B at 95% is the best and C halfway to the cutoff."""
-        history = self._history(**{"% up_x": [100.0, 95.0, 93.575]})
+    def test_unpickable_indexer_does_not_set_the_scale(self, exclusion):
+        """A at 100 can't be picked, so B at 10 is the best and C at 5 the worst."""
+        history = self._history(stake_to_fees=[100.0, 10.0, 5.0])
 
         processor = IndexerSelector(
             history=history, deployment_id=DeploymentId("test_subgraph"), **exclusion
         )
 
-        # A sits above the bar B sets, so it is clipped to 1.
+        # A sits above the best B sets, so it is clipped to 1.
         data = processor.data.set_index("indexer")
-        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 1.0, 0.5])
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 1.0, 0.0])
 
-    def test_group_member_still_sets_the_uptime_bar(self):
-        """A is already in the group, so its 100% stays the bar the candidates are held to."""
-        history = self._history(**{"% up_x": [100.0, 95.0, 93.575]})
+    def test_group_member_still_sets_the_scale(self):
+        """A is already in the group, so its 100 stays the best the candidates are held to."""
+        history = self._history(stake_to_fees=[100.0, 10.0, 5.0])
 
         processor = IndexerSelector(
             history=history,
@@ -996,7 +1038,7 @@ class TestScaleSetByPickableIndexers:
         )
 
         data = processor.data.set_index("indexer")
-        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.0, 0.0])
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 5 / 95, 0.0])
 
     @pytest.mark.parametrize(
         "exclusion",
@@ -1006,9 +1048,9 @@ class TestScaleSetByPickableIndexers:
         ],
         ids=["blocked", "declined"],
     )
-    def test_blocked_group_member_does_not_set_the_uptime_bar(self, exclusion):
-        """A is in the group but blocked, so B's 95% is the bar, not A's 100%."""
-        history = self._history(**{"% up_x": [100.0, 95.0, 93.575]})
+    def test_blocked_group_member_does_not_set_the_scale(self, exclusion):
+        """A is in the group but blocked, so B's 10 is the best, not A's 100."""
+        history = self._history(stake_to_fees=[100.0, 10.0, 5.0])
 
         processor = IndexerSelector(
             history=history,
@@ -1018,7 +1060,7 @@ class TestScaleSetByPickableIndexers:
         )
 
         data = processor.data.set_index("indexer")
-        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 1.0, 0.5])
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 1.0, 0.0])
 
     def test_zero_fee_candidates_keep_full_stake_to_fees_marks(self):
         """With only zero-fee indexers left to pick, they still score 1.0 (maximum capacity)."""
@@ -1060,7 +1102,7 @@ class TestScaleSetByPickableIndexers:
         assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 1.0, 0.0])
 
     def test_scales_against_everyone_when_no_indexer_can_be_picked(self):
-        history = self._history(**{"% up_x": [100.0, 95.0, 93.575]})
+        history = self._history(stake_to_fees=[100.0, 10.0, 5.0])
 
         processor = IndexerSelector(
             history=history,
@@ -1069,7 +1111,7 @@ class TestScaleSetByPickableIndexers:
         )
 
         data = processor.data.set_index("indexer")
-        assert list(data["norm_uptime_score"]) == pytest.approx([1.0, 0.0, 0.0])
+        assert list(data["norm_stake_to_fees"]) == pytest.approx([1.0, 5 / 95, 0.0])
 
     def test_unreadable_value_scores_zero_without_moving_the_pickable_scale(self):
         """D's text scores 0 and blocked A sets nothing, so B and C alone set the scale."""
@@ -1219,6 +1261,7 @@ class TestNormalizeMetrics:
                 "average_status": [0, 1, 50, 75.7575, 99.9],
                 "base_price_per_epoch": [10, 200, 300, 400.457, 1000],
                 "price_per_entity": [0.1, 0.2, 0.3, 0.4, 0.5],
+                "freshness": [0.0, 0.25, 0.5, 0.75, 1.0],
                 "other_column": ["A", 1, "B", 12.12, np.nan],
             }
         )
@@ -1236,6 +1279,7 @@ class TestNormalizeMetrics:
             "average_status",
             "base_price_per_epoch",
             "price_per_entity",
+            "freshness",
             "other_column",
             # New columns
             "norm_lat_lin_reg_coefficient",
@@ -1244,6 +1288,7 @@ class TestNormalizeMetrics:
             "norm_success_rate",
             "norm_base_price_per_epoch",
             "norm_price_per_entity",
+            "norm_freshness",
         ]
         for col in expected_columns:
             assert col in result.columns
@@ -1256,6 +1301,7 @@ class TestNormalizeMetrics:
             "norm_success_rate",
             "norm_base_price_per_epoch",
             "norm_price_per_entity",
+            "norm_freshness",
         ]
         for col in normalized_columns:
             assert result[col].between(0, 1).all()
@@ -1277,24 +1323,22 @@ class TestNormalizeMetrics:
 
         assert result.tolist() == pytest.approx([0.0, 0.5, 1.0, 1.0, 0.0])
 
-    def test_normalize_uptime_and_success_rate(self):
-        # Test the normalize_uptime_and_success_rate function
+    def test_normalize_uptime(self):
         series = pd.Series([0, 12.121212, 98, 99, 100])
-        result = _normalize_uptime_and_success_rate(series)
-        assert result.max() == 1
-        assert result.min() == 0
-        assert len(result) == len(series)
+        result = _normalize_uptime(series)
+        assert result.tolist() == pytest.approx([0.0, 0.12121212**6, 0.98**6, 0.99**6, 1.0])
 
-    def test_normalize_uptime_and_success_rate_scores_missing_value_zero(self):
+    def test_normalize_uptime_and_success_rate_score_a_missing_value_zero(self):
         """A missing value scores 0, not full marks, and leaves the others unchanged."""
-        series = pd.Series([100, np.nan, 98.5, 90])
+        result = _normalize_uptime(pd.Series([100, np.nan, 98.5, 90]))
 
-        result = _normalize_uptime_and_success_rate(series)
-
-        assert result.tolist() == pytest.approx([1.0, 0.0, 0.5, 0.0])
+        assert result.tolist() == pytest.approx([1.0, 0.0, 0.985**6, 0.9**6])
+        assert _normalize_success_rate(pd.Series([np.nan, 0.9])).tolist() == pytest.approx(
+            [0.0, 0.9**6]
+        )
 
     def test_pre_scaled_uptime_and_success_rate_are_rescored_from_raw_values(self):
-        """The CronJob's min-max copies don't override the 97%-of-best scaling."""
+        """The CronJob's min-max copies don't override the service's own scoring."""
         # Arrange: the shape the score loader hands the selector.
         df = pd.DataFrame(
             {
@@ -1311,16 +1355,15 @@ class TestNormalizeMetrics:
         result = _normalize_metrics(df)
 
         # Assert: uptime and success rate rescored, latency and stake_to_fees kept.
-        assert result["norm_uptime_score"].tolist() == pytest.approx([1.0, 0.5, 0.0])
-        assert result["norm_success_rate"].tolist() == pytest.approx([1.0, 0.5, 0.0])
+        assert result["norm_uptime_score"].tolist() == pytest.approx([1.0, 0.985**6, 0.9**6])
+        assert result["norm_success_rate"].tolist() == pytest.approx([1.0, 0.985**6, 0.9**6])
         assert result["norm_lat_lin_reg_coefficient"].tolist() == [0.2, 0.4, 0.6]
         assert result["norm_stake_to_fees"].tolist() == [0.5, 0.5, 0.5]
 
     def test_normalize_uptime_and_success_rate_all_zero_scores_zero(self):
-        """When the best is 0 every indexer scores 0, not full marks."""
-        result = _normalize_uptime_and_success_rate(pd.Series([0.0, 0.0]))
-
-        assert result.tolist() == [0.0, 0.0]
+        """When every indexer is at 0 each scores 0, not full marks."""
+        assert _normalize_uptime(pd.Series([0.0, 0.0])).tolist() == [0.0, 0.0]
+        assert _normalize_success_rate(pd.Series([0.0, 0.0])).tolist() == [0.0, 0.0]
 
     def test_empty_dataframe(self, sample_df):
         # Test with an empty DataFrame
@@ -1370,12 +1413,12 @@ class TestNormalizeMetrics:
                 )
 
     def test_negative_values(self, sample_df):
-        # Test with negative values (7 columns)
-        sample_df.loc[0] = [-1, -1, -1, -1, -1, -1, -1]
-        sample_df.loc[1] = [-100, -50, -25, -10, -5, -1, -1]
-        sample_df.loc[2] = [0, 0, 0, 0, 0, 0, 0]
-        sample_df.loc[3] = [1, 1, 1, 1, 1, 1, 1]
-        sample_df.loc[4] = [-1000, 0, -500, 500, -250, 250, 250]
+        # Test with negative values (8 columns)
+        sample_df.loc[0] = [-1, -1, -1, -1, -1, -1, -1, -1]
+        sample_df.loc[1] = [-100, -50, -25, -10, -5, -1, -1, -1]
+        sample_df.loc[2] = [0, 0, 0, 0, 0, 0, 0, 0]
+        sample_df.loc[3] = [1, 1, 1, 1, 1, 1, 1, 1]
+        sample_df.loc[4] = [-1000, 0, -500, 500, -250, 250, 250, 250]
 
         # Compute result
         result = _normalize_metrics(sample_df)

@@ -38,9 +38,9 @@ spec:
             - name: health
               containerPort: 9091
               protocol: TCP
-          # Each environment sets the prober's FRESHNESS_* values here, as gateways and payers differ
-          # between networks; its API key is read from a secret below. The prober is off unless
-          # the map sets FRESHNESS_PROBE_ENABLED to true; a value under env below would override it.
+          # Each environment sets the prober's FRESHNESS_* values here, as gateways differ between
+          # networks; its API key is read from a secret below. The prober is off unless the map
+          # sets FRESHNESS_PROBE_ENABLED to true; a value under env below would override it.
           envFrom:
             - configMapRef:
                 name: iisa-redpanda-config

@@ -1,5 +1,5 @@
 """Tests for the 2 rules that keep an indexer from being marked down for something that isn't its
-fault: refused payments judged by the gateway's escrow, and subgraphs broken for every indexer.
+fault: refused payments, which are void, and subgraphs broken for every indexer.
 The gateway, the network subgraph and the push to IISA are all fakes."""
 
 import asyncio
@@ -32,15 +32,11 @@ from freshness_rules import (  # noqa: E402
     GatewayUnreachable,
     Judgement,
     Targets,
-    escrow_is_funded,
     judge,
 )
 
 FAKE_KEY = "fake-freshness-key-0000"
-PAYER = "0x" + "9" * 40
-CONFIG = FreshnessConfig(
-    gateway_url="https://gateway.example.com/api", api_key=FAKE_KEY, gateway_payers=(PAYER,)
-)
+CONFIG = FreshnessConfig(gateway_url="https://gateway.example.com/api", api_key=FAKE_KEY)
 # 2026-11-10T22:31:00Z
 MINUTE = 1_794_349_860.0
 CHAIN = "mainnet"
@@ -166,11 +162,10 @@ def _outcomes(payload):
     return {(o["indexer"], o["chain"]): (o["outcome"], o["reason"]) for o in payload["outcomes"]}
 
 
-def _targets(eligible, escrow_funded=None):
+def _targets(eligible):
     return Targets(
         pairs=tuple(sorted(eligible)),
         eligible={(indexer, CHAIN): deployments for (indexer, _), deployments in eligible.items()},
-        escrow_funded=escrow_funded or {},
     )
 
 
@@ -179,62 +174,46 @@ def _targets(eligible, escrow_funded=None):
 # ---------------------------------------------------------------------------
 
 
-def _escrow_account(balance, thawing="0"):
-    return {
-        "payer": {"id": PAYER},
-        "collector": "0x1",
-        "balance": balance,
-        "totalAmountThawing": thawing,
-    }
-
-
-ESCROWS = {
-    "funded": ([_escrow_account("1000")], ("fail", "payment_refused")),
-    "empty": ([_escrow_account("0")], ("void", "escrow_empty")),
-    "fully thawing": ([_escrow_account("1000", "1000")], ("void", "escrow_empty")),
-    "unknown": (None, ("fail", "payment_refused")),
+# Who refuses, and how the others answer, in the same minute.
+REFUSALS = {
+    "alone": ({A}, {}),
+    "while others answer fresh": ({A}, {(S, B): FRESH, (S, J1): FRESH}),
+    "while most indexers refuse at once": ({A, B, J1}, {}),
 }
 
 
 @pytest.mark.parametrize("status", [400, 402])
-@pytest.mark.parametrize("escrow", list(ESCROWS))
-async def test_a_refused_payment_is_judged_by_the_gateways_escrow(escrow, status):
-    accounts, expected = ESCROWS[escrow]
-    funded = {} if accounts is None else {A: escrow_is_funded(accounts, {PAYER})}
+@pytest.mark.parametrize("case", list(REFUSALS))
+async def test_a_refused_payment_is_void_whatever_else_is_known(case, status):
+    """The indexer may be owed more than the gateway's escrow holds, which IISA can't see, so a
+    refusal never counts against it."""
+    refusing, others = REFUSALS[case]
     clock = FakeClock(MINUTE)
-    gateway = FakeGateway(clock, {(S, A): _refused(A, status)})
-    pushed = []
-
-    await _prober(clock, gateway, _targets({(A, CHAIN): (S,)}, funded), pushed).run_minute(MINUTE)
-
-    assert _outcomes(pushed[0]) == {(A, CHAIN): expected}
-
-
-async def test_funded_refusals_are_still_void_when_most_indexers_refuse_at_once():
-    indexers = [A, B, J1]
-    clock = FakeClock(MINUTE)
-    gateway = FakeGateway(clock, {(S, i): _refused(i, 402) for i in indexers})
-    targets = _targets({(i, CHAIN): (S,) for i in indexers}, dict.fromkeys(indexers, True))
+    replies = {**{(S, i): _refused(i, status) for i in refusing}, **others}
+    gateway = FakeGateway(clock, replies)
+    targets = _targets({(i, CHAIN): (S,) for _, i in replies})
     pushed = []
 
     await _prober(clock, gateway, targets, pushed).run_minute(MINUTE)
 
-    assert set(_outcomes(pushed[0]).values()) == {("void", "general_fault")}
-    assert {o["detail"].split(":")[0] for o in pushed[0]["outcomes"]} == {"payment_refused"}
+    outcomes = _outcomes(pushed[0])
+    assert {outcomes[(i, CHAIN)] for i in refusing} == {("void", "payment_refused")}
+    assert all(outcomes[(i, CHAIN)] == ("pass", None) for _, i in others)
 
 
-async def test_an_empty_escrow_is_logged_once_per_interval_naming_the_indexer(caplog):
+async def test_refused_payments_are_a_warning_once_per_interval_for_each_indexer(caplog):
     clock = FakeClock(MINUTE)
-    gateway = FakeGateway(clock, {(S, A): _refused(A, 402)})
-    prober = _prober(clock, gateway, _targets({(A, CHAIN): (S,)}, {A: False}), [])
+    gateway = FakeGateway(clock, {(S, A): _refused(A, 402), (S, B): _refused(B, 400)})
+    prober = _prober(clock, gateway, _targets({(A, CHAIN): (S,), (B, CHAIN): (S,)}), [])
 
-    with caplog.at_level(logging.ERROR, logger="freshness_prober"):
+    with caplog.at_level(logging.WARNING, logger="freshness_prober"):
         for minute in range(3):
             await prober.run_minute(MINUTE + 60 * minute)
 
-    errors = [r.getMessage() for r in caplog.records if "escrow" in r.getMessage()]
-    assert len(errors) == 1
-    assert A in errors[0]
+    refusals = [r for r in caplog.records if "refuses the gateway's payments" in r.getMessage()]
+    assert [r.levelno for r in refusals] == [logging.WARNING] * 2
+    for indexer in (A, B):
+        assert sum(indexer in r.getMessage() for r in refusals) == 1
 
 
 # ---------------------------------------------------------------------------

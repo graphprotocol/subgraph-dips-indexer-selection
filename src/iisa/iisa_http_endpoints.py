@@ -22,11 +22,12 @@ import logging
 import math
 import numbers
 import os
+import threading
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, partial
-from typing import Annotated, Any, Literal, NamedTuple, Optional, Self, Union, cast
+from typing import Annotated, Any, Literal, NamedTuple, Optional, Self, TypeGuard, Union, cast
 
 import pandas as pd
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
@@ -48,8 +49,10 @@ from pydantic import (
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from . import score_columns as cols
 from .freshness import (
     HISTORY_DAYS,
+    MINUTES_PER_DAY,
     Check,
     Enforcement,
     FreshnessStore,
@@ -100,11 +103,13 @@ class Settings(BaseSettings):
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
     freshness_file_path: str = "/app/scores/freshness.json"
-    # Chains, comma-separated, on which an indexer marked stale isn't picked for new
-    # agreements. Elsewhere the mark is only recorded and reported.
-    freshness_enforced_chains: Annotated[frozenset[str], NoDecode] = frozenset()
-    # How many minutes behind this service's clock an enforced chain's last counted check may
-    # be. Past that its marks are too old to trust, and selection there ignores them.
+    # Chains, comma-separated, on which a stale mark is only recorded and reported and freshness
+    # isn't weighed. On every other chain an indexer marked stale isn't picked for new
+    # agreements.
+    freshness_exempt_chains: Annotated[frozenset[str], NoDecode] = frozenset()
+    # How many minutes behind this service's clock a chain's last answered minute, the last in
+    # which a check there passed or failed, may be. Past that its marks are too old to trust,
+    # and selection there ignores them and leaves freshness out.
     freshness_max_age_minutes: int = Field(default=60, ge=1)
     # Bearer token for pushing scores and sync status, also accepted on every read.
     # /health and /select-indexers take no token. When it is unset, a WARNING is
@@ -159,7 +164,7 @@ class Settings(BaseSettings):
             raise ValueError("IISA_SYNC_CHECK_GATEWAY_URL must start with http:// or https://")
         return self
 
-    @field_validator("freshness_enforced_chains", mode="before")
+    @field_validator("freshness_exempt_chains", mode="before")
     @classmethod
     def _split_chains(cls, value: Any) -> Any:
         if isinstance(value, str):
@@ -330,7 +335,9 @@ class ScoreRequest(BaseModel):
 
 
 class ChainScore(BaseModel):
-    """An indexer's weighted score and component scores, prices included, on one chain.
+    """An indexer's weighted score and component scores, prices and freshness included, on one
+    chain. Freshness is left out on a chain whose checks don't yet cover 7 days or have stopped
+    counting.
 
     Scored against every indexer that supports the chain and has priced it, as selection does
     before it applies a request's budget, blocklist and expected fees.
@@ -345,7 +352,8 @@ class ScoreResponse(BaseModel):
     Response for the /get-score endpoint.
 
     weighted_score and components compare the indexer with every loaded indexer and leave out
-    prices, which depend on the chain. chains has the full score for each chain it has priced.
+    prices and freshness, which depend on the chain. chains has the full score for each chain
+    it has priced.
     """
 
     indexer_id: str
@@ -410,9 +418,9 @@ class WeightedScoresResponse(BaseModel):
 
 
 class DipsIndexersResponse(BaseModel):
-    """Response for GET /dips-indexers: the indexers offering DIPs on the chain. Where freshness
-    is enforced there, selection also leaves out the ones marked stale. ``computed_at`` mirrors
-    the push so callers can reject an out-of-date snapshot. Example::
+    """Response for GET /dips-indexers: the indexers offering DIPs on the chain. Unless the chain
+    is exempt from freshness, selection also leaves out the ones marked stale. ``computed_at``
+    mirrors the push so callers can reject an out-of-date snapshot. Example::
 
         {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2, "indexers": ["0xaa", "0xbb"]}
     """
@@ -578,7 +586,10 @@ class FreshnessLastCheck(BaseModel):
 
 class FreshnessPair(BaseModel):
     """An indexer's freshness on 1 chain. judged is false when fewer than 5 of the last 10
-    minutes counted, and marked is then the mark carried over.
+    minutes counted. marked then comes from its last 5 counted checks, recent_passed of the
+    recent_counted no more than 60 of the chain's answered minutes old: it is unmarked only when
+    all 5 are that recent and at least 3 passed. An indexer that never counted keeps its mark.
+    last_counted_minute is null until one of its checks counts.
     """
 
     marked: bool
@@ -586,20 +597,25 @@ class FreshnessPair(BaseModel):
     window_passed: int
     window_counted: int
     last: FreshnessLastCheck
+    last_counted_minute: Optional[str] = None
+    recent_passed: int = 0
+    recent_counted: int = 0
     passed_28d: int
     counted_28d: int
     share_28d: Optional[float] = None
 
 
 class FreshnessChain(BaseModel):
-    """Freshness on 1 chain, by indexer. enforced says the chain is listed as enforced, and
-    enforcing that a check there also counted recently enough for a marked indexer to be
-    left out of new agreements. last_counted_minute is null when no check there has counted.
+    """Freshness on 1 chain, by indexer. enforced says the chain isn't exempt, and enforcing
+    that a check there also passed or failed recently enough, at last_answered_minute, for a
+    marked indexer to be left out of new agreements. last_counted_minute is the last minute a
+    check there counted, no evidence included. Each is null when no such check is on record.
     """
 
     enforced: bool = False
     enforcing: bool = False
     last_counted_minute: Optional[str] = None
+    last_answered_minute: Optional[str] = None
     indexers: dict[str, FreshnessPair] = {}
 
 
@@ -641,6 +657,44 @@ logging.basicConfig(
 logger = logging.getLogger("iisa-service")
 
 
+# The warning that freshness isn't enforced on a chain whose checks have stopped passing or
+# failing is logged at most once per chain in this many minutes of the service's clock, since a
+# prober that is down or off would otherwise log 1 on every selection for up to 28 days.
+LAPSE_WARNING_INTERVAL_MINUTES = 10
+
+
+class _PerChainLimit:
+    """Lets a log line through at most once per chain every LAPSE_WARNING_INTERVAL_MINUTES,
+    counting those held back in between, until the chain is reset, which starts it afresh. It
+    has a lock of its own, so selections running on different threads can share it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last: dict[str, int] = {}
+        self._held: dict[str, int] = {}
+
+    def allow(self, chain: str, now: int) -> Optional[int]:
+        """How many lines on ``chain`` were held back since the last one let through, when a
+        line in the minute ``now`` may be logged, or None when it is held back too.
+        """
+        with self._lock:
+            last = self._last.get(chain)
+            if last is not None and now - last < LAPSE_WARNING_INTERVAL_MINUTES:
+                self._held[chain] = self._held.get(chain, 0) + 1
+                return None
+            self._last[chain] = now
+            return self._held.pop(chain, 0)
+
+    def reset(self, chain: str) -> None:
+        """Forget ``chain``'s last line and the count held back since, so its next line goes
+        through and counts only what is held back after it.
+        """
+        with self._lock:
+            self._last.pop(chain, None)
+            self._held.pop(chain, None)
+
+
 class IISAState:
     """
     Holds the IISA service state including initialized providers and cached data.
@@ -653,6 +707,7 @@ class IISAState:
         self._sync_status: Optional["SyncStatusData"] = None
         self.sync_checker: Optional[SyncClaimChecker] = None
         self.freshness = FreshnessStore()
+        self.lapse_warnings = _PerChainLimit()
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -924,6 +979,20 @@ _state = IISAState()
 # =============================================================================
 
 
+# The opt-in list of enforced chains that IISA_FRESHNESS_EXEMPT_CHAINS replaced. Startup warns
+# when it is still set, as whoever set it may expect only the chains it lists to be enforced.
+_RETIRED_ENFORCED_CHAINS = "IISA_FRESHNESS_ENFORCED_CHAINS"
+
+
+def _warn_about_retired_settings(environ: Mapping[str, str]) -> None:
+    if _RETIRED_ENFORCED_CHAINS in environ:
+        logger.warning(
+            "%s is set but no longer read: freshness is enforced on every chain not listed in "
+            "IISA_FRESHNESS_EXEMPT_CHAINS",
+            _RETIRED_ENFORCED_CHAINS,
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """FastAPI lifespan: load settings, init loader + DataManager, recover the
@@ -961,6 +1030,8 @@ async def lifespan(_app: FastAPI):
             "IISA_READ_TOKEN is the same as IISA_PUSH_TOKEN, so whoever holds it can push "
             "scores and sync status too. Give readers a token of their own."
         )
+
+    _warn_about_retired_settings(os.environ)
 
     # Initialize providers
     if not _state.initialize(settings):
@@ -1273,8 +1344,9 @@ def scores_snapshot(
     )
 
 
-# Prices only exist once a chain is chosen, so the network-wide score leaves these weights out.
-_PRICE_WEIGHTS = ("base_price_per_epoch", "price_per_entity")
+# Prices and freshness only exist once a chain is chosen, so the network-wide score leaves
+# these weights out.
+_CHAIN_WEIGHTS = ("base_price_per_epoch", "price_per_entity", "freshness")
 
 
 def _scores_by_indexer(
@@ -1333,10 +1405,10 @@ def _scores_by_indexer(
 def _network_scores(
     history: pd.DataFrame, indexer_id: Optional[str] = None
 ) -> dict[str, ChainScore]:
-    """Each indexer scored against every loaded indexer, with prices left out."""
+    """Each indexer scored against every loaded indexer, with prices and freshness left out."""
     from .indexer_selection import DEFAULT_WEIGHTS, _normalize_metrics
 
-    weights = {k: v for k, v in DEFAULT_WEIGHTS.items() if k not in _PRICE_WEIGHTS}
+    weights = {k: v for k, v in DEFAULT_WEIGHTS.items() if k not in _CHAIN_WEIGHTS}
     return _scores_by_indexer(_normalize_metrics(history.copy()), weights, indexer_id)
 
 
@@ -1370,7 +1442,7 @@ def _chain_scores(
         pool, _ = _keep_with_chain_price(pool, chain)
         if pool.empty:
             continue
-        normalized = _normalize_metrics(_enrich_with_chain_prices(pool, chain))
+        normalized = _normalize_metrics(_enrich_for_chain(pool, chain))
         for row_indexer, score in _scores_by_indexer(
             normalized, DEFAULT_WEIGHTS, indexer_id
         ).items():
@@ -1432,7 +1504,7 @@ def dips_indexers(
     """Indexers offering DIPs on ``chain`` (a 422 if omitted), by selection's price test: they
     answered their DIPs probe, support the chain and are priced within the optional
     ``max_grt_per_30_days`` and ``max_grt_per_billion_entities_per_30_days`` ceilings (omit
-    either to skip it). Where freshness is enforced on the chain, selection also leaves out
+    either to skip it). Unless the chain is exempt from freshness, selection also leaves out
     indexers marked stale, which this list still includes. Example: ``?chain=arbitrum-one``.
     """
     _require_read_token(authorization)
@@ -1902,6 +1974,117 @@ def _enrich_with_chain_prices(
     return df
 
 
+def _weighed_freshness(chain_id: str) -> Optional[Mapping[str, float]]:
+    """Each indexer's freshness score on ``chain_id``, or None where freshness isn't weighed: on
+    an exempt chain, whose checks are taken as untrustworthy or impossible to pass, on a chain
+    whose checks don't yet cover 7 days, and on one where no check has passed or failed within
+    IISA_FRESHNESS_MAX_AGE_MINUTES by this service's clock, which is when enforcement stops
+    trusting its marks too. The scores are worked out at each push, so they go stale when the
+    prober stops or no check goes through the gateway. Reads neither through the freshness lock.
+    """
+    scores = _state.freshness.scores_on(chain_id)
+    enforcement = _enforcement()
+    if scores is None or not enforcement.enforced(chain_id):
+        return None
+    if not enforcement.current(_state.freshness.last_answered_minute(chain_id)):
+        return None
+    return scores
+
+
+def _with_chain_freshness(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
+    """``history`` with each indexer's freshness score on ``chain_id`` in a freshness column,
+    replacing any it held: 0 for an indexer with no record there, and NaN for everyone where
+    _weighed_freshness gives no scores, so the weighted score leaves freshness out there rather
+    than scoring everyone 0.
+    """
+    df = history.copy()
+    scores = _weighed_freshness(chain_id)
+    if scores is None or "indexer" not in df.columns:
+        df["freshness"] = math.nan
+        return df
+
+    def score_of(indexer: Any) -> float:
+        return scores.get(indexer.lower(), 0.0) if isinstance(indexer, str) else 0.0
+
+    df["freshness"] = df["indexer"].map(score_of).astype(float)
+    return df
+
+
+# The {chain: share} maps the job pushes for uptime and success rate, the column selection reads
+# each from, and how many times the share that column holds it.
+_BY_CHAIN_COLUMNS = (
+    ("uptime_by_chain", cols.SEL_UPTIME_PERCENT, 100.0),
+    ("success_rate_by_chain", cols.SEL_AVERAGE_STATUS, 1.0),
+)
+
+
+def _is_share(value: Any) -> TypeGuard[float]:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
+
+
+def _is_missing(value: Any) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _chain_shares(by_chain: pd.Series, chain_id: str) -> tuple[pd.Series, list[Any]]:
+    """Each row's share on ``chain_id`` from its {chain: share} map, NaN where it has none, and
+    what couldn't be read, which also gives NaN: a value for ``chain_id`` that isn't a number
+    from 0 to 1, or a map that isn't one. A row without a map, as from a job that sends none,
+    is neither.
+    """
+    shares: list[float] = []
+    unusable: list[Any] = []
+    for value in by_chain:
+        share = value.get(chain_id) if isinstance(value, dict) else None
+        if _is_share(share):
+            shares.append(float(share))
+            continue
+        if isinstance(value, dict) and chain_id in value:
+            unusable.append(share)
+        elif not isinstance(value, dict) and not _is_missing(value):
+            unusable.append(value)
+        shares.append(math.nan)
+    return pd.Series(shares, index=by_chain.index, dtype=float), unusable
+
+
+def _with_chain_quality(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
+    """``history`` with each indexer's uptime and success rate on ``chain_id`` where the job
+    pushed one, and its overall values elsewhere, as for scores from a job that pushes none.
+    """
+    df = history.copy()
+    for by_chain, column, factor in _BY_CHAIN_COLUMNS:
+        if by_chain not in df.columns:
+            continue
+        shares, unusable = _chain_shares(df[by_chain], chain_id)
+        if unusable:
+            logger.warning(
+                "%d %s entr(ies) for chain %s can't be read as a share from 0 to 1, so those "
+                "indexers are scored on their overall value, such as %.100r",
+                len(unusable),
+                by_chain,
+                chain_id,
+                unusable[0],
+            )
+        elif shares.isna().all():
+            logger.debug(
+                "No indexer has a %s value on chain %s, so every one is scored on its overall "
+                "value",
+                by_chain,
+                chain_id,
+            )
+        overall = df[column] if column in df.columns else math.nan
+        df[column] = (shares * factor).where(shares.notna(), overall)
+    return df
+
+
+def _enrich_for_chain(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
+    """``history`` with everything that depends on ``chain_id``: its prices, each indexer's
+    freshness there, and its uptime and success rate there where the job measured them.
+    """
+    priced = _enrich_with_chain_prices(history, chain_id)
+    return _with_chain_quality(_with_chain_freshness(priced, chain_id), chain_id)
+
+
 def _indexer_prices(
     history: pd.DataFrame, idx_id: str, chain_id: str
 ) -> tuple[Optional[float], Optional[float]]:
@@ -2038,6 +2221,7 @@ _BREAKDOWN_COMPONENTS = (
     ("norm_uptime_score", "uptime"),
     ("norm_success_rate", "success_rate"),
     ("norm_price_per_entity", "price_per_entity"),
+    ("norm_freshness", "freshness"),
 )
 
 
@@ -2138,42 +2322,59 @@ def _current_minute() -> int:
 def _enforcement() -> Enforcement:
     settings = get_settings()
     return Enforcement(
-        settings.freshness_enforced_chains, settings.freshness_max_age_minutes, _current_minute()
+        settings.freshness_exempt_chains, settings.freshness_max_age_minutes, _current_minute()
     )
 
 
 def _checks_too_old(request: SelectionRequest, enforcement: Enforcement) -> bool:
-    """True, after a warning saying why, when the request's chain is enforced but no check
-    there counted recently enough for its marks to be trusted.
+    """True when no check on the request's chain passed or failed recently enough for its
+    marks to be trusted. A no_evidence check doesn't count here, as the prober works it out
+    without asking the gateway. A chain whose checks did pass or fail but not within the limit,
+    as when the prober stops or the gateway is down, gets a warning at most once every
+    LAPSE_WARNING_INTERVAL_MINUTES, saying how many were held back since the last. Once its
+    checks are current again that count starts afresh, so its next lapse warns at once. A chain
+    with no such check in the HISTORY_DAYS kept, such as one the prober doesn't check, only gets
+    a debug line.
     """
-    last_counted = _state.freshness.last_counted_minute(request.chain_id)
-    if enforcement.current(last_counted):
+    last_answered = _state.freshness.last_answered_minute(request.chain_id)
+    if enforcement.current(last_answered):
+        _state.lapse_warnings.reset(request.chain_id)
         return False
-    if last_counted is None:
-        why = f"no freshness check on it has counted in the last {HISTORY_DAYS} days"
-    else:
-        why = (
-            f"its last counted check was {enforcement.now - last_counted} minutes ago, over "
-            f"the limit of {enforcement.max_age_minutes} set by IISA_FRESHNESS_MAX_AGE_MINUTES"
+    if last_answered is None or enforcement.now - last_answered > HISTORY_DAYS * MINUTES_PER_DAY:
+        logger.debug(
+            "deployment=%s chain=%s: freshness isn't enforced there, since no freshness check "
+            "on it has passed or failed in the last %d days",
+            request.deployment_id,
+            request.chain_id,
+            HISTORY_DAYS,
         )
+        return True
+    held = _state.lapse_warnings.allow(request.chain_id, enforcement.now)
+    if held is None:
+        return True
     logger.warning(
-        "deployment=%s chain=%s is listed as enforced but freshness isn't enforced there, "
-        "since %s; candidates are picked as if the chain weren't listed",
+        "deployment=%s chain=%s isn't exempt but freshness isn't enforced there, since no check "
+        "on it has passed or failed for %d minutes, over the limit of %d set by "
+        "IISA_FRESHNESS_MAX_AGE_MINUTES; candidates are picked as if the chain were exempt. "
+        "Logged at most once every %d minutes per chain, with %d held back since the last",
         request.deployment_id,
         request.chain_id,
-        why,
+        enforcement.now - last_answered,
+        enforcement.max_age_minutes,
+        LAPSE_WARNING_INTERVAL_MINUTES,
+        held,
     )
     return True
 
 
 def _stale_candidates(request: SelectionRequest, candidates: pd.DataFrame) -> list[str]:
-    """Candidates marked stale on the request's chain, or with no freshness record there, when
-    that chain is enforced and its checks are recent enough to trust. Group members are never
-    listed: a stale member keeps its place and still counts towards each metric's scale, as
-    members do on a chain that isn't enforced.
+    """Candidates marked stale on the request's chain, or with no freshness record there,
+    unless that chain is exempt or its checks aren't recent enough to trust. Group members are
+    never listed: a stale member keeps its place and still counts towards each metric's scale,
+    as members do on an exempt chain.
     """
     enforcement = _enforcement()
-    if request.chain_id not in enforcement.chains or _checks_too_old(request, enforcement):
+    if not enforcement.enforced(request.chain_id) or _checks_too_old(request, enforcement):
         return []
     members = {member.lower() for member in request.existing_indexers or []}
     ids = [ix for ix in candidates.get("indexer", pd.Series(dtype=object)) if isinstance(ix, str)]
@@ -2234,8 +2435,8 @@ def _prepare_selection(request: SelectionRequest) -> Union[_Selection, Selection
             ),
         )
 
-    # Enrich with chain-specific price columns for normalization
-    enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
+    # Enrich with the chain's prices, freshness, uptime and success rate for normalization
+    enriched_history = _enrich_for_chain(filtered_history, request.chain_id)
     request = _without_stale_candidates(request, enriched_history)
     return _Selection(request, enriched_history, _synced_indexers_for(request.deployment_id))
 
@@ -2253,7 +2454,7 @@ def _selection_response(selection: _Selection, processor: IndexerSelector) -> Se
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """Run IndexerSelector and return a SelectionResponse for the deployment.
 
-    The selector weights stake-to-fees, base price, latency, uptime,
+    The selector weights stake-to-fees, base price, latency, uptime, freshness,
     success rate, and price-per-entity; lower is better for prices and
     latency, higher for the rest.
     """

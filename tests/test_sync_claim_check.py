@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from iisa import DataManager, sync_check
 from iisa import iisa_http_endpoints as endpoints
+from iisa.freshness import FreshnessStore
 from iisa.iisa_http_endpoints import SelectionRequest, Settings, _select_checking_sync_claims
 from iisa.sync_check import GatewayReply, SyncClaimChecker, post_once
 
@@ -334,8 +335,7 @@ def _record(indexer: str, success_rate: float, **changes: Any) -> dict[str, Any]
     return {**record, **changes}
 
 
-# By score alone D is the best pick, then C, then B; A is the worst. The rates sit close
-# together because a success rate under 97% of the best scores 0, which would tie A, B and C.
+# By score alone D is the best pick, then C, then B; A is the worst.
 RECORDS = [_record(A, 0.970), _record(B, 0.975), _record(C, 0.980), _record(D, 0.990)]
 # M is a weak indexer scoring under 0.45: less than the 0.60 a synced candidate needs once the
 # group has a synced member, and not enough to replace anyone. Beside it A, B, C and D all score
@@ -372,7 +372,11 @@ def _state(
     history = DataManager(MagicMock()).transform_scores_df(pd.DataFrame(records or RECORDS))
     sync_status = SimpleNamespace(synced_indexers_for=lambda _deployment: set(claimed))
     return SimpleNamespace(
-        history=history, sync_status=sync_status, sync_checker=checker, is_ready=True
+        history=history,
+        sync_status=sync_status,
+        sync_checker=checker,
+        is_ready=True,
+        freshness=FreshnessStore(),
     )
 
 

@@ -20,6 +20,7 @@ from hypothesis import example, given, note
 from hypothesis import strategies as st
 
 from iisa import iisa_http_endpoints as endpoints
+from iisa.freshness import FreshnessStore
 from iisa.iisa_http_endpoints import (
     SelectionRequest,
     _extract_chain_price,
@@ -44,7 +45,8 @@ from iisa.indexer_selection import (
     _normalize_metrics,
     _normalize_price_per_entity,
     _normalize_stake_to_fees,
-    _normalize_uptime_and_success_rate,
+    _normalize_success_rate,
+    _normalize_uptime,
 )
 from iisa.score_columns import SEL_LATENCY_CI
 
@@ -54,6 +56,9 @@ DEPLOYMENT = "QmPropertyTestDeployment"
 ENTITY_COLUMN = "dips_min_grt_per_billion_entities_per_30_days"
 INDEXER_IDS = [f"0x{number:040x}" for number in range(1, 9)]
 NORM_COLUMNS = [f"norm_{metric}" for metric in DEFAULT_WEIGHTS]
+# Left out rather than scored 0 where there is nothing to score: freshness, on a chain whose
+# checks don't yet cover 7 days, or a table without a freshness column.
+LEFT_OUT_WHEN_MISSING = {"norm_freshness"}
 # Deep enough to exhaust the JSON decoder's recursion limit.
 DEEPLY_NESTED = "[" * 2_000 + "]" * 2_000
 # An integer longer than Python reads from text by default (4,300 digits).
@@ -373,7 +378,8 @@ float_series = st.lists(any_floats, max_size=10).map(lambda values: pd.Series(va
         _normalize_generic,
         _normalize_latency,
         _normalize_stake_to_fees,
-        _normalize_uptime_and_success_rate,
+        _normalize_uptime,
+        _normalize_success_rate,
     ],
 )
 @given(values=float_series)
@@ -414,6 +420,7 @@ RAW_METRICS = {
     "stake_to_fees": st.floats(min_value=0, max_value=1e6),
     "base_price_per_epoch": st.floats(min_value=0, max_value=1e6),
     "price_per_entity": st.floats(min_value=0, max_value=1e6),
+    "freshness": st.floats(min_value=0, max_value=1),
 }
 # Scores the CronJob ships already normalised. The service keeps latency and stake_to_fees as
 # they are and recomputes uptime and success rate, so their copies here must be ignored.
@@ -460,7 +467,7 @@ def test_normalised_metrics_are_finite_and_within_unit_range(table):
     normalized = _normalize_metrics(table.copy())
     assert len(normalized) == len(table)
     for column in NORM_COLUMNS:
-        _assert_unit_interval(normalized[column])
+        _assert_unit_interval(normalized[column], allow_nan=column in LEFT_OUT_WHEN_MISSING)
 
 
 # Each raw metric column and the score _normalize_metrics derives from it.
@@ -471,6 +478,7 @@ RAW_TO_NORM = {
     "average_status": "norm_success_rate",
     "base_price_per_epoch": "norm_base_price_per_epoch",
     "price_per_entity": "norm_price_per_entity",
+    "freshness": "norm_freshness",
 }
 raw_values = st.one_of(st.floats(min_value=0, max_value=100), any_floats, st.none())
 
@@ -521,13 +529,17 @@ weights = st.one_of(
 
 
 @given(
-    rows=st.lists(st.lists(norm_values, min_size=6, max_size=6), min_size=1, max_size=8),
+    rows=st.lists(
+        st.lists(norm_values, min_size=len(NORM_COLUMNS), max_size=len(NORM_COLUMNS)),
+        min_size=1,
+        max_size=8,
+    ),
     weights=weights,
 )
 # The two sums of a weighted average were added up in different orders, so a row of full
 # scores with gaps came out just above 1.
-@example(rows=[[1.0, 1.0, math.nan, math.nan, 1.0, 1.0]], weights=dict(DEFAULT_WEIGHTS))
-@example(rows=[[1.0, 1.0, math.nan, 1.0, 1.0, math.nan]], weights=dict(DEFAULT_WEIGHTS))
+@example(rows=[[1.0, 1.0, math.nan, math.nan, math.nan, 1.0, 1.0]], weights=dict(DEFAULT_WEIGHTS))
+@example(rows=[[1.0, 1.0, math.nan, 1.0, math.nan, 1.0, math.nan]], weights=dict(DEFAULT_WEIGHTS))
 def test_weighted_scores_are_finite_and_within_unit_range(rows, weights):
     norms = pd.DataFrame(rows, columns=NORM_COLUMNS)
     weight_vector = np.array([weights[metric] for metric in DEFAULT_WEIGHTS])
@@ -612,7 +624,7 @@ def _select(case: SelectionCase) -> tuple[list[str], Optional[IndexerSelector]]:
         built.append(IndexerSelector(*args, **kwargs))
         return built[-1]
 
-    state = SimpleNamespace(history=case.table, sync_status=None)
+    state = SimpleNamespace(history=case.table, sync_status=None, freshness=FreshnessStore())
     with (
         patch.object(endpoints, "_state", state),
         patch.object(endpoints, "IndexerSelector", side_effect=build),
@@ -664,7 +676,7 @@ def _assert_selection_scores(selector: Optional[IndexerSelector]) -> None:
     if selector is None:
         return
     for column in [*NORM_COLUMNS, "weighted_score"]:
-        _assert_unit_interval(selector.data[column])
+        _assert_unit_interval(selector.data[column], allow_nan=column in LEFT_OUT_WHEN_MISSING)
 
 
 @given(case=selection_cases())

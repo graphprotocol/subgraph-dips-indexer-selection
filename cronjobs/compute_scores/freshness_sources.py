@@ -22,7 +22,6 @@ from freshness_rules import (
     Targets,
     dips_pairs,
     eligible_deployments,
-    escrow_is_funded,
     first_allocation_lookups,
     is_chain_name,
     is_deployment_entity_id,
@@ -44,10 +43,6 @@ logger = logging.getLogger(__name__)
 INDEXERS_PER_PAGE = 20
 NESTED_ALLOCATION_LIMIT = 1000
 FIRST_ALLOCATIONS_PER_QUERY = 50
-ESCROWS_PER_QUERY = 50
-# While escrow reads fail, the last answers that were read are used for at most this long. Past it
-# an empty escrow recorded long ago would keep excusing refused payments, made-up ones included.
-ESCROW_REUSE_LIMIT_SECONDS = 3600
 
 # Reads for second opinions get 1 attempt and this many seconds: a verdict too late for its
 # minute does no good, and a slow read mustn't hold up the next one.
@@ -89,11 +84,6 @@ _DEPLOYMENTS_ON_CHAIN_FIELD = (
     'indexerAllocations_: { indexer: "%(indexer)s", status: Active } }) { ipfsHash '
     'indexerAllocations(first: 1, orderBy: createdAt, where: { indexer: "%(indexer)s", '
     "status: Active }) { createdAt } }"
-)
-
-_ESCROW_FIELD = (
-    '%(alias)s: paymentsEscrowAccounts(first: 1000, where: { receiver: "%(indexer)s", '
-    "payer_in: [%(payers)s] }) { payer { id } collector balance totalAmountThawing }"
 )
 
 # The gateway only routes to the 100 largest open allocations on a subgraph.
@@ -287,42 +277,6 @@ def read_first_allocations(url: str, keys: Sequence[tuple[str, str]]) -> dict[tu
     return found
 
 
-@retry_subgraph_read
-def _read_escrow_chunk(
-    url: str, indexers: Sequence[str], payers: Collection[str], collector: Optional[str]
-) -> dict[str, bool]:
-    payer_list = ", ".join(f'"{payer}"' for payer in payers)
-    fields = "\n".join(
-        _ESCROW_FIELD % {"alias": f"e{i}", "indexer": indexer, "payers": payer_list}
-        for i, indexer in enumerate(indexers)
-    )
-    data = post_graphql(url, "{\n" + fields + "\n}")
-    return {
-        indexer: escrow_is_funded(data.get(f"e{i}"), payers, collector)
-        for i, indexer in enumerate(indexers)
-    }
-
-
-def read_escrow_funded(
-    url: str, indexers: Sequence[str], payers: Collection[str], collector: Optional[str] = None
-) -> dict[str, bool]:
-    """Whether the gateway's escrow holds funds for each indexer, from ``payers``' accounts,
-    and only those under ``collector`` when it is given.
-
-    An indexer with no account at all is unfunded. Raises ValueError, before anything is sent,
-    when ``payers`` is empty or holds anything but addresses, and raises when any reply can't be
-    read.
-    """
-    if not payers or not all(is_indexer_address(payer) for payer in payers):
-        raise ValueError(f"escrow payers must be 0x addresses: {sorted(map(repr, payers))!s:.200}")
-    payers = tuple(sorted({payer.lower() for payer in payers}))
-    funded: dict[str, bool] = {}
-    for start in range(0, len(indexers), ESCROWS_PER_QUERY):
-        chunk = indexers[start : start + ESCROWS_PER_QUERY]
-        funded.update(_read_escrow_chunk(url, chunk, payers, collector))
-    return funded
-
-
 def read_allocated_indexers(url: str, deployment: str) -> list[str]:
     """The indexers with an open allocation on ``deployment`` that the gateway routes to, in 1
     quick attempt, for a second opinion."""
@@ -393,7 +347,6 @@ class TargetLoader:
         fetch_scores: Callable[[], Any],
         read_allocations: Callable[[Sequence[str]], list[Allocation]],
         read_first_allocations: Callable[[Sequence[tuple[str, str]]], dict[tuple[str, str], int]],
-        read_escrow: Callable[[Sequence[str]], dict[str, bool]],
         min_allocation_age_seconds: float,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -401,12 +354,9 @@ class TargetLoader:
         self._fetch_scores = fetch_scores
         self._read_allocations = read_allocations
         self._read_first_allocations = read_first_allocations
-        self._read_escrow = read_escrow
         self._min_age = min_allocation_age_seconds
         self._clock = clock
         self._first_allocated: dict[tuple[str, str], int] = {}
-        self._last_escrow: dict[str, bool] = {}
-        self._last_escrow_at: Optional[float] = None
 
     def __call__(self) -> Targets:
         networks = self._networks()
@@ -437,42 +387,4 @@ class TargetLoader:
         return Targets(
             pairs=tuple(pairs),
             eligible={pair: hashes for pair, hashes in eligible.items() if pair in wanted},
-            escrow_funded=self._escrow(indexers),
         )
-
-    def _escrow(self, indexers: Sequence[str]) -> dict[str, bool]:
-        """The escrow of each indexer. When it can't be read, the answers of the last read that
-        worked are used again rather than keeping the whole refresh back; an indexer they don't
-        cover has its refused payments counted against it."""
-        if not indexers:
-            return {}
-        try:
-            funded = self._read_escrow(indexers)
-        except Exception as e:
-            return self._escrow_after_failed_read(e)
-        self._last_escrow, self._last_escrow_at = funded, self._clock()
-        return funded
-
-    def _escrow_after_failed_read(self, error: Exception) -> dict[str, bool]:
-        read_at = self._last_escrow_at
-        age = None if read_at is None else self._clock() - read_at
-        cause = (type(error).__name__, error)
-        exc_info = not isinstance(error, EXPECTED_READ_ERRORS)
-        if age is not None and age > ESCROW_REUSE_LIMIT_SECONDS:
-            logger.warning(
-                "The gateway's escrow has been unreadable for over an hour (last read %.0fs ago), "
-                "so its old answers are dropped and refused payments count against indexers "
-                "until it can be read again: %s: %s",
-                age,
-                *cause,
-                exc_info=exc_info,
-            )
-            return {}
-        logger.warning(
-            "Couldn't read the gateway's escrow, so the last answers (%s) are used until the "
-            "next refresh: %s: %s",
-            "none read yet" if age is None else f"read {age:.0f}s ago",
-            *cause,
-            exc_info=exc_info,
-        )
-        return dict(self._last_escrow)

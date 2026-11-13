@@ -27,6 +27,11 @@ FAKE_LINE = "\nINFO - Pushed sync status for 500 indexers to iisa"
 UNPARSEABLE_URL = "http://[::1" + FAKE_LINE
 
 
+# Some of these tests serve replies from a server on this machine, which IISA would refuse to
+# call as an indexer.
+pytestmark = pytest.mark.usefixtures("local_indexers_allowed")
+
+
 def _assert_on_1_line(caplog, logger_name: str, level: int) -> None:
     messages = [
         r.getMessage() for r in caplog.records if r.name == logger_name and r.levelno == level

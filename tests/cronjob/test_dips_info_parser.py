@@ -32,6 +32,10 @@ from processing import (  # noqa: E402
     _for_log,
 )
 
+# Some of these tests serve replies from a server on this machine, which IISA would refuse to
+# call as an indexer.
+pytestmark = pytest.mark.usefixtures("local_indexers_allowed")
+
 
 def test_extracts_from_flat_shape():
     # Arrange — the post-#1037 shape, three top-level keys.
@@ -168,7 +172,7 @@ class _StubSession:
     def __init__(self, body):
         self._body = body
 
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, max_redirects=None):
         return _StubResponse(self._body)
 
 

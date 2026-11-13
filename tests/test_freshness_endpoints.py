@@ -536,11 +536,16 @@ class TestRead:
                 "deployment": "QmOther",
                 "age_seconds": 1778.9,
             },
+            "last_counted_minute": minute,
+            "recent_passed": 0,
+            "recent_counted": 1,
             "passed_28d": 0,
             "counted_28d": 1,
             "share_28d": 0.0,
         }
         assert body["chains"][CHAIN]["indexers"][INDEXER]["window_passed"] == 1
+        assert body["chains"][CHAIN]["last_counted_minute"] == minute
+        assert body["chains"][CHAIN]["last_answered_minute"] == minute
 
     def test_mark_clears_after_5_passing_minutes(self, client):
         now = _now_minute()

@@ -2,7 +2,7 @@
 Indexer selection algorithm for IISA.
 
 Selects the best indexers for subgraphs based on weighted scoring of multiple
-metrics including latency, uptime, success rate, and economic security.
+metrics including latency, uptime, freshness, success rate, and economic security.
 """
 
 import logging
@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .score_columns import NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI
+from .share_score import shaped_share
 
 __all__ = [
     "IndexerSelector",
@@ -33,8 +34,6 @@ IndexerId = EthAddressStr
 
 # Module-level logger
 logger = logging.getLogger(__name__)
-
-NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD = 0.97
 
 # Indexers scoring below this threshold are candidates for replacement.
 # They will only be replaced if a significantly better candidate is available.
@@ -59,6 +58,7 @@ class WeightsDict(TypedDict, total=False):
     base_price_per_epoch: float
     lat_lin_reg_coefficient: float
     uptime_score: float
+    freshness: float
     success_rate: float
     price_per_entity: float
 
@@ -67,10 +67,11 @@ DEFAULT_WEIGHTS = cast(
     WeightsDict,
     MappingProxyType(
         {
-            "stake_to_fees": 0.30,
+            "stake_to_fees": 0.25,
             "base_price_per_epoch": 0.25,
-            "lat_lin_reg_coefficient": 0.20,
+            "lat_lin_reg_coefficient": 0.10,
             "uptime_score": 0.15,
+            "freshness": 0.15,
             "success_rate": 0.05,
             "price_per_entity": 0.05,
         }
@@ -274,8 +275,8 @@ class IndexerSelector:
     def _scale_rows(self) -> Optional[pd.Series]:
         """Rows that set each metric's scale: the group plus every indexer this request can pick.
 
-        Blocked and declined indexers are left out even when in the group, so one with the best
-        uptime can't push every real candidate below the 97%-of-best cutoff.
+        Blocked and declined indexers are left out even when in the group, so one with an
+        extreme value can't stretch a metric's scale for every real candidate.
         """
         if "indexer" not in self.data.columns:
             return None
@@ -707,6 +708,10 @@ class IndexerSelector:
 # recomputed from its raw value, so a pre-scaled copy can't replace the selector's own scaling.
 _PRECOMPUTED_NORM_COLUMNS = frozenset({NORM_LAT_LIN_REG_COEFFICIENT, "norm_stake_to_fees"})
 
+# Norm columns left missing rather than scored 0 when there is nothing to score, so the weighted
+# score leaves them out: freshness, on a chain whose checks don't yet cover 7 days.
+_LEFT_OUT_WHEN_MISSING = frozenset({"norm_freshness"})
+
 # A normaliser takes a metric's values and, optionally, a mask of the rows whose values set its
 # scale (best, worst, cutoff). Rows outside the mask are scored on that scale, clipped to [0, 1].
 _Normaliser = Callable[[pd.Series, Optional[pd.Series]], Union[pd.Series, float]]
@@ -721,24 +726,26 @@ def _normalize_metrics(
 
     price_ceiling, when given, caps pricing instead of the observed max. scale_rows, when given,
     marks the rows that set each metric's best and worst; other rows are scored against them.
-    Missing metrics score 0, and so does a value that does not read as a number, such as text.
-    Input norm_ columns outside _PRECOMPUTED_NORM_COLUMNS are recomputed; those inside score 0
-    when outside [0, 1].
+    Missing metrics score 0, except those in _LEFT_OUT_WHEN_MISSING, which stay missing, and a
+    value that does not read as a number, such as text, scores 0. Input norm_ columns outside
+    _PRECOMPUTED_NORM_COLUMNS are recomputed; those inside score 0 when outside [0, 1].
     """
     # (norm column, source column, normaliser), in the order the columns are added.
     metrics: list[tuple[str, str, _Normaliser]] = [
         (NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI, _normalize_latency),
         # higher is better
-        ("norm_uptime_score", "% up_x", _normalize_uptime_and_success_rate),
+        ("norm_uptime_score", "% up_x", _normalize_uptime),
         ("norm_stake_to_fees", "stake_to_fees", _normalize_stake_to_fees),
         # higher is better
-        ("norm_success_rate", "average_status", _normalize_uptime_and_success_rate),
+        ("norm_success_rate", "average_status", _normalize_success_rate),
         (
             "norm_base_price_per_epoch",
             "base_price_per_epoch",
             lambda prices, rows: _normalize_base_price_per_epoch(prices, price_ceiling, rows),
         ),
         ("norm_price_per_entity", "price_per_entity", _normalize_price_per_entity),
+        # higher is better
+        ("norm_freshness", "freshness", _normalize_freshness),
     ]
 
     if merged.empty:
@@ -758,8 +765,11 @@ def _normalize_metrics(
         else:
             merged[norm_col] = np.nan
 
-    # Fill NaN values with 0 for all norm_ columns
-    norm_columns = [col for col in merged.columns if col.startswith("norm_")]
+    norm_columns = [
+        col
+        for col in merged.columns
+        if col.startswith("norm_") and col not in _LEFT_OUT_WHEN_MISSING
+    ]
     merged[norm_columns] = merged[norm_columns].fillna(0)
 
     return merged
@@ -918,29 +928,36 @@ def _normalize_generic(series: pd.Series, scale_rows: Optional[pd.Series] = None
     return cast(pd.Series, normalized)
 
 
-def _normalize_uptime_and_success_rate(
-    series: pd.Series, scale_rows: Optional[pd.Series] = None
+def _normalize_uptime(
+    uptime_percent: pd.Series, _scale_rows: Optional[pd.Series] = None
 ) -> pd.Series:
-    """Piecewise-scale uptime/success rate, rewarding only the top band.
+    """Score uptime on the indexer's own share of time up; ``% up_x`` holds it times 100."""
+    return _normalize_share(uptime_percent / 100)
 
-    Values below NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD of the best
-    indexer's score get 0; from there to the best they scale linearly to 1
-    (e.g. 98.5% of the best maps to ~0.5). A missing value scores 0.
+
+def _normalize_success_rate(
+    success_rate: pd.Series, _scale_rows: Optional[pd.Series] = None
+) -> pd.Series:
+    """Score success rate, already a share from 0 to 1, on the indexer's own share."""
+    return _normalize_share(success_rate)
+
+
+def _normalize_share(share: pd.Series) -> pd.Series:
+    """A share scored on its own, with no reference to the other candidates: clipped to [0, 1]
+    and shaped by shaped_share, so 0.9 scores about 0.53 and 0.8 about 0.26. A missing value
+    scores 0.
     """
-    # Find the best uptime/success rate score in the series first
-    best = _scale_values(series, scale_rows).max()
+    return shaped_share(share.clip(0, 1)).fillna(0.0)
 
-    # Threshold whereby indexers that have less uptime/success rate than this get no score.
-    threshold = best * NON_ZERO_UPTIME_SUCCESS_RATE_SCORE_THRESHOLD
 
-    # Linear score between the threshold and the best. clip() keeps NaN as NaN
-    # (a missing value, or 0 / 0 when the best is 0), so it fills to 0 below.
-    normalized = ((series - threshold) / (best - threshold)).clip(0, 1)
-
-    # Fill NaN's with 0.
-    normalized = normalized.fillna(0)
-
-    return cast(pd.Series, normalized)
+def _normalize_freshness(
+    freshness: pd.Series, _scale_rows: Optional[pd.Series] = None
+) -> pd.Series:
+    """Freshness arrives already scored on the indexer's own share of checks passed (see
+    freshness.freshness_score), so it is only clipped to [0, 1]. NaN, for a chain where
+    freshness isn't weighed yet, stays NaN.
+    """
+    return freshness.clip(0, 1)
 
 
 def _calculate_weighted_scores(df: pd.DataFrame, weights: WeightsDict) -> pd.Series:

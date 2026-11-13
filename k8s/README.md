@@ -119,13 +119,13 @@ supplies to choose what the job scores: `REDPANDA_TOPIC` (for example
 than falling back to the mainnet `gateway_queries` topic.
 
 The sync-status fetcher loads the same ConfigMap when it exists, for the freshness prober's
-`FRESHNESS_*` settings other than its API key, because the gateway and the address it pays
-indexers from differ between networks. The prober runs only when `FRESHNESS_PROBE_ENABLED`
-is `true`, `1` or `yes`, and stays off when it is unset, `false`, `0` or `no`. Any other
-value, or a prober switched on with a setting missing or out of range, stops the fetcher
-from starting, and with it the sync-status pushes, so check the fetcher's log after a
-change. A pod reads the ConfigMap and the secret only when it starts, so a change takes
-effect after `kubectl rollout restart deployment/sync-status-fetcher` in that namespace.
+`FRESHNESS_*` settings other than its API key, because the gateway differs between networks.
+The prober runs only when `FRESHNESS_PROBE_ENABLED` is `true`, `1` or `yes`, and stays off
+when it is unset, `false`, `0` or `no`. Any other value, or a prober switched on with a
+setting missing or out of range, stops the fetcher from starting, and with it the
+sync-status pushes, so check the fetcher's log after a change. A pod reads the ConfigMap and
+the secret only when it starts, so a change takes effect after
+`kubectl rollout restart deployment/sync-status-fetcher` in that namespace.
 
 Geo-location data uses MaxMind GeoLite2, downloaded into the CronJob image at build
 time, so no geo API key is needed at runtime.
@@ -141,8 +141,18 @@ egress is limited to DNS, the IISA service and public addresses. Other pods and 
 in the cluster stay out of reach because the policy allows no pod but IISA, and the
 cluster checks the destination pod even when a URL names a Service address. Private and
 link-local ranges, which hold the nodes and the metadata server, are left out of the
-public rule. This only takes effect on a cluster that enforces network policies. The
-score-computation job calls the same URLs but has no egress limit yet.
+public rule. This only takes effect on a cluster that enforces network policies.
+
+The fetcher and the score-computation job also check each address in their own code before
+they connect, on any cluster. A registered URL that names an address which is not public, a
+name that resolves only to such addresses, and a redirect that leads to one are all refused:
+the indexer is treated as unreachable and a warning names it. Redirects are followed 3 times
+at most, and proxy settings are ignored. The job has no egress policy of its own: it also
+reads from Redpanda, at an address each environment sets, which a policy would have to allow.
+
+A local network, whose indexers sit at private addresses, sets
+`INDEXER_URLS_ALLOW_PRIVATE_ADDRESSES=true` on the job and the fetcher. Nothing else should:
+with it on, an indexer can point IISA at any address inside its network.
 
 ## Service discovery
 

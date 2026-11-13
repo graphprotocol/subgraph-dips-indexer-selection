@@ -23,6 +23,10 @@ sys.path.insert(0, str(jobs_path))
 import processing  # noqa: E402
 from processing import _fetch_single_graph_node_version_async  # noqa: E402
 
+# Some of these tests serve replies from a server on this machine, which IISA would refuse to
+# call as an indexer.
+pytestmark = pytest.mark.usefixtures("local_indexers_allowed")
+
 
 class _FakeContent:
     """Mimics `aiohttp.ClientResponse.content.read(n)`: each read returns the next part of the
@@ -120,7 +124,7 @@ class _FakeSession:
         self._responses = list(responses)
         self.calls = []
 
-    def post(self, url, json=None, timeout=None):
+    def post(self, url, json=None, timeout=None, max_redirects=None):
         self.calls.append({"url": url, "json": json})
         return self._responses.pop(0)
 
