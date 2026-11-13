@@ -51,6 +51,7 @@ QUALITY_COLUMNS = [
     "success_rate",
     "uptime_by_chain",
     "success_rate_by_chain",
+    "queries_by_chain",
     "org",
     "dst_lat",
     "dst_lon",
@@ -384,3 +385,13 @@ class TestCarriedOver:
         carried = carried_over({"scores": [as_served, as_pushed]}, [A, B], NOW)
 
         assert carried.set_index("indexer")["success_rate"].to_dict() == {A: 0.8, B: 0.7}
+
+    def test_queries_by_chain_are_carried_over(self):
+        from carry_over import carried_over
+
+        rows = [self._row(A, queries_by_chain={"arbitrum-one": 1_200}), self._row(B)]
+
+        carried = carried_over({"scores": rows}, [A, B], NOW).set_index("indexer")
+
+        assert carried.loc[A, "queries_by_chain"] == {"arbitrum-one": 1_200}
+        assert carried.loc[B, "queries_by_chain"] is None

@@ -41,6 +41,7 @@ QUALITY_COLUMNS = [
     "success_rate",
     "uptime_by_chain",
     "success_rate_by_chain",
+    "queries_by_chain",
     "org",
     "dst_lat",
     "dst_lon",
