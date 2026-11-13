@@ -63,7 +63,9 @@ def test_the_lock_holds_a_version_each_listed_range_accepts(line):
 
 @pytest.mark.parametrize("dockerfile", DOCKERFILES, ids=lambda path: str(path.relative_to(REPO)))
 def test_every_base_image_is_fixed_by_digest(dockerfile):
-    images = re.findall(r"^FROM\s+(\S+)", dockerfile.read_text(), re.MULTILINE)
+    images = re.findall(
+        r"^FROM\s+(?:--platform=\S+\s+)?(\S+)", dockerfile.read_text(), re.MULTILINE
+    )
     mounted = re.findall(r"--mount=from=(\S+?),", dockerfile.read_text())
 
     assert images
