@@ -537,7 +537,7 @@ class TestSelection:
         with patch.object(endpoints, "_state", _state({A, D}, None)):
             selection = endpoints._prepare_selection(request)
             selector = endpoints._build_selector(
-                selection.request, selection.history, selection.synced
+                selection.request, selection.history, selection.synced, selection.stale
             )
         selector._preferred_on_a_claim.update({A, D})
 
