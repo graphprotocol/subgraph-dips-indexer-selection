@@ -1668,9 +1668,9 @@ def calculate_quality_by_chain(queries: pd.DataFrame, counts: pd.DataFrame) -> p
     """Each indexer's uptime and success rate overall and on each chain it served, as shares
     from 0 to 1, from the replayed ``queries`` and the count pass's ``counts``.
 
-    Each chain's value is blended with the indexer's other chains by its queries over the whole
-    replay (chain_quality.blend), and the overall values are the query-weighted average over
-    its chains. Rows naming no chain are left out. Columns are _QUALITY_BY_CHAIN_COLUMNS.
+    Each chain's value is blended with the indexer's overall value, the query-weighted average
+    over all its chains, by its queries over the whole replay (chain_quality.blend). Rows
+    naming no chain are left out. Columns are _QUALITY_BY_CHAIN_COLUMNS.
     """
     chains = queries["subgraph_network"]
     named = [chain for chain in chains.dropna().unique() if isinstance(chain, str) and chain]

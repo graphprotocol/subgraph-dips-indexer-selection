@@ -1,8 +1,8 @@
 """Uptime and success rate worked out on each chain an indexer serves.
 
 The replay's rows each name the chain of the subgraph queried. A chain with few queries leans on
-the indexer's other chains until it has 10,000, and the overall values the network-wide scores
-use are the query-weighted average over the indexer's chains.
+the indexer's overall value, the query-weighted average over all its chains, until it has 10,000.
+That overall value is also what the network-wide scores use.
 """
 
 import logging
@@ -34,8 +34,11 @@ from test_run_without_stake import (  # noqa: E402
 A, B, C = INDEXERS
 OTHERS = {"mainnet": 0.9, "matic": 0.7}
 OTHER_QUERIES = {"mainnet": 30_000, "matic": 10_000}
-# The query-weighted average of the 2 other chains: (30,000 * 0.9 + 10,000 * 0.7) / 40,000.
-PRIOR = 0.85
+
+
+def _overall(base_queries: int) -> float:
+    """The query-weighted average over base at 0.5 and OTHERS, with base_queries on base."""
+    return (base_queries * 0.5 + 30_000 * 0.9 + 10_000 * 0.7) / (base_queries + 40_000)
 
 
 class TestBlend:
@@ -50,39 +53,51 @@ class TestBlend:
     @pytest.mark.parametrize(
         ("queries", "blended"),
         [
-            (0, PRIOR),
-            (250, 0.5 * 0.5 + 0.5 * PRIOR),
-            (9_999, (9_999 * 0.5 + 250 * PRIOR) / 10_249),
+            (0, _overall(0)),
+            (250, 0.5 * 0.5 + 0.5 * _overall(250)),
+            (9_999, (9_999 * 0.5 + 250 * _overall(9_999)) / 10_249),
             (10_000, 0.5),
         ],
     )
-    def test_a_chain_leans_on_the_indexers_other_chains_until_it_has_10000_queries(
+    def test_a_chain_leans_on_the_indexers_overall_value_until_it_has_10000_queries(
         self, queries, blended
     ):
         _, by_chain = blend({"base": 0.5, **OTHERS}, {"base": queries, **OTHER_QUERIES})
 
         assert by_chain["base"] == pytest.approx(blended)
 
-    def test_the_prior_and_the_overall_value_are_weighted_by_queries(self):
-        """Matic's prior leans to mainnet, which had 30 times base's queries."""
+    def test_the_prior_is_the_query_weighted_average_over_every_chain(self):
+        """Matic's prior leans to mainnet, which had 30 times matic's queries, and counts
+        matic's own queries too."""
         values = {"base": 0.5, "mainnet": 0.9, "matic": 0.7}
         queries = {"base": 1_000, "mainnet": 30_000, "matic": 1_000}
 
         overall, by_chain = blend(values, queries)
 
-        prior = (1_000 * 0.5 + 30_000 * 0.9) / 31_000
+        prior = (1_000 * 0.5 + 30_000 * 0.9 + 1_000 * 0.7) / 32_000
         weight = 1_000 / 1_250
+        assert overall == pytest.approx(prior)
         assert by_chain["matic"] == pytest.approx(weight * 0.7 + (1 - weight) * prior)
-        assert overall == pytest.approx((1_000 * 0.5 + 30_000 * 0.9 + 1_000 * 0.7) / 32_000)
+
+    def test_2_small_chains_keep_their_order(self):
+        """Weighing only the other chain would swap them: 0.2 and 1.0 would blend to 0.771
+        and 0.429."""
+        _, by_chain = blend({"base": 0.2, "matic": 1.0}, {"base": 100, "matic": 100})
+
+        weight = 100 / 350
+        assert by_chain == pytest.approx(
+            {"base": weight * 0.2 + (1 - weight) * 0.6, "matic": weight * 1.0 + (1 - weight) * 0.6}
+        )
+        assert by_chain["base"] < by_chain["matic"]
 
     @pytest.mark.parametrize("queries", [0, 10, 100_000])
     def test_with_no_other_chain_the_chains_own_value_stands(self, queries):
         assert blend({"base": 0.6}, {"base": queries})[1] == {"base": 0.6}
 
-    def test_other_chains_without_queries_give_no_prior(self):
+    def test_a_chain_without_queries_adds_nothing_to_the_prior_and_takes_it_whole(self):
         _, by_chain = blend({"base": 0.6, "mainnet": 0.1}, {"base": 10, "mainnet": 0})
 
-        assert by_chain["base"] == 0.6
+        assert by_chain == pytest.approx({"base": 0.6, "mainnet": 0.6})
 
     def test_no_queries_on_any_chain_gives_no_overall_value(self):
         assert blend({"base": 0.6}, {"base": 0})[0] is None
@@ -155,9 +170,11 @@ class TestScoresByChain:
     def test_each_indexer_gets_a_value_on_each_chain_it_served(self, monkeypatch):
         scores = _scores(monkeypatch, COUNTS)
 
-        # a's 250 queries on base weigh its own 0 and its 1 on mainnet equally.
+        # a's 250 queries on base weigh its own 0 and its overall 20,000 / 20,250 equally.
         for column in ("uptime_by_chain", "success_rate_by_chain"):
-            assert scores.loc[A, column] == pytest.approx({"mainnet": 1.0, "base": 0.5})
+            assert scores.loc[A, column] == pytest.approx(
+                {"mainnet": 1.0, "base": 0.5 * 20_000 / 20_250}
+            )
             assert scores.loc[B, column] == {"mainnet": 1.0}
             assert scores.loc[C, column] == {"base": 1.0}
 
@@ -179,14 +196,15 @@ class TestScoresByChain:
         assert "7,000 of the count pass's 32,350 queries" in notes[0]
 
     def test_without_the_count_pass_the_sample_counts_with_a_warning(self, monkeypatch, caplog):
-        """Each chain then has 40 queries, so each of a's 2 chains leans mostly on the other."""
+        """Each chain then has 40 queries, so each of a's 2 chains leans mostly on its overall
+        0.5, while mainnet stays above base."""
         empty = pd.DataFrame(columns=["deployment_hash", "indexer", "num_rows"])
 
         with caplog.at_level(logging.WARNING, logger="processing"):
             scores = _scores(monkeypatch, empty)
 
         assert scores.loc[A, "success_rate_by_chain"] == pytest.approx(
-            {"mainnet": 40 / 290, "base": 250 / 290}
+            {"mainnet": (40 + 250 * 0.5) / 290, "base": 250 * 0.5 / 290}
         )
         assert scores.loc[A, "success_rate"] == pytest.approx(0.5)
         assert any("sampled queries" in r.getMessage() for r in caplog.records)
