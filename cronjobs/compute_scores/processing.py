@@ -56,6 +56,10 @@ LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER = 1.5
 LATENCY_COEFFICIENT_COLUMN = "Latency Coefficient"
 STANDARD_ERROR_COLUMN = "Standard Error"
 LATENCY_UPPER_BOUND_COLUMN = "Latency Coefficient + Error Confidence Interval"
+# Each indexer's latency in ms: the median indexer's latency over the rows the regression fits
+# on, plus the indexer's upper-bound gap to that median indexer, floored at 0. The coefficients
+# alone are measured from an arbitrary reference query, so they can't give an absolute latency.
+LATENCY_MS_COLUMN = "latency_ms"
 REQUEST_STATUS_OK = "200 OK"
 REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK = "Unavailable(MissingBlock)"
 
@@ -1086,6 +1090,8 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     scores["lat_lin_reg_coefficient"] = merged.get(LATENCY_COEFFICIENT_COLUMN)
     scores["lat_coefficient_std_error"] = merged.get(STANDARD_ERROR_COLUMN)
     scores["lat_coefficient_upper_bound"] = merged.get(LATENCY_UPPER_BOUND_COLUMN)
+    # None without a regression, as when GeoIP is unavailable.
+    scores[LATENCY_MS_COLUMN] = merged.get(LATENCY_MS_COLUMN)
 
     # Compute normalized latency score (lower latency = higher score)
     lat_raw = merged.get(LATENCY_UPPER_BOUND_COLUMN)
@@ -1497,7 +1503,30 @@ def perform_latency_linear_regression(
     y = df[predictor]
     pipeline = _fit_latency_model(x, y, categorical, numeric)
     results_df, deg_freedom = _coefficient_statistics(pipeline, x, y)
-    return _indexer_latency_rankings(results_df, deg_freedom), results_df
+    rankings = _indexer_latency_rankings(results_df, deg_freedom)
+    rankings[LATENCY_MS_COLUMN] = _latency_ms(rankings, df["indexer"], y.iloc[:, 0])
+    return rankings, results_df
+
+
+def _latency_ms(rankings: pd.DataFrame, indexers: pd.Series, response_ms: pd.Series) -> pd.Series:
+    """Each indexer's latency in ms, floored at 0: the median indexer's latency plus the
+    indexer's upper-bound gap to that median indexer.
+
+    The median indexer's latency is the median response time over the rows the regression fits
+    on, once each row's own indexer gap is taken out. The median query alone would lean towards
+    the indexers the gateway sends most queries to, which are mostly the fast ones.
+    """
+    gaps = indexers.map(rankings.set_index("indexer")[LATENCY_COEFFICIENT_COLUMN])
+    median_indexer_ms = float((response_ms - gaps).median())
+    latency_ms = median_indexer_ms + rankings[LATENCY_UPPER_BOUND_COLUMN]
+    logger.info(
+        "Latency in ms: the median indexer answers in %.1f ms; %d of %d indexer(s) estimated "
+        "below 0 ms are floored at 0",
+        median_indexer_ms,
+        int((latency_ms < 0).sum()),
+        len(latency_ms),
+    )
+    return latency_ms.clip(lower=0.0)
 
 
 def _fit_latency_model(
@@ -1937,6 +1966,7 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["lat_coefficient_std_error"] = 0.0
     scores["lat_coefficient_upper_bound"] = 0.0
     scores["lat_normalized_score"] = 0.5
+    scores[LATENCY_MS_COLUMN] = None
     # The service scores uptime and success rate on each indexer's own share raised to the 6th
     # power, so 1.0 is the only neutral value: it scores everyone 1 on both, as equal values did
     # under the old rule of scoring against the best candidate, where 0.5 would score everyone

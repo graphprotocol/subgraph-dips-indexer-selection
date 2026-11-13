@@ -45,6 +45,7 @@ QUALITY_COLUMNS = [
     "lat_coefficient_std_error",
     "lat_coefficient_upper_bound",
     "lat_normalized_score",
+    "latency_ms",
     "uptime_score",
     "observed_duration_seconds",
     "uptime_duration_seconds",
@@ -384,3 +385,13 @@ class TestCarriedOver:
         carried = carried_over({"scores": [as_served, as_pushed]}, [A, B], NOW)
 
         assert carried.set_index("indexer")["success_rate"].to_dict() == {A: 0.8, B: 0.7}
+
+    def test_latency_in_milliseconds_is_carried_over(self):
+        from carry_over import carried_over
+
+        rows = [self._row(A, latency_ms=182.5), self._row(B)]
+
+        carried = carried_over({"scores": rows}, [A, B], NOW).set_index("indexer")
+
+        assert carried.loc[A, "latency_ms"] == 182.5
+        assert pd.isna(carried.loc[B, "latency_ms"])

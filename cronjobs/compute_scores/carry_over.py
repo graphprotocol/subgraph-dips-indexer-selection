@@ -35,6 +35,7 @@ QUALITY_COLUMNS = [
     "lat_coefficient_std_error",
     "lat_coefficient_upper_bound",
     "lat_normalized_score",
+    "latency_ms",
     "uptime_score",
     "observed_duration_seconds",
     "uptime_duration_seconds",
