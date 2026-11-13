@@ -17,6 +17,7 @@ from iisa.iisa_http_endpoints import (
     IISAState,
     SelectionRequest,
     Settings,
+    _select_checking_sync_claims,
     _select_with_processor,
     app,
 )
@@ -446,6 +447,27 @@ class TestChecksTooOld:
 
         assert _not_enforced(caplog) == []
         assert _not_enforced(caplog, logging.DEBUG) == []
+
+
+class _RefusingChecker:
+    """Stands in for the gateway check of synced claims, confirming none."""
+
+    async def unconfirmed(self, deployment_id: str, indexers: list[str]) -> dict[str, str]:
+        return dict.fromkeys(indexers, "latest block is 900s old")
+
+
+async def test_selecting_again_after_a_failed_claim_check_still_leaves_out_the_stale(
+    state, monkeypatch
+):
+    """GOOD's claim to have synced wins it the first pick; the gateway doesn't confirm it, so
+    selection runs again without the claim. BEST is stale, so GOOD is still the pick."""
+    _judge(state, ALL_PASS_BUT_BEST)
+    monkeypatch.setattr(iisa_http_endpoints, "_synced_indexers_for", lambda _deployment: {GOOD})
+    monkeypatch.setattr(state, "sync_checker", _RefusingChecker())
+
+    response = await _select_checking_sync_claims(_request(CHAIN, 1, None))
+
+    assert [indexer.id for indexer in response.indexers] == [GOOD]
 
 
 def test_select_indexers_over_http_leaves_out_the_marked_candidate(state):
