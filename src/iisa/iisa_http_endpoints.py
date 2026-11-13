@@ -6,12 +6,13 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - POST /scores - Push computed indexer scores from the cronjob (push token)
 - GET /scores - Return the current scores snapshot (read token)
 - GET /scores/status - Return when the loaded scores were computed, for monitoring (read token)
-- GET /scores/weighted - Bulk total scores for every loaded indexer (read token)
+- GET /scores/weighted - Every loaded indexer's total scores, 1 per chain it has priced (read token)
 - GET /dips-indexers - Indexers offering DIPs on a required ?chain (read token)
 - POST /sync-status - Push sync-status snapshot from the fetcher (push token)
 - POST /freshness - Push 1 minute of freshness outcomes from the prober (push token)
 - GET /freshness - Return each indexer's stale mark and freshness counts, by chain (read token)
-- POST /get-score - Return the total score, factors and components for one indexer (read token)
+- POST /get-score - Return 1 indexer's total score, factors and components on each chain it has
+  priced (read token)
 - POST /select-indexers - Select optimal indexers for a deployment
 """
 
@@ -1455,9 +1456,9 @@ def _chain_scores(
 def scores_weighted(
     authorization: Optional[str] = Header(None),
 ) -> WeightedScoresResponse:
-    """Bulk total-score snapshot — same shape as /get-score, every indexer.
+    """Every loaded indexer's total scores, 1 per chain it has priced, shaped like /get-score.
 
-    Single pass across the loaded snapshot — saves N round-trips to /get-score.
+    Single pass across the loaded snapshot, which saves N round-trips to /get-score.
     Selection can pass `max_grt_per_30_days` as a `price_ceiling`; this endpoint
     cannot, so each chain's prices are normalised against its observed max instead.
     """
