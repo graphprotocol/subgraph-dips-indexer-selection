@@ -285,12 +285,19 @@ def refused_url(url: str) -> Optional[Refused]:
     return None
 
 
-def warn_refused(indexer: str, url: str, refusal: Refused) -> None:
-    """Say in the log that an indexer was not called, and why. The indexer chose the URL, and a
-    refusal can repeat a name from it, so both are quoted for the log."""
-    logger.warning(
-        "Not calling indexer %s at %s: %s",
-        for_log(indexer),
-        url_for_log(url),
-        error_for_log(refusal),
-    )
+def warn_refused(
+    indexer: str, url: str, refusal: Refused, *, while_connecting: bool = False
+) -> None:
+    """Say in the log that a call to an indexer was refused, and why. The indexer chose the URL,
+    and a refusal can repeat a name from it, so both are quoted for the log.
+
+    A refusal `while_connecting` came from a name or a redirect, after the call had started, so
+    the indexer may have been reached first and the URL it registered may be public.
+    """
+    if while_connecting:
+        message = (
+            "Stopped a call to indexer %s at %s: a name or a redirect led to a refused address (%s)"
+        )
+    else:
+        message = "Not calling indexer %s at %s: %s"
+    logger.warning(message, for_log(indexer), url_for_log(url), error_for_log(refusal))

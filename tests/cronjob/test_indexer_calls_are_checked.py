@@ -104,6 +104,7 @@ async def test_an_indexer_at_an_address_that_is_not_public_is_never_called(
     refusals = [r for r in caplog.records if "refused" in r.getMessage()]
     assert len(refusals) == 1, caplog.text
     assert refusals[0].levelno == logging.WARNING
+    assert refusals[0].getMessage().startswith("Not calling indexer")
 
 
 @pytest.mark.parametrize("fetch, unreachable", FETCHES)
@@ -115,7 +116,11 @@ async def test_a_call_refused_while_connecting_is_not_tried_again(fetch, unreach
 
     assert result is unreachable
     assert session.calls == 1
-    assert any("refused indexer.example" in r.getMessage() for r in caplog.records), caplog.text
+    refusals = [r for r in caplog.records if "refused indexer.example" in r.getMessage()]
+    assert len(refusals) == 1, caplog.text
+    # The call was made, and may have reached the indexer before a redirect led elsewhere, so the
+    # warning must not say the indexer was not called.
+    assert refusals[0].getMessage().startswith("Stopped a call to indexer"), caplog.text
 
 
 @pytest.mark.parametrize("fetch, unreachable", FETCHES)

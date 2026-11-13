@@ -166,7 +166,7 @@ async def _fetch_single_status(
             refusal = refusal_behind(e)
             if refusal is not None:
                 # The address would be refused again, so the call is not tried again.
-                warn_refused(indexer, url, refusal)
+                warn_refused(indexer, url, refusal, while_connecting=True)
                 return None
             last_error = e
             if attempt < MAX_RETRIES - 1:

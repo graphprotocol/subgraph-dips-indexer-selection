@@ -367,7 +367,7 @@ async def _fetch_single_dips_info_async(
             refusal = refusal_behind(e)
             if refusal is not None:
                 # The address would be refused again, so the call is not tried again.
-                warn_refused(indexer, url, refusal)
+                warn_refused(indexer, url, refusal, while_connecting=True)
                 return _unavailable_dips_info(indexer)
             last_error = e
             if attempt < DIPS_INFO_MAX_RETRIES - 1:
@@ -537,7 +537,7 @@ async def _fetch_single_graph_node_version_async(
         refusal = refusal_behind(last_error)
         if refusal is not None:
             # The address would be refused again, so the call is not tried again.
-            warn_refused(indexer, url, refusal)
+            warn_refused(indexer, url, refusal, while_connecting=True)
             return unknown
         if _retry_would_not_help(last_error):
             break
