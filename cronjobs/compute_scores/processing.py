@@ -66,12 +66,16 @@ REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK = "Unavailable(MissingBlock)"
 # Each indexer's uptime and success rate on each chain it served, as {chain: share} maps.
 UPTIME_BY_CHAIN = "uptime_by_chain"
 SUCCESS_RATE_BY_CHAIN = "success_rate_by_chain"
+# Each indexer's queries on each chain it served, as a {chain: count} map: the counts that weigh
+# each chain in the blend above, so a reader can weigh the indexer's chains the same way.
+QUERIES_BY_CHAIN = "queries_by_chain"
 _QUALITY_BY_CHAIN_COLUMNS = [
     "indexer",
     "uptime_overall",
     "success_overall",
     UPTIME_BY_CHAIN,
     SUCCESS_RATE_BY_CHAIN,
+    QUERIES_BY_CHAIN,
 ]
 # The count pass's columns: queries per (deployment, indexer) over the whole replay.
 _COUNT_COLUMNS = {"deployment_hash", "indexer", "num_rows"}
@@ -1111,6 +1115,7 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
     # Uptime and success rate on each chain, which selection prefers on the request's chain
     scores[UPTIME_BY_CHAIN] = merged.get(UPTIME_BY_CHAIN)
     scores[SUCCESS_RATE_BY_CHAIN] = merged.get(SUCCESS_RATE_BY_CHAIN)
+    scores[QUERIES_BY_CHAIN] = merged.get(QUERIES_BY_CHAIN)
 
     # Economic security metrics
     scores["stake_to_fees"] = merged.get("stake_to_fees")
@@ -1816,6 +1821,7 @@ def _blended_by_chain(values: pd.DataFrame, queries: pd.Series) -> pd.DataFrame:
             overall, by_chain = blend(shares, weights)
             record[overall_column] = math.nan if overall is None else overall
             record[by_chain_column] = by_chain or None
+        record[QUERIES_BY_CHAIN] = {chain: round(count) for chain, count in weights.items()} or None
         records.append(record)
     return pd.DataFrame(records, columns=_QUALITY_BY_CHAIN_COLUMNS)
 
@@ -1977,6 +1983,7 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["success_rate"] = 1.0
     scores[UPTIME_BY_CHAIN] = None
     scores[SUCCESS_RATE_BY_CHAIN] = None
+    scores[QUERIES_BY_CHAIN] = None
     scores["stake_to_fees"] = None
     scores["norm_stake_to_fees"] = 0.5
     scores["org"] = None

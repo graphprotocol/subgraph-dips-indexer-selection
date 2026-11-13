@@ -177,6 +177,15 @@ class TestScoresByChain:
             assert scores.loc[B, column] == {"mainnet": 1.0}
             assert scores.loc[C, column] == {"base": 1.0}
 
+    def test_each_indexer_reports_the_queries_the_blend_weighed_on_each_chain(self, monkeypatch):
+        """The count pass's counts, each subgraph on its chain: a's 250 on base are what gave
+        base equal weight with a's overall value above."""
+        scores = _scores(monkeypatch, COUNTS)
+
+        assert scores.loc[A, "queries_by_chain"] == {"mainnet": 20_000, "base": 250}
+        assert scores.loc[B, "queries_by_chain"] == {"mainnet": 100}
+        assert scores.loc[C, "queries_by_chain"] == {"base": 5_000}
+
     def test_the_overall_values_are_the_query_weighted_average_over_chains(self, monkeypatch):
         scores = _scores(monkeypatch, COUNTS)
 
@@ -206,6 +215,7 @@ class TestScoresByChain:
             {"mainnet": (40 + 250 * 0.5) / 290, "base": 250 * 0.5 / 290}
         )
         assert scores.loc[A, "success_rate"] == pytest.approx(0.5)
+        assert scores.loc[A, "queries_by_chain"] == {"mainnet": 40, "base": 40}
         assert any("sampled queries" in r.getMessage() for r in caplog.records)
 
     def test_the_fallback_scores_send_no_values_by_chain(self, monkeypatch):
@@ -216,3 +226,4 @@ class TestScoresByChain:
 
         assert scores["uptime_by_chain"].tolist() == [None]
         assert scores["success_rate_by_chain"].tolist() == [None]
+        assert scores["queries_by_chain"].tolist() == [None]
