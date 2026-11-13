@@ -2,7 +2,7 @@
 
 A prober checks every indexer on every chain it offers DIPs on once a minute and pushes that
 minute's outcomes to the service. From them this module keeps, for each indexer and chain, a
-stale mark worked out from the last 10 minutes and from when its checks last counted, and daily
+stale mark worked out from the last 10 minutes and from its latest counted checks, and daily
 counts of passed and counted checks
 for the last 28 days, from which it scores the indexer's freshness on the chain. Minutes and
 days are counted from the Unix epoch in UTC, so a day here is a UTC day.
@@ -37,10 +37,11 @@ OutcomeKind = Literal["pass", "fail", "no_evidence", "void"]
 
 WINDOW_MINUTES = 10
 MIN_COUNTED_MINUTES = 5
-# A pair none of whose checks has counted for more than this many minutes, while checks on other
-# indexers on its chain still count, is marked: with no evidence it is fresh, it isn't picked.
-# Comparing with the chain's checks means an outage that voids every check there marks nobody.
-MAX_SILENT_MINUTES = 60
+# A pair none of whose checks has counted in this many of its chain's latest answered minutes is
+# marked: with no evidence it is fresh, it isn't picked. An answered minute on a chain is 1 in
+# which some check there passed or failed, so went through the gateway; an outage that voids
+# every check, or leaves only the no_evidence ones the prober works out alone, ages nobody.
+RECENT_ANSWERED_MINUTES = 60
 HISTORY_DAYS = 28
 MINUTES_PER_DAY = 1_440
 # Freshness is weighed on a chain only once it has this many minutes of checks, 7 days, and an
@@ -92,6 +93,13 @@ class DayCount(BaseModel):
     counted: int = Field(default=0, ge=0)
 
 
+class RecentOutcome(BaseModel):
+    """1 counted outcome of a pair, with how many answered minutes its chain had by then."""
+
+    passed: bool
+    answered: int = Field(ge=0)
+
+
 class PairState(BaseModel):
     """What is kept for 1 indexer on 1 chain."""
 
@@ -109,30 +117,24 @@ class PairState(BaseModel):
     # The minute of the pair's last outcome that counted, meaning any but void, or None before
     # it has one.
     last_counted: Optional[int] = None
+    # The pair's last MIN_COUNTED_MINUTES counted outcomes, oldest first.
+    recent: list[RecentOutcome] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _fill_in_last_counted(self) -> Self:
-        """Work out last_counted for a pair saved before it was kept, as _last_counted_of does."""
-        if self.last_counted is None:
-            self.last_counted = _last_counted_of(self)
+    def _fill_in_for_an_older_file(self) -> Self:
+        """A pair saved before last_counted and recent were kept gets them from the counted
+        minutes in its window, each taken as answered at 0, the count every chain starts from
+        when loaded from such a file. A pair that was judged fine then stays fine.
+        """
+        counted = sorted((m, outcome) for m, outcome in self.minutes.items() if outcome != "void")
+        if "recent" not in self.model_fields_set:
+            self.recent = [
+                RecentOutcome(passed=outcome == "pass", answered=0)
+                for _, outcome in counted[-MIN_COUNTED_MINUTES:]
+            ]
+        if "last_counted" not in self.model_fields_set and counted:
+            self.last_counted = counted[-1][0]
         return self
-
-
-def _last_counted_of(pair: PairState) -> Optional[int]:
-    """The pair's last counted minute from what else it holds: its latest outcome when that
-    counted, else the latest counted minute in its window, else the latest minute it can have
-    been, the end of the latest day it has counted checks on or its latest outcome if earlier.
-    None when it holds no counted outcome at all.
-    """
-    if pair.last.outcome != "void":
-        return pair.last.minute
-    counted = [minute for minute, outcome in pair.minutes.items() if outcome != "void"]
-    if counted:
-        return max(counted)
-    days = [day for day, counts in pair.days.items() if counts.counted]
-    if days:
-        return min((max(days) + 1) * MINUTES_PER_DAY - 1, pair.last.minute)
-    return None
 
 
 class FreshnessState(BaseModel):
@@ -146,6 +148,9 @@ class FreshnessState(BaseModel):
     chains: dict[str, dict[str, PairState]] = Field(default_factory=dict)
     # By chain, the last minute holding an outcome there that counted, meaning any but void.
     last_counted: dict[str, int] = Field(default_factory=dict)
+    # By chain, how many answered minutes it has had: minutes in which some check there passed or
+    # failed. A file saved before this was kept starts every chain from 0.
+    answered: dict[str, int] = Field(default_factory=dict)
 
 
 def _window(pair: PairState, received: set[int], last_minute: int) -> tuple[int, int]:
@@ -200,6 +205,10 @@ def _record(state: FreshnessState, minute: int, check: Check) -> None:
     _count(pair, minute // MINUTES_PER_DAY, check.outcome)
     if check.outcome != "void":
         pair.last_counted = minute
+        outcome = RecentOutcome(
+            passed=check.outcome == "pass", answered=state.answered.get(check.chain, 0)
+        )
+        pair.recent = [*pair.recent, outcome][-MIN_COUNTED_MINUTES:]
         state.last_counted[check.chain] = minute
 
 
@@ -219,6 +228,7 @@ def _prune(state: FreshnessState, last_minute: int) -> None:
         else:
             del state.chains[chain]
             state.last_counted.pop(chain, None)
+            state.answered.pop(chain, None)
 
 
 def _trim(pair: PairState, last_minute: int) -> None:
@@ -229,27 +239,35 @@ def _trim(pair: PairState, last_minute: int) -> None:
     pair.days = {day: counts for day, counts in pair.days.items() if day >= oldest_day}
 
 
-def _silent(pair: PairState, chain_last_counted: Optional[int]) -> bool:
-    """Whether checks on the pair's chain went on counting for more than MAX_SILENT_MINUTES
-    after the pair's own last counted one. A pair that never counted is never silent: it starts
-    marked anyway.
-    """
-    if pair.last_counted is None or chain_last_counted is None:
-        return False
-    return chain_last_counted - pair.last_counted > MAX_SILENT_MINUTES
+def _answered_chains(checks: Iterable[Check]) -> set[str]:
+    """The chains on which some check in a minute passed or failed, so went through the gateway."""
+    return {check.chain for check in checks if check.outcome in ("pass", "fail")}
 
 
-def _update_marks(state: FreshnessState, last_minute: int) -> None:
-    """Judge every pair on record over the window. With too few counted minutes a pair keeps
-    the mark it had, unless it is silent, which marks it.
+def _has_counted(pair: PairState) -> bool:
+    """Whether any of the pair's checks has ever counted, as its daily counts show for a pair
+    loaded from a file saved before recent outcomes were kept."""
+    return bool(pair.recent) or any(day.counted for day in pair.days.values())
+
+
+def _silent(pair: PairState, answered: int) -> bool:
+    """Whether none of the pair's counted checks falls in its chain's latest
+    RECENT_ANSWERED_MINUTES answered minutes, ``answered`` being the chain's count now."""
+    return not pair.recent or answered - pair.recent[-1].answered > RECENT_ANSWERED_MINUTES
+
+
+def _update_marks(state: FreshnessState, last_minute: int, answered: Iterable[str]) -> None:
+    """Judge every pair on each chain answered in the minute just applied. On any other chain
+    every mark stays as it was, as nothing there went through the gateway. A pair with too few
+    counted minutes in its window keeps its mark, unless it is silent, which marks it; a pair
+    that never counted keeps the mark it started with.
     """
-    for chain, pairs in state.chains.items():
-        chain_last_counted = state.last_counted.get(chain)
-        for pair in pairs.values():
+    for chain in answered:
+        for pair in state.chains.get(chain, {}).values():
             passed, counted = _window(pair, state.received, last_minute)
             if counted >= MIN_COUNTED_MINUTES:
                 pair.marked = passed * 2 < counted
-            elif _silent(pair, chain_last_counted):
+            elif _has_counted(pair) and _silent(pair, state.answered[chain]):
                 pair.marked = True
 
 
@@ -394,12 +412,15 @@ class FreshnessStore:
             state = self._state
             if state.last_minute is not None and minute <= state.last_minute:
                 return False
+            answered = _answered_chains(checks)
+            for chain in answered:
+                state.answered[chain] = state.answered.get(chain, 0) + 1
             for check in checks:
                 _record(state, minute, check)
             state.last_minute = minute
             state.received.add(minute)
             _prune(state, minute)
-            _update_marks(state, minute)
+            _update_marks(state, minute, answered)
             self._marks = _marks_of(state)
             save(state.model_dump(mode="json"))
             return True
