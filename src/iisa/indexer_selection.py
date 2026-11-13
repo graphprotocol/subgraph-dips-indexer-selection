@@ -6,13 +6,15 @@ metrics including latency, uptime, freshness, success rate, and economic securit
 """
 
 import logging
+import time
 from types import MappingProxyType
 from typing import Any, Callable, NewType, Optional, TypedDict, Union, cast
 
 import numpy as np
 import pandas as pd
 
-from .score_columns import NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI
+from .log_limit import LogLimit
+from .score_columns import LATENCY_MS, NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI
 from .share_score import shaped_share
 
 __all__ = [
@@ -749,10 +751,23 @@ class IndexerSelector:
         return all_synced_candidates
 
 
-# Norm columns the CronJob ships already normalised and the selector keeps: latency, and
-# stake_to_fees in degraded mode (a neutral 0.5). Every other metric in _normalize_metrics is
-# recomputed from its raw value, so a pre-scaled copy can't replace the selector's own scaling.
+# Norm columns the CronJob ships already normalised and the selector keeps: latency, for scores
+# without latency_ms, and stake_to_fees in degraded mode (a neutral 0.5). Every other metric in
+# _normalize_metrics is recomputed from its raw value, so a pre-scaled copy can't replace the
+# selector's own scaling.
 _PRECOMPUTED_NORM_COLUMNS = frozenset({NORM_LAT_LIN_REG_COEFFICIENT, "norm_stake_to_fees"})
+
+# Latency in ms is scored on a fixed curve, the shape of the gateway's own latency score made
+# steeper: 1 at 0ms, about 0.96 at 50ms, 0.52 at the midpoint and 0.04 at 500ms, and never below
+# the floor once measured, so an indexer's score doesn't depend on the other candidates.
+LATENCY_MIDPOINT_MS = 250
+LATENCY_WIDTH_MS = 80
+LATENCY_FLOOR_SCORE = 0.001
+
+# Scores without latency_ms keep the job's own latency score, and say so in a warning logged at
+# most once in this many minutes, since every selection and score read would otherwise repeat it.
+LATENCY_FALLBACK_WARNING_MINUTES = 10
+_LATENCY_FALLBACK_WARNINGS = LogLimit(LATENCY_FALLBACK_WARNING_MINUTES)
 
 # Norm columns left missing rather than scored 0 when there is nothing to score, so the weighted
 # score leaves them out: freshness, on a chain whose checks don't yet cover 7 days.
@@ -778,9 +793,10 @@ def _normalize_metrics(
     value that does not read as a number, such as text, scores 0. Input norm_ columns outside
     _PRECOMPUTED_NORM_COLUMNS are recomputed; those inside score 0 when outside [0, 1].
     """
+    latency, precomputed = _latency_metric(merged)
     # (norm column, source column, normaliser), in the order the columns are added.
     metrics: list[tuple[str, str, _Normaliser]] = [
-        (NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI, _normalize_latency),
+        latency,
         # higher is better
         ("norm_uptime_score", "% up_x", _normalize_uptime),
         ("norm_stake_to_fees", "stake_to_fees", _normalize_stake_to_fees),
@@ -810,7 +826,7 @@ def _normalize_metrics(
         scale_rows = None
 
     for norm_col, source_col, normalize in metrics:
-        if norm_col in _PRECOMPUTED_NORM_COLUMNS and norm_col in merged.columns:
+        if norm_col in precomputed and norm_col in merged.columns:
             merged[norm_col] = _carried_scores(merged, norm_col)
         elif source_col in merged.columns:
             merged[norm_col] = _normalize_column(merged, source_col, normalize, scale_rows)
@@ -825,6 +841,41 @@ def _normalize_metrics(
     merged[norm_columns] = merged[norm_columns].fillna(0)
 
     return merged
+
+
+def _latency_metric(
+    merged: pd.DataFrame,
+) -> tuple[tuple[str, str, _Normaliser], frozenset[str]]:
+    """The latency metric, as (norm column, source column, normaliser), and the norm columns to
+    keep as pushed. latency_ms is scored on the fixed curve. Scores without it keep the latency
+    score from before it, with a warning: the job's pushed lat_normalized_score, scaled across
+    every indexer the job measured, or else the regression's upper bound scaled against the
+    candidates. A run without GeoIP and a degraded run measure no latency in ms, and nor did a
+    job older than latency_ms.
+    """
+    if LATENCY_MS in merged.columns:
+        # No row sets a scale here, as no indexer's score depends on another's.
+        curve = (NORM_LAT_LIN_REG_COEFFICIENT, LATENCY_MS, lambda ms, _rows: _score_latency_ms(ms))
+        return curve, _PRECOMPUTED_NORM_COLUMNS - {NORM_LAT_LIN_REG_COEFFICIENT}
+    held = _LATENCY_FALLBACK_WARNINGS.allow(LATENCY_MS, _current_minute())
+    if held is not None:
+        logger.warning(
+            "The loaded scores have no %s, so latency is scored from the job's pushed "
+            "lat_normalized_score, scaled across every indexer the job measured, instead of on "
+            "the fixed curve. Check the score job's last run: one without GeoIP or a degraded "
+            "run measures no latency in ms, and nor does a job older than the field. Logged at "
+            "most once every %d minutes, with %d held back since the last",
+            LATENCY_MS,
+            LATENCY_FALLBACK_WARNING_MINUTES,
+            held,
+        )
+    pool_scaled = (NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI, _normalize_latency)
+    return pool_scaled, _PRECOMPUTED_NORM_COLUMNS
+
+
+def _current_minute() -> int:
+    """The wall clock as a minute counted from the Unix epoch."""
+    return int(time.time() // 60)
 
 
 def _normalize_column(
@@ -904,6 +955,20 @@ def _normalize_latency(latency: pd.Series, scale_rows: Optional[pd.Series] = Non
     """Normalise the latency linear regression score. A missing latency scores 0, the worst."""
     # lower is better
     return (1 - _normalize_generic(latency, scale_rows)).mask(latency.isna(), 0.0)
+
+
+def _score_latency_ms(latency_ms: pd.Series) -> pd.Series:
+    """Score each latency in ms on the fixed curve, (1 + e^(-midpoint / width)) / (1 +
+    e^((ms - midpoint) / width)), held to [floor, 1]. A latency that is missing or not finite
+    scores 0.
+    """
+    ms = latency_ms.astype(float)
+    finite = pd.Series(np.isfinite(ms), index=ms.index)
+    steps = (ms.where(finite, 0.0) - LATENCY_MIDPOINT_MS) / LATENCY_WIDTH_MS
+    at_0ms = 1 + np.exp(-LATENCY_MIDPOINT_MS / LATENCY_WIDTH_MS)
+    # at_0ms / (1 + e^steps), written so a huge latency gives 0 rather than overflowing.
+    curve = at_0ms * np.exp(-np.logaddexp(0.0, steps))
+    return cast(pd.Series, curve.clip(LATENCY_FLOOR_SCORE, 1.0).where(finite, 0.0))
 
 
 def _normalize_stake_to_fees(

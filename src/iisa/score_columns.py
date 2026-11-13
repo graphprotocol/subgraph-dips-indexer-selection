@@ -10,6 +10,9 @@ INDEXER = "indexer"
 COMPUTED_AT = "computed_at"
 LAT_NORMALIZED_SCORE = "lat_normalized_score"
 LAT_COEFFICIENT_UPPER_BOUND = "lat_coefficient_upper_bound"
+# Each indexer's latency in milliseconds, pushed by jobs from this column's introduction on and
+# scored as it is, with no rename.
+LATENCY_MS = "latency_ms"
 UPTIME_SCORE = "uptime_score"
 SUCCESS_RATE = "success_rate"
 STAKE_TO_FEES = "stake_to_fees"
