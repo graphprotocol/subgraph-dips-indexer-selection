@@ -56,9 +56,9 @@ LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER = 1.5
 LATENCY_COEFFICIENT_COLUMN = "Latency Coefficient"
 STANDARD_ERROR_COLUMN = "Standard Error"
 LATENCY_UPPER_BOUND_COLUMN = "Latency Coefficient + Error Confidence Interval"
-# Each indexer's latency in ms: the median response time over the rows the regression fits on,
-# plus its upper-bound gap to the median indexer, floored at 0. The coefficients alone are
-# measured from an arbitrary reference query, so they can't give an absolute latency.
+# Each indexer's latency in ms: the median indexer's latency over the rows the regression fits
+# on, plus the indexer's upper-bound gap to that median indexer, floored at 0. The coefficients
+# alone are measured from an arbitrary reference query, so they can't give an absolute latency.
 LATENCY_MS_COLUMN = "latency_ms"
 REQUEST_STATUS_OK = "200 OK"
 REQUEST_STATUS_UNAVAILABLE_MISSING_BLOCK = "Unavailable(MissingBlock)"
@@ -1504,9 +1504,29 @@ def perform_latency_linear_regression(
     pipeline = _fit_latency_model(x, y, categorical, numeric)
     results_df, deg_freedom = _coefficient_statistics(pipeline, x, y)
     rankings = _indexer_latency_rankings(results_df, deg_freedom)
-    latency_ms = float(y.iloc[:, 0].median()) + rankings[LATENCY_UPPER_BOUND_COLUMN]
-    rankings[LATENCY_MS_COLUMN] = latency_ms.clip(lower=0.0)
+    rankings[LATENCY_MS_COLUMN] = _latency_ms(rankings, df["indexer"], y.iloc[:, 0])
     return rankings, results_df
+
+
+def _latency_ms(rankings: pd.DataFrame, indexers: pd.Series, response_ms: pd.Series) -> pd.Series:
+    """Each indexer's latency in ms, floored at 0: the median indexer's latency plus the
+    indexer's upper-bound gap to that median indexer.
+
+    The median indexer's latency is the median response time over the rows the regression fits
+    on, once each row's own indexer gap is taken out. The median query alone would lean towards
+    the indexers the gateway sends most queries to, which are mostly the fast ones.
+    """
+    gaps = indexers.map(rankings.set_index("indexer")[LATENCY_COEFFICIENT_COLUMN])
+    median_indexer_ms = float((response_ms - gaps).median())
+    latency_ms = median_indexer_ms + rankings[LATENCY_UPPER_BOUND_COLUMN]
+    logger.info(
+        "Latency in ms: the median indexer answers in %.1f ms; %d of %d indexer(s) estimated "
+        "below 0 ms are floored at 0",
+        median_indexer_ms,
+        int((latency_ms < 0).sum()),
+        len(latency_ms),
+    )
+    return latency_ms.clip(lower=0.0)
 
 
 def _fit_latency_model(
