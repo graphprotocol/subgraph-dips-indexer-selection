@@ -167,12 +167,14 @@ def _indexer_app(hits):
     return app
 
 
-async def test_the_real_fetches_leave_a_server_inside_the_network_alone():
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+async def test_the_real_fetches_leave_a_server_inside_the_network_alone(host):
     # The stand-in indexer listens on this machine's loopback address, which is not public. The
-    # sessions the 3 fetches open for themselves must not reach it.
+    # address is refused before any call. The name passes that first check, so only the sessions
+    # the 3 fetches open for themselves can keep it from being reached.
     hits = []
-    async with TestServer(_indexer_app(hits)) as server:
-        urls = {INDEXER: str(server.make_url("/"))}
+    async with TestServer(_indexer_app(hits), host="127.0.0.1") as server:
+        urls = {INDEXER: f"http://{host}:{server.port}/"}
 
         prices = await processing._fetch_all_dips_info_async(urls)
         versions = await processing._fetch_all_graph_node_versions_async(urls)
@@ -200,20 +202,28 @@ async def test_a_local_network_can_switch_the_rule_off(local_indexers_allowed):
     assert statuses[INDEXER]["deployments"] == ["QmDeployment"]
 
 
-async def test_a_fetch_follows_at_most_3_redirects(local_indexers_allowed, monkeypatch):
-    # 1 try, so the count below is of 1 call's redirects, not of retries.
+@pytest.mark.parametrize("fetch, unreachable", FETCHES)
+async def test_a_fetch_follows_at_most_3_redirects(
+    fetch, unreachable, local_indexers_allowed, monkeypatch
+):
+    # 1 try each, so the count below is of 1 call's redirects, not of retries.
     monkeypatch.setattr(processing, "DIPS_INFO_MAX_RETRIES", 1)
+    monkeypatch.setattr(processing, "GRAPH_NODE_VERSION_MAX_RETRIES", 1)
+    monkeypatch.setattr(sync_status_fetcher, "MAX_RETRIES", 1)
     hits = []
 
     async def bounce(request):
         hits.append(request.path)
-        raise web.HTTPFound("/dips/info")
+        # A temporary redirect keeps the method, so a POST stays a POST.
+        raise web.HTTPTemporaryRedirect(request.path)
 
     app = web.Application()
     app.router.add_get("/dips/info", bounce)
+    app.router.add_post("/status", bounce)
     async with TestServer(app) as server:
-        prices = await processing._fetch_all_dips_info_async({INDEXER: str(server.make_url("/"))})
+        async with aiohttp.ClientSession() as session:
+            result = await fetch(session, str(server.make_url("/")))
 
-    assert prices[0]["dips_info_available"] is False
+    assert result is unreachable
     # The call itself and the 3 redirects it may follow. Without the limit it would follow 10.
     assert len(hits) == 4
