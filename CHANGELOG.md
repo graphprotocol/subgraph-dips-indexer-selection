@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.13.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.12.0...v2.13.0) (2026-11-13)
+
+
+### Added
+
+* **scoring:** score uptime and success per chain ([#436](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/436)) ([1a03810](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/1a038100aeca01fa72f340871c5df6eb479d0db5))
+* **service:** enforce freshness on every chain by default ([#433](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/433)) ([6ed39fa](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/6ed39fa5e5e101021105ae109fb4c99ea727cb19))
+* **service:** mark indexers whose checks stop counting ([#438](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/438)) ([a69e1b2](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/a69e1b2d20e3ad7b381335179f3c5a72d7f38d88))
+* **service:** score uptime and success on their own share ([#435](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/435)) ([d456177](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/d456177658d457ca6be70ee69322e68e52ef5070))
+* **service:** weigh freshness when picking indexers ([#434](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/434)) ([ed2a9c8](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ed2a9c8392ee7b953a44c84a78479840b2726dea))
+
+
+### Fixed
+
+* **cronjob:** build the score job image from a hashed lock ([#441](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/441)) ([a39991a](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/a39991a9282af121dd5c943558de609051132a44))
+* **cronjob:** refuse indexer addresses that are not public ([#439](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/439)) ([3236301](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/323630177ee28a128bd77656b787257f299fa169))
+* **cronjob:** stop counting refused payments against indexers ([#432](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/432)) ([5fbbe88](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/5fbbe88110d1dd6a68b7b9d39f7bfcd2afc8e05f))
+* **service:** warn once every 10 minutes when freshness lapses ([#440](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/440)) ([09e0bf9](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/09e0bf9c8583758e7093a14c659526597c8ba159))
+
+
+### Changed
+
+* **deps:** bump the service-python group with 6 updates ([#448](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/448)) ([65349ce](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/65349ce7a5ffc1478ca0a8ed3ba263fbc5fba266))
+* **deps:** update opentelemetry-api past its security advisory ([#446](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/446)) ([5bd4eff](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/5bd4effa5a786a02c4e4ed3907d06982809d6209))
+* **k8s:** update cronjob image to sha-a39991a ([#447](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/447)) ([c6f4e59](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/c6f4e590f357abf0ff559535b222fd72721a7f1e))
+
 ## [2.12.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.11.0...v2.12.0) (2026-11-12)
 
 
