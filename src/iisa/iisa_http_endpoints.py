@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     freshness_file_path: str = "/app/scores/freshness.json"
     # Chains, comma-separated, on which a stale mark is only recorded and reported and freshness
     # isn't weighed. On every other chain an indexer marked stale isn't picked for new
-    # agreements.
+    # agreements while a fresh candidate is left to fill the group.
     freshness_exempt_chains: Annotated[frozenset[str], NoDecode] = frozenset()
     # How many minutes behind this service's clock a chain's last answered minute, the last in
     # which a check there passed or failed, may be. Past that its marks are too old to trust,
@@ -419,7 +419,8 @@ class WeightedScoresResponse(BaseModel):
 
 class DipsIndexersResponse(BaseModel):
     """Response for GET /dips-indexers: the indexers offering DIPs on the chain. Unless the chain
-    is exempt from freshness, selection also leaves out the ones marked stale. ``computed_at``
+    is exempt from freshness, selection also passes over the ones marked stale while a fresh
+    candidate is left. ``computed_at``
     mirrors the push so callers can reject an out-of-date snapshot. Example::
 
         {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2, "indexers": ["0xaa", "0xbb"]}
@@ -1504,8 +1505,9 @@ def dips_indexers(
     """Indexers offering DIPs on ``chain`` (a 422 if omitted), by selection's price test: they
     answered their DIPs probe, support the chain and are priced within the optional
     ``max_grt_per_30_days`` and ``max_grt_per_billion_entities_per_30_days`` ceilings (omit
-    either to skip it). Unless the chain is exempt from freshness, selection also leaves out
-    indexers marked stale, which this list still includes. Example: ``?chain=arbitrum-one``.
+    either to skip it). Unless the chain is exempt from freshness, selection also passes over
+    indexers marked stale while a fresh candidate is left, and this list includes them.
+    Example: ``?chain=arbitrum-one``.
     """
     _require_read_token(authorization)
 

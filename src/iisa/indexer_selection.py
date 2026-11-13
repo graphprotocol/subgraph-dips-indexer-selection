@@ -634,7 +634,8 @@ class IndexerSelector:
     ) -> Optional[IndexerId]:
         """Pick the highest-scoring eligible indexer to add or to replace one.
         Skips indexers already in the group, on the denylist, with pending
-        (unaccepted) agreements, or that previously declined this subgraph.
+        (unaccepted) agreements, that previously declined this subgraph, or marked
+        stale, unless the pick fills a place no other candidate can.
         replacing_indexer, when set, simulates the swap for the decentralisation
         check. prefer_synced, when False, ranks candidates on score alone, as if
         none were synced. Returns the best indexer ID, or None if none qualify.
