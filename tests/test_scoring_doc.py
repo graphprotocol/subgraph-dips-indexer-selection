@@ -108,17 +108,6 @@ def test_the_quality_and_value_equations_match_the_code(start, weights):
     assert _weights(_equation(start)) == pytest.approx(dict(weights))
 
 
-def test_the_rescaled_value_equation_matches_the_code():
-    """Value without the price per billion entities: the other 2 weights over their sum."""
-    match = re.fullmatch(r"V = \\frac\{(.*)\}\{([0-9.]+)\}", _equation("V = \\frac"))
-    assert match, "docs/scoring.md's rescaled value equation no longer reads as a fraction"
-    parts = _weights(match.group(1))
-
-    assert parts == pytest.approx({key: VALUE_WEIGHTS[key] for key in parts})
-    assert set(parts) == set(VALUE_WEIGHTS) - {"price_per_entity"}
-    assert float(match.group(2)) == pytest.approx(sum(parts.values()))
-
-
 def test_the_latency_table_matches_the_curve():
     rows = _table("Latency")
     latencies = pd.Series([_number(latency) for latency, _ in rows])

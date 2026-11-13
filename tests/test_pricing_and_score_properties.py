@@ -36,7 +36,6 @@ from iisa.iisa_http_endpoints import (
     _supports_chain,
 )
 from iisa.indexer_selection import (
-    CHAIN_PARTS,
     QUALITY_WEIGHTS,
     VALUE_WEIGHTS,
     IndexerSelector,
@@ -532,24 +531,23 @@ norm_values = st.one_of(st.floats(min_value=0, max_value=1), st.just(math.nan))
         min_size=1,
         max_size=8,
     ),
-    left_out=st.sampled_from([frozenset(), CHAIN_PARTS]),
 )
 # The two sums of a weighted average were added up in different orders, so a row of full
 # scores with gaps came out just above 1.
-@example(rows=[[1.0, 1.0, math.nan, 1.0, 1.0, math.nan, 1.0]], left_out=frozenset())
-@example(rows=[[1.0, math.nan, 1.0, 1.0, math.nan, 1.0, 1.0]], left_out=frozenset())
-def test_totals_are_finite_and_within_unit_range(rows, left_out):
+@example(rows=[[1.0, 1.0, math.nan, 1.0, 1.0, math.nan, 1.0]])
+@example(rows=[[1.0, math.nan, 1.0, 1.0, math.nan, 1.0, 1.0]])
+def test_totals_are_finite_and_within_unit_range(rows):
     norms = pd.DataFrame(rows, columns=NORM_COLUMNS)
 
     def lacks_every_part(weights):
-        parts = [f"norm_{metric}" for metric in weights if metric not in left_out]
+        parts = [f"norm_{metric}" for metric in weights]
         return norms[parts].isna().all(axis=1).any()
 
     if lacks_every_part(QUALITY_WEIGHTS) or lacks_every_part(VALUE_WEIGHTS):
         with pytest.raises(ValueError):
-            _calculate_scores(norms, left_out)
+            _calculate_scores(norms)
         return
-    _assert_unit_interval(_calculate_scores(norms, left_out))
+    _assert_unit_interval(_calculate_scores(norms))
 
 
 # --- Selection end to end ------------------------------------------------------------------

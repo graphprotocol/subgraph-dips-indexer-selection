@@ -2,7 +2,6 @@
 
 The replay's rows each name the chain of the subgraph queried. A chain with few queries leans on
 the indexer's overall value, the query-weighted average over all its chains, until it has 10,000.
-That overall value is also what the network-wide scores use.
 """
 
 import logging

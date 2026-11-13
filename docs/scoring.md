@@ -1,6 +1,6 @@
 # How an indexer is scored
 
-When IISA picks indexers for a deployment, it gives every candidate a total score between 0 and 1 and prefers the higher totals. This page sets out how that total is worked out, for anyone who would rather check the maths than read the code. Tests check the page against the code: the weights in the equations for quality and value, including value with a part left out, every row of the constants table in the last section, the latency table and the worked example's table. The prose is not checked, so a figure written only in a sentence, such as the 0.85 in the cut-offs section or the sums written out under the worked example, could fall out of date unnoticed.
+When IISA picks indexers for a deployment, it gives every candidate a total score between 0 and 1 and prefers the higher totals. This page sets out how that total is worked out, for anyone who would rather check the maths than read the code. Tests check the page against the code: the weights in the equations for quality and value, every row of the constants table in the last section, the latency table and the worked example's table. The prose is not checked, so a figure written only in a sentence, such as the 0.85 in the cut-offs section or the sums written out under the worked example, could fall out of date unnoticed.
 
 ## The formula
 
@@ -44,7 +44,7 @@ $$
 F = \left( \frac{\text{passed}}{\max(\text{counted},\ 10{,}080)} \right)^{6}
 $$
 
-On a chain with at least 7 days of checks, an indexer with no record there scores 0. Freshness is left out, which counts as $F = 1$, wherever it can't be trusted to tell indexers apart: on a chain whose checks cover less than 7 days or that has none, on a chain exempt from freshness, on a chain where no check has passed or failed within the age limit (as when the prober stops or the gateway is down), and in the network-wide scores, which don't belong to any chain.
+On a chain with at least 7 days of checks, an indexer with no record there scores 0. Freshness is left out, which counts as $F = 1$, wherever it can't be trusted to tell indexers apart: on a chain whose checks cover less than 7 days or that has none, on a chain exempt from freshness, and on a chain where no check has passed or failed within the age limit (as when the prober stops or the gateway is down).
 
 ## Quality, Q
 
@@ -78,17 +78,9 @@ $P$, the price per 30 days on the request's chain, scores $1 - \text{price} / \t
 
 $E$, the price per billion entities, scores the same way against the payer's per-entity ceiling, `max_grt_per_billion_entities_per_30_days`, held between 0 and 1, so a price at the ceiling scores 0. Without a ceiling the highest per-entity price among the candidates takes its place.
 
-The network-wide scores belong to no chain and leave both prices out, so there value is $K$ alone.
-
 ## When a part is missing
 
-Within quality and value, a part that is left out drops out and the others are rescaled to make up its weight. Value without $E$, for example, is
-
-$$
-V = \frac{0.45 \, K + 0.45 \, P}{0.90}
-$$
-
-That only happens where a part is left out on purpose, such as the prices in the network-wide scores. Missing data is never given a neutral value: an indexer with no uptime, no success rate or no latency scores 0 on it. Freshness is the one exception, as above, since leaving it out is how a chain whose checks can't be trusted ignores it.
+Missing data is never given a neutral value: an indexer with no uptime, no success rate or no latency scores 0 on it. Freshness is the one exception, as above, since leaving it out is how a chain whose checks can't be trusted ignores it.
 
 ## Selection's cut-offs
 

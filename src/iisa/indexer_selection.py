@@ -74,9 +74,6 @@ VALUE_WEIGHTS: Mapping[str, float] = MappingProxyType(
     }
 )
 
-# The parts that depend on the request's chain, which the network-wide scores leave out.
-CHAIN_PARTS = frozenset({"base_price_per_epoch", "price_per_entity", "freshness"})
-
 # The 4 factors whose product is the total, in the order they are reported.
 SCORE_FACTORS = ("uptime", "freshness", "quality", "value")
 
@@ -1083,31 +1080,27 @@ def _normalize_freshness(
     return freshness.clip(0, 1)
 
 
-def _score_factors(df: pd.DataFrame, left_out: frozenset[str] = frozenset()) -> pd.DataFrame:
+def _score_factors(df: pd.DataFrame) -> pd.DataFrame:
     """Each row's 4 factors, whose product is its total, from its norm_ columns: uptime, 0 when
-    missing; freshness, 1 when missing or in ``left_out``, as on a chain where it isn't weighed;
-    and quality and value, each the weighted average of its parts present, so a part missing or
-    in ``left_out`` drops out and the others are rescaled. Raises ValueError if a row has no
-    part of quality or of value.
+    missing; freshness, 1 when missing, as on a chain where it isn't weighed; and quality and
+    value, each the weighted average of its parts present. _normalize_metrics gives every part,
+    so a part is only missing from a table built without it; it then drops out and the others
+    are rescaled, with a warning. Raises ValueError if a row has no part of quality or of value.
     """
-    if "freshness" in left_out:
-        freshness = pd.Series(1.0, index=df.index)
-    else:
-        freshness = _norm_column(df, "freshness").fillna(1.0)
     return pd.DataFrame(
         {
             "uptime": _norm_column(df, "uptime_score").fillna(0.0),
-            "freshness": freshness,
-            "quality": _weighted_average(df, QUALITY_WEIGHTS, left_out),
-            "value": _weighted_average(df, VALUE_WEIGHTS, left_out),
+            "freshness": _norm_column(df, "freshness").fillna(1.0),
+            "quality": _weighted_average(df, QUALITY_WEIGHTS),
+            "value": _weighted_average(df, VALUE_WEIGHTS),
         },
         index=df.index,
     )
 
 
-def _calculate_scores(df: pd.DataFrame, left_out: frozenset[str] = frozenset()) -> pd.Series:
+def _calculate_scores(df: pd.DataFrame) -> pd.Series:
     """Each row's total, uptime x freshness x quality x value (see _score_factors)."""
-    return _score_factors(df, left_out).prod(axis=1)
+    return _score_factors(df).prod(axis=1)
 
 
 def _norm_column(df: pd.DataFrame, metric: str) -> pd.Series:
@@ -1119,15 +1112,13 @@ def _norm_column(df: pd.DataFrame, metric: str) -> pd.Series:
     return df[column].astype(float)
 
 
-def _weighted_average(
-    df: pd.DataFrame, weights: Mapping[str, float], left_out: frozenset[str]
-) -> pd.Series:
-    """Weighted average of each row's present parts by ``weights``, leaving out ``left_out``.
+def _weighted_average(df: pd.DataFrame, weights: Mapping[str, float]) -> pd.Series:
+    """Weighted average of each row's present parts by ``weights``.
     NaN cells drop out of both the numerator and the per-row weight total, so each row
     renormalises over the parts it has. Both sums add their terms in the same order, so parts
     within [0, 1] cannot round to an average above 1. Raises ValueError if a row has no part.
     """
-    parts = [(metric, weight) for metric, weight in weights.items() if metric not in left_out]
+    parts = list(weights.items())
     matrix = np.column_stack(
         [_norm_column(df, metric).to_numpy(dtype=float) for metric, _ in parts]
     )

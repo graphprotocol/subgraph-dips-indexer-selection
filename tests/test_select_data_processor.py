@@ -2015,7 +2015,7 @@ class TestWeightedAverageVectorized:
         )
 
         # Act
-        vectorised = _weighted_average(df, VALUE_WEIGHTS, frozenset())
+        vectorised = _weighted_average(df, VALUE_WEIGHTS)
 
         # Assert
         pd.testing.assert_series_equal(vectorised, self._row_wise(df, VALUE_WEIGHTS))
@@ -2031,7 +2031,7 @@ class TestWeightedAverageVectorized:
         )
         weights = {"a": 0.5, "b": 0.3, "c": 0.2}
 
-        vectorised = _weighted_average(df, weights, frozenset())
+        vectorised = _weighted_average(df, weights)
 
         pd.testing.assert_series_equal(vectorised, self._row_wise(df, weights))
 
@@ -2040,7 +2040,7 @@ class TestWeightedAverageVectorized:
         df = pd.DataFrame({"norm_a": [0.6, 0.2], "norm_b": [0.4, 0.8]})
         weights = {"a": 0.5, "b": 0.3, "c": 0.2}  # norm_c is absent
 
-        vectorised = _weighted_average(df, weights, frozenset())
+        vectorised = _weighted_average(df, weights)
 
         pd.testing.assert_series_equal(vectorised, self._row_wise(df, weights))
 
@@ -2050,4 +2050,4 @@ class TestWeightedAverageVectorized:
         weights = {"a": 0.5, "b": 0.5}
 
         with pytest.raises(ValueError, match="Total weight cannot be 0"):
-            _weighted_average(df, weights, frozenset())
+            _weighted_average(df, weights)

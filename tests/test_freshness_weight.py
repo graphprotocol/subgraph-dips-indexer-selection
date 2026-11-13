@@ -238,9 +238,7 @@ class TestSelection:
         assert data["norm_freshness"].isna().all()
         assert not math.isnan(data["weighted_score"].iloc[0])
         assert (data["factor_freshness"] == 1.0).all()
-        assert list(data["weighted_score"]) == pytest.approx(
-            list(_calculate_scores(data, frozenset({"freshness"})))
-        )
+        assert list(data["weighted_score"]) == pytest.approx(list(_calculate_scores(data)))
 
 
 class TestChecksStopCounting:
@@ -321,13 +319,12 @@ class TestChecksStopCounting:
 
 
 class TestReportedScores:
-    def test_network_wide_scores_leave_freshness_out_and_each_chain_lists_it(self, service):
+    def test_each_chain_lists_its_own_freshness(self, service):
         service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
 
         entries = TestClient(iisa_http_endpoints.app).get("/scores/weighted").json()["scores"]
         twin = next(entry for entry in entries if entry["indexer"] == TWIN)
 
-        assert "freshness" not in twin["components"]
         assert twin["chains"][CHAIN]["components"]["freshness"] == pytest.approx(0.9**6)
         assert "freshness" not in twin["chains"][OTHER_CHAIN]["components"]
 
@@ -338,5 +335,4 @@ class TestReportedScores:
             TestClient(iisa_http_endpoints.app).post("/get-score", json={"indexer_id": TWIN}).json()
         )
 
-        assert "freshness" not in body["components"]
         assert body["chains"][CHAIN]["components"]["freshness"] == pytest.approx(0.9**6)

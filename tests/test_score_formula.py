@@ -12,7 +12,6 @@ import pandas as pd
 import pytest
 
 from iisa.indexer_selection import (
-    CHAIN_PARTS,
     MIN_INDEXER_SCORE,
     MIN_SYNCED_THRESHOLD,
     REPLACEMENT_MARGIN,
@@ -35,8 +34,8 @@ QUALITY = 0.2 * 0.5 + 0.8 * 0.7
 VALUE = 0.45 * 0.6 + 0.45 * 0.4 + 0.10 * 1.0
 
 
-def _total(left_out=frozenset(), **changes) -> float:
-    return float(_calculate_scores(pd.DataFrame([{**PARTS, **changes}]), left_out).iloc[0])
+def _total(**changes) -> float:
+    return float(_calculate_scores(pd.DataFrame([{**PARTS, **changes}])).iloc[0])
 
 
 class TestFormula:
@@ -58,14 +57,6 @@ class TestFormula:
         assert total == pytest.approx(0.9 * 0.8 * (0.2 * 0.5) * VALUE)
         assert total > 0
 
-    def test_network_wide_value_is_stake_to_fees_alone(self):
-        """The network-wide scores leave out the prices and freshness, which depend on the chain."""
-        factors = _score_factors(pd.DataFrame([PARTS]), CHAIN_PARTS).iloc[0]
-
-        assert factors["value"] == pytest.approx(0.6)
-        assert factors["freshness"] == 1.0
-        assert _total(CHAIN_PARTS) == pytest.approx(0.9 * QUALITY * 0.6)
-
     def test_freshness_left_out_counts_as_1(self):
         """Freshness is NaN on a chain whose checks don't yet cover 7 days, or are stale."""
         assert _total(norm_freshness=math.nan) == pytest.approx(0.9 * QUALITY * VALUE)
@@ -74,7 +65,9 @@ class TestFormula:
         """Indexers must prove themselves, so no data is not a neutral value."""
         assert _total(norm_uptime_score=math.nan) == 0.0
 
-    def test_a_part_left_out_of_value_is_rescaled_over_the_others(self):
+    def test_a_part_missing_from_value_is_rescaled_over_the_others(self):
+        """_normalize_metrics gives every part, so this only happens to a table built without
+        one, which also logs a warning."""
         total = _total(norm_price_per_entity=math.nan)
 
         rescaled = (0.45 * 0.6 + 0.45 * 0.4) / 0.90

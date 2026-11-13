@@ -6,12 +6,13 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - POST /scores - Push computed indexer scores from the cronjob (push token)
 - GET /scores - Return the current scores snapshot (read token)
 - GET /scores/status - Return when the loaded scores were computed, for monitoring (read token)
-- GET /scores/weighted - Bulk total scores for every loaded indexer (read token)
+- GET /scores/weighted - Every loaded indexer's total scores, 1 per chain it has priced (read token)
 - GET /dips-indexers - Indexers offering DIPs on a required ?chain (read token)
 - POST /sync-status - Push sync-status snapshot from the fetcher (push token)
 - POST /freshness - Push 1 minute of freshness outcomes from the prober (push token)
 - GET /freshness - Return each indexer's stale mark and freshness counts, by chain (read token)
-- POST /get-score - Return the total score, factors and components for one indexer (read token)
+- POST /get-score - Return 1 indexer's total score, factors and components on each chain it has
+  priced (read token)
 - POST /select-indexers - Select optimal indexers for a deployment
 """
 
@@ -342,27 +343,27 @@ class ChainScore(BaseModel):
     counting.
 
     Scored against every indexer that supports the chain and has priced it, as selection does
-    before it applies a request's budget, blocklist and expected fees.
+    before it applies a request's budget, blocklist and expected fees. queries is the indexer's
+    queries on the chain from the score job's queries_by_chain, null when the job sent none, so
+    a reader can weigh the indexer's chain totals into 1 number of its own.
     """
 
     weighted_score: Optional[float] = None
     components: dict[str, float] = {}
     factors: dict[str, float] = {}
+    queries: Optional[int] = None
 
 
 class ScoreResponse(BaseModel):
     """
     Response for the /get-score endpoint.
 
-    weighted_score, components and factors compare the indexer with every loaded indexer and
-    leave out prices and freshness, which depend on the chain, so value is stake-to-fees alone
-    and freshness counts as 1. chains has the full score for each chain it has priced.
+    An indexer is scored on each chain, since its prices and freshness only exist there, so
+    chains has its score on each chain it has priced, and there is no score across chains.
+    chains is null when the indexer isn't loaded.
     """
 
     indexer_id: str
-    weighted_score: Optional[float] = None
-    components: Optional[dict[str, float]] = None
-    factors: Optional[dict[str, float]] = None
     chains: Optional[dict[str, ChainScore]] = None
     found: bool
 
@@ -400,12 +401,9 @@ class ScoresSnapshotResponse(BaseModel):
 
 
 class WeightedScoreEntry(BaseModel):
-    """One indexer's scores, shaped like the /get-score response."""
+    """One indexer's scores on each chain it has priced, shaped like the /get-score response."""
 
     indexer: str
-    weighted_score: Optional[float] = None
-    components: dict[str, float] = {}
-    factors: dict[str, float] = {}
     chains: dict[str, ChainScore] = {}
 
 
@@ -1319,14 +1317,13 @@ def scores_snapshot(
 
 
 def _scores_by_indexer(
-    normalized: pd.DataFrame,
-    left_out: frozenset[str],
-    indexer_id: Optional[str] = None,
+    normalized: pd.DataFrame, chain: str, indexer_id: Optional[str] = None
 ) -> dict[str, ChainScore]:
-    """Total, factors and component scores for each indexer in an already normalised table.
+    """Total, factors, component scores and queries on ``chain`` for each indexer in an already
+    normalised table of the indexers on it.
 
-    The parts in ``left_out`` don't count. ``indexer_id``, when given, scores just that indexer.
-    An indexer with more than 1 row is scored from its first.
+    ``indexer_id``, when given, scores just that indexer. An indexer with more than 1 row is
+    scored from its first. Queries that can't be read are reported as null, with a warning.
     """
     from .indexer_selection import _score_factors
 
@@ -1339,17 +1336,13 @@ def _scores_by_indexer(
     # so a row with no part of quality or value can't arise here; degrade to unscored rather
     # than 500 if it somehow does.
     try:
-        factors: Optional[pd.DataFrame] = _score_factors(normalized, left_out)
+        factors: Optional[pd.DataFrame] = _score_factors(normalized)
     except ValueError as e:
         logger.warning("scoring failed: %s", e)
         factors = None
 
-    reported = [
-        (col, name)
-        for col, name in _BREAKDOWN_COMPONENTS
-        if col.removeprefix("norm_") not in left_out
-    ]
     scores: dict[str, ChainScore] = {}
+    unreadable: list[Any] = []
     for position, (_, row) in enumerate(normalized.iterrows()):
         row_indexer = row.get("indexer")
         if row_indexer is None or (isinstance(row_indexer, float) and pd.isna(row_indexer)):
@@ -1358,41 +1351,67 @@ def _scores_by_indexer(
         if str(row_indexer) in scores:
             logger.warning("indexer %s has more than 1 score row; using the first", row_indexer)
             continue
-        scores[str(row_indexer)] = _chain_score(row, reported, factors, position)
+        queries = _queries_on(row.get("queries_by_chain"), chain, unreadable)
+        scores[str(row_indexer)] = _chain_score(row, factors, position, queries)
+    if unreadable:
+        logger.warning(
+            "%d queries_by_chain entr(ies) for chain %s can't be read as a count of 0 or more, "
+            "so those indexers' queries there are reported as null, such as %.100r",
+            len(unreadable),
+            chain,
+            unreadable[0],
+        )
     return scores
 
 
 def _chain_score(
-    row: pd.Series,
-    reported: list[tuple[str, str]],
-    factors: Optional[pd.DataFrame],
-    position: int,
+    row: pd.Series, factors: Optional[pd.DataFrame], position: int, queries: Optional[int]
 ) -> ChainScore:
-    """1 indexer's ChainScore: its row's ``reported`` components, and its total and factors
+    """1 indexer's ChainScore with ``queries``: its row's components, and its total and factors
     from row ``position`` of ``factors``, or none when scoring failed.
     """
     from .indexer_selection import SCORE_FACTORS
 
     components = {
-        name: float(row[col]) for col, name in reported if col in row.index and pd.notna(row[col])
+        name: float(row[col])
+        for col, name in _BREAKDOWN_COMPONENTS
+        if col in row.index and pd.notna(row[col])
     }
     if factors is None:
-        return ChainScore(weighted_score=None, components=components)
+        return ChainScore(weighted_score=None, components=components, queries=queries)
     own = {name: float(factors[name].iloc[position]) for name in SCORE_FACTORS}
     return ChainScore(
         weighted_score=math.prod(own.values()),
         components=components,
         factors=own,
+        queries=queries,
     )
 
 
-def _network_scores(
-    history: pd.DataFrame, indexer_id: Optional[str] = None
-) -> dict[str, ChainScore]:
-    """Each indexer scored against every loaded indexer, with prices and freshness left out."""
-    from .indexer_selection import CHAIN_PARTS, _normalize_metrics
+def _queries_on(queries_by_chain: Any, chain: str, unreadable: list[Any]) -> Optional[int]:
+    """The queries on ``chain`` in an indexer's pushed queries_by_chain, or None when there are
+    none. What the job sent that can't be read, a map that isn't one or a value for ``chain``
+    that isn't a whole count of 0 or more, is added to ``unreadable``. A row without a map, as
+    from a job that sends none, or a map without ``chain`` is not.
+    """
+    if not isinstance(queries_by_chain, dict):
+        if not _is_missing(queries_by_chain):
+            unreadable.append(queries_by_chain)
+        return None
+    if chain not in queries_by_chain:
+        return None
+    count = queries_by_chain[chain]
+    if _is_count(count):
+        return int(count)
+    unreadable.append(count)
+    return None
 
-    return _scores_by_indexer(_normalize_metrics(history.copy()), CHAIN_PARTS, indexer_id)
+
+def _is_count(value: Any) -> bool:
+    """Whether ``value`` is a whole number of 0 or more, as an int or a float."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0 and value == int(value)
 
 
 def _priced_chains(history: pd.DataFrame) -> list[str]:
@@ -1426,7 +1445,7 @@ def _chain_scores(
         if pool.empty:
             continue
         normalized = _normalize_metrics(_enrich_for_chain(pool, chain))
-        for row_indexer, score in _scores_by_indexer(normalized, frozenset(), indexer_id).items():
+        for row_indexer, score in _scores_by_indexer(normalized, chain, indexer_id).items():
             scores.setdefault(row_indexer, {})[chain] = score
     return scores
 
@@ -1437,9 +1456,9 @@ def _chain_scores(
 def scores_weighted(
     authorization: Optional[str] = Header(None),
 ) -> WeightedScoresResponse:
-    """Bulk total-score snapshot — same shape as /get-score, every indexer.
+    """Every loaded indexer's total scores, 1 per chain it has priced, shaped like /get-score.
 
-    Single pass across the loaded snapshot — saves N round-trips to /get-score.
+    Single pass across the loaded snapshot, which saves N round-trips to /get-score.
     Selection can pass `max_grt_per_30_days` as a `price_ceiling`; this endpoint
     cannot, so each chain's prices are normalised against its observed max instead.
     """
@@ -1457,14 +1476,8 @@ def scores_weighted(
 
     by_chain = _chain_scores(snap.data, _priced_chains(snap.data))
     entries = [
-        WeightedScoreEntry(
-            indexer=indexer_id,
-            weighted_score=score.weighted_score,
-            components=score.components,
-            factors=score.factors,
-            chains=by_chain.get(indexer_id, {}),
-        )
-        for indexer_id, score in _network_scores(snap.data).items()
+        WeightedScoreEntry(indexer=indexer_id, chains=by_chain.get(indexer_id, {}))
+        for indexer_id in _loaded_indexers(snap.data)
     ]
 
     return WeightedScoresResponse(
@@ -1472,6 +1485,17 @@ def scores_weighted(
         count=len(entries),
         scores=entries,
     )
+
+
+def _loaded_indexers(history: pd.DataFrame) -> list[str]:
+    """Every indexer in the loaded scores once, in order, leaving out rows without one."""
+    indexers: dict[str, None] = {}
+    for value in history.get("indexer", pd.Series(dtype=object)):
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            logger.debug("skipping row with missing indexer field")
+            continue
+        indexers.setdefault(str(value), None)
+    return list(indexers)
 
 
 @app.get("/dips-indexers", response_model=DipsIndexersResponse, responses=_documented_errors(401))
@@ -1618,7 +1642,8 @@ async def get_score(
     request: ScoreRequest,
     authorization: Optional[str] = Header(None),
 ) -> ScoreResponse:
-    """Return one indexer's total score plus the factors and component scores feeding it.
+    """Return one indexer's total score on each chain it has priced, with the factors and
+    component scores feeding each.
 
     Useful for debugging selection decisions and monitoring per-indexer
     performance without running a full selection request.
@@ -1638,12 +1663,8 @@ async def get_score(
     if match.empty:
         return ScoreResponse(indexer_id=request.indexer_id, found=False)
 
-    network = _network_scores(history, indexer_id)[indexer_id]
     return ScoreResponse(
         indexer_id=request.indexer_id,
-        weighted_score=network.weighted_score,
-        components=network.components,
-        factors=network.factors,
         chains=_chain_scores(history, _priced_chains(match), indexer_id).get(indexer_id, {}),
         found=True,
     )
