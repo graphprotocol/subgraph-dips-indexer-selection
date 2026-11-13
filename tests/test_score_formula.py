@@ -162,6 +162,32 @@ class TestRelativeCutOffs:
         assert ("C" in set(ahead["indexer"])) is kept_ahead
 
 
+class TestReplacingTheGroupsSyncedMember:
+    """A member being replaced has left the group for the replacement's sake, so its sync claim
+    doesn't count: a synced challenger keeps the head start the first synced indexer gets."""
+
+    def test_a_synced_challenger_keeps_its_head_start_when_the_only_synced_member_goes(self):
+        """E, the group's only synced member, totals under 15% of A's 1.0. S says it has
+        synced, totals under 60% of A's and gains 0.56 on E, more than half of A's total."""
+        processor = _selector(
+            {"E": 0.02, "M": 0.9, "S": 0.58, "A": 1.0}, ["E", "M"], synced={"e", "s"}
+        )
+
+        swap = processor._swap_for("E")
+
+        assert swap is not None and swap[:2] == ("E", "S")
+
+    def test_another_synced_member_still_holds_a_synced_challenger_to_60_percent(self):
+        """T, also synced, stays in the group, so S needs 60% of A's total to stay ahead."""
+        processor = _selector(
+            {"E": 0.02, "T": 0.9, "S": 0.58, "A": 1.0}, ["E", "T"], synced={"e", "t", "s"}
+        )
+
+        swap = processor._swap_for("E")
+
+        assert swap is not None and swap[:2] == ("E", "A")
+
+
 class TestCutOffsWhileFillingWithStale:
     """Once no fresh candidate is left, the stale ones fill the remaining places but never
     replace a member. B is the best total the pick at hand can choose from: the best stale
