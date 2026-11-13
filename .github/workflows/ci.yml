@@ -1,6 +1,5 @@
 # The service is tested against uv.lock, the versions its image installs and the OSV scan checks.
-# The cronjob image has no lock, so tests/cronjob runs on what pip resolves from its
-# requirements.txt on the day, as the image's build does.
+# tests/cronjob runs against the cronjob's own lock, requirements.txt, which its image installs.
 name: CI
 
 on:
@@ -78,13 +77,11 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra dev
 
-      # mypy checks the cronjob too, and only its requirements.txt lists its packages. The lock
-      # holds every package both lists share at its locked version, and fails the step if the
-      # cronjob needs a version the lock doesn't have.
+      # mypy checks the cronjob too, and only its requirements.txt lists its packages. The 2 images
+      # lock their packages separately, so a package both use can be at 2 versions; mypy needs 1,
+      # and takes the cronjob's.
       - name: Install cronjob dependencies
-        run: |
-          uv export --locked --extra dev --no-hashes --no-emit-project -o "$RUNNER_TEMP/locked.txt"
-          uv pip install -r cronjobs/compute_scores/requirements.txt -c "$RUNNER_TEMP/locked.txt"
+        run: uv pip install --require-hashes -r cronjobs/compute_scores/requirements.txt
 
       - name: mypy
         run: mypy
@@ -103,7 +100,7 @@ jobs:
       # lets the test tools step prove it left every one of those versions alone.
       - name: Install cronjob dependencies
         run: |
-          pip install -r cronjobs/compute_scores/requirements.txt
+          pip install --require-hashes -r cronjobs/compute_scores/requirements.txt
           pip freeze > "$RUNNER_TEMP/cronjob-packages.txt"
 
       # The test tools add packages the image lacks (pydantic and pyyaml among them), so an

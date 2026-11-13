@@ -1312,8 +1312,8 @@ def merge_in_indexers_info(combined_queries: pd.DataFrame, indexers: pd.DataFram
 
 
 def _drop_repeated_airport_codes(iata_df: pd.DataFrame) -> pd.DataFrame:
-    """Keep the first row per IATA code, so a repeat in the unpinned airportsdata package
-    can't stop the airport lookup below from running."""
+    """Keep the first row per IATA code, so a repeat in a new release of the airportsdata
+    package can't stop the airport lookup below from running."""
     repeated = iata_df["IATA_code"].duplicated()
     if repeated.any():
         logger.warning(
