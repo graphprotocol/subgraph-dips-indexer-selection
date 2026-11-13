@@ -102,7 +102,7 @@ When asked to fill a deployment, the service gives each indexer a total score be
 | Value | Price (per 30 days) | lower | 0.45 |
 | Value | Price (per billion entities) | lower | 0.10 |
 
-*Better* is the direction that earns a higher score: latency and price are inverted during scoring, so a lower raw value scores higher. Because the factors multiply, a 0 on uptime or freshness sinks the whole score, while a weak signal inside quality or value only pulls that factor down. These are the weights selection always uses: the source of truth is `QUALITY_WEIGHTS` and `VALUE_WEIGHTS` in `src/iisa/indexer_selection.py`, and a selection request has no way to change them.
+*Better* is the direction that earns a higher score: latency and price are inverted during scoring, so a lower raw value scores higher. Because the factors multiply, a 0 on uptime or freshness sinks the whole score, while a weak signal inside quality or value only pulls that factor down. These are the weights selection always uses: the source of truth is `QUALITY_WEIGHTS` and `VALUE_WEIGHTS` in `src/iisa/indexer_selection.py`, and a selection request has no way to change them. [docs/scoring.md](docs/scoring.md) sets the formula out in full, with every constant and a worked example.
 
 Uptime and success rate are each scored on the indexer's own share, raised to the 6th power, so 90% scores about 0.53 and 80% about 0.26, and an indexer's score on them doesn't move when a better indexer becomes a candidate.
 
