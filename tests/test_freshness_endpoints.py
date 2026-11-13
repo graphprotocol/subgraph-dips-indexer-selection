@@ -544,6 +544,8 @@ class TestRead:
             "share_28d": 0.0,
         }
         assert body["chains"][CHAIN]["indexers"][INDEXER]["window_passed"] == 1
+        assert body["chains"][CHAIN]["last_counted_minute"] == minute
+        assert body["chains"][CHAIN]["last_answered_minute"] == minute
 
     def test_mark_clears_after_5_passing_minutes(self, client):
         now = _now_minute()

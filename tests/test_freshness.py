@@ -202,6 +202,7 @@ def _old_file(tmp_path, save: dict[str, Any]) -> FreshnessStore:
     indexers whose checks stop counting taken out, as a file written then would be."""
     older = json.loads(json.dumps(save))
     older.pop("answered", None)
+    older.pop("last_answered", None)
     for pairs in older["chains"].values():
         for pair in pairs.values():
             pair.pop("last_counted", None)
@@ -348,14 +349,20 @@ class TestStaleIndexers:
         assert chains["amoy"]["indexers"] == {}
 
 
+def _last_counted(store: FreshnessStore, chain: str = CHAIN) -> Optional[str]:
+    """The last minute a check on ``chain`` counted, as GET /freshness reports it."""
+    chains = store.snapshot()["chains"]
+    return chains[chain]["last_counted_minute"] if chain in chains else None
+
+
 class TestLastCountedMinute:
     @pytest.mark.parametrize("outcome", ["pass", "fail", "no_evidence"])
     def test_counted_outcome_sets_its_chains_minute(self, outcome):
         store = FreshnessStore()
         _push(store, START, _check(outcome), _check("void", chain=OTHER_CHAIN))
 
-        assert store.last_counted_minute(CHAIN) == START
-        assert store.last_counted_minute(OTHER_CHAIN) is None
+        assert _last_counted(store) == minute_text(START)
+        assert _last_counted(store, OTHER_CHAIN) is None
 
     def test_void_outcomes_and_empty_pushes_leave_it_alone(self):
         store = FreshnessStore()
@@ -363,7 +370,7 @@ class TestLastCountedMinute:
         _push(store, START + 1, _check("void"), _check("void", indexer=OTHER))
         _push(store, START + 2)
 
-        assert store.last_counted_minute(CHAIN) == START
+        assert _last_counted(store) == minute_text(START)
         assert store.last_minute == START + 2
 
     def test_1_counted_outcome_on_the_chain_is_enough(self):
@@ -371,7 +378,7 @@ class TestLastCountedMinute:
         _push(store, START, _check("pass"))
         _push(store, START + 1, _check("void"), _check("fail", indexer=OTHER))
 
-        assert store.last_counted_minute(CHAIN) == START + 1
+        assert _last_counted(store) == minute_text(START + 1)
 
     def test_forgotten_with_its_chain(self):
         saves: list[dict[str, Any]] = []
@@ -379,15 +386,58 @@ class TestLastCountedMinute:
         store.apply(START, [_check("pass", chain=OTHER_CHAIN)], saves.append)
         store.apply(START + 28 * DAY, [_check("pass")], saves.append)
 
-        assert store.last_counted_minute(OTHER_CHAIN) is None
+        assert _last_counted(store, OTHER_CHAIN) is None
         assert saves[-1]["last_counted"] == {CHAIN: START + 28 * DAY}
+
+
+class TestLastAnsweredMinute:
+    """The last minute in which a check on the chain passed or failed, so went through the
+    gateway, which decides whether its marks and freshness scores are current."""
+
+    @pytest.mark.parametrize("outcome", ["pass", "fail"])
+    def test_a_pass_or_fail_sets_its_chains_minute(self, outcome):
+        store = FreshnessStore()
+        _push(store, START, _check(outcome), _check("no_evidence", chain=OTHER_CHAIN))
+
+        assert store.last_answered_minute(CHAIN) == START
+        assert store.last_answered_minute(OTHER_CHAIN) is None
+
+    def test_no_evidence_voids_and_empty_pushes_leave_it_alone(self):
+        store = FreshnessStore()
+        _push(store, START, _check("pass"))
+        _push(store, START + 1, _check("no_evidence"), _check("void", indexer=OTHER))
+        _push(store, START + 2)
+
+        assert store.last_answered_minute(CHAIN) == START
+        assert _last_counted(store) == minute_text(START + 1)
+
+    def test_a_chain_with_only_no_evidence_pushes_is_not_current(self):
+        store = FreshnessStore()
+        for minute in range(START, START + 10):
+            _push(store, minute, _check("no_evidence"), _check("no_evidence", indexer=OTHER))
+
+        body = store.snapshot(Enforcement(frozenset(), 60, START + 9))["chains"][CHAIN]
+
+        assert store.last_answered_minute(CHAIN) is None
+        assert (body["enforced"], body["enforcing"]) == (True, False)
+        assert body["last_counted_minute"] == minute_text(START + 9)
+        assert body["last_answered_minute"] is None
+
+    def test_forgotten_with_its_chain(self):
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        store.apply(START, [_check("pass", chain=OTHER_CHAIN)], saves.append)
+        store.apply(START + 28 * DAY, [_check("pass")], saves.append)
+
+        assert store.last_answered_minute(OTHER_CHAIN) is None
+        assert saves[-1]["last_answered"] == {CHAIN: START + 28 * DAY}
 
     def test_read_without_waiting_for_the_lock(self):
         store = FreshnessStore()
         _push(store, START, _check("pass"))
 
         with store._lock:
-            assert store.last_counted_minute(CHAIN) == START
+            assert store.last_answered_minute(CHAIN) == START
 
 
 class TestEnforcement:
@@ -409,25 +459,43 @@ class TestEnforcement:
         assert enforcement.enforced("a-chain-never-seen") is True
         assert enforcement.enforced(OTHER_CHAIN) is False
 
-    def test_snapshot_reports_each_chains_enforcement_and_last_counted_minute(self):
+    def test_snapshot_reports_each_chains_enforcement_and_last_minutes(self):
+        """CHAIN's check at START + 1 found no evidence, which counts but isn't an answer, so
+        its marks stop being enforced 61 minutes after START."""
         store = FreshnessStore()
         _push(store, START, _check("pass"), _check("pass", chain=OTHER_CHAIN))
-        _push(store, START + 1, _check("void"), _check("void", chain=OTHER_CHAIN))
+        _push(
+            store,
+            START + 1,
+            _check("void"),
+            _check("no_evidence", indexer=OTHER),
+            _check("void", chain=OTHER_CHAIN),
+        )
         exempt = frozenset({OTHER_CHAIN, "amoy"})
 
-        def chains(now: int) -> dict[str, tuple[bool, bool, Optional[str]]]:
+        def chains(now: int) -> dict[str, tuple[bool, bool, Optional[str], Optional[str]]]:
             report = store.snapshot(Enforcement(exempt, 60, now))["chains"]
             return {
-                chain: (body["enforced"], body["enforcing"], body["last_counted_minute"])
+                chain: (
+                    body["enforced"],
+                    body["enforcing"],
+                    body["last_counted_minute"],
+                    body["last_answered_minute"],
+                )
                 for chain, body in report.items()
             }
 
         assert chains(START + 60) == {
-            CHAIN: (True, True, minute_text(START)),
-            OTHER_CHAIN: (False, False, minute_text(START)),
-            "amoy": (False, False, None),
+            CHAIN: (True, True, minute_text(START + 1), minute_text(START)),
+            OTHER_CHAIN: (False, False, minute_text(START), minute_text(START)),
+            "amoy": (False, False, None, None),
         }
-        assert chains(START + 61)[CHAIN] == (True, False, minute_text(START))
+        assert chains(START + 61)[CHAIN] == (
+            True,
+            False,
+            minute_text(START + 1),
+            minute_text(START),
+        )
 
     def test_snapshot_without_enforcement_enforces_nothing(self):
         store = FreshnessStore()
@@ -437,6 +505,7 @@ class TestEnforcement:
 
         assert (body["enforced"], body["enforcing"]) == (False, False)
         assert body["last_counted_minute"] == minute_text(START)
+        assert body["last_answered_minute"] == minute_text(START)
 
 
 class TestPushes:
@@ -537,12 +606,13 @@ class TestSavedFile:
             store.apply(START + offset, [_check(outcome), _check("fail", indexer=OTHER)], save)
         assert json.loads(path.read_text())["version"] == 1
         assert json.loads(path.read_text())["last_counted"] == {CHAIN: START + 5}
+        assert json.loads(path.read_text())["last_answered"] == {CHAIN: START + 5}
 
         reloaded = FreshnessStore(load_state(str(path)))
 
         assert reloaded.snapshot() == store.snapshot()
         assert reloaded.last_minute == START + 5
-        assert reloaded.last_counted_minute(CHAIN) == START + 5
+        assert reloaded.last_answered_minute(CHAIN) == START + 5
         assert reloaded.stale_indexers(CHAIN, [INDEXER, OTHER]) == {OTHER}
         # The reloaded store keeps judging from where the saved one stopped.
         reloaded.apply(START + 6, [_check("pass")], _no_save)
@@ -556,7 +626,11 @@ class TestSavedFile:
             store.apply(
                 START + offset, [_check("pass"), _check("fail", indexer=OTHER)], saves.append
             )
-        older = {key: value for key, value in saves[-1].items() if key != "last_counted"}
+        older = {
+            key: value
+            for key, value in saves[-1].items()
+            if key not in ("last_counted", "last_answered")
+        }
         path = tmp_path / "freshness.json"
         path.write_text(json.dumps(older))
 
@@ -566,9 +640,28 @@ class TestSavedFile:
         assert caplog.records == []
         assert reloaded.last_minute == START + 4
         assert reloaded.stale_indexers(CHAIN, [INDEXER, OTHER]) == {OTHER}
-        assert reloaded.last_counted_minute(CHAIN) is None
+        assert reloaded.last_answered_minute(CHAIN) is None
         reloaded.apply(START + 5, [_check("pass")], _no_save)
-        assert reloaded.last_counted_minute(CHAIN) == START + 5
+        assert reloaded.last_answered_minute(CHAIN) == START + 5
+        assert _last_counted(reloaded) == minute_text(START + 5)
+
+    def test_an_older_file_takes_each_chains_last_answered_minute_from_its_last_counted(
+        self, tmp_path
+    ):
+        """So the chain stays current as it was until its first answered minute, even when its
+        last counted check found no evidence."""
+        saves: list[dict[str, Any]] = []
+        store = FreshnessStore()
+        store.apply(START, [_check("pass")], saves.append)
+        store.apply(START + 1, [_check("no_evidence")], saves.append)
+
+        reloaded = _old_file(tmp_path, saves[-1])
+
+        assert reloaded.last_answered_minute(CHAIN) == START + 1
+        reloaded.apply(START + 2, [_check("no_evidence")], _no_save)
+        assert reloaded.last_answered_minute(CHAIN) == START + 1
+        reloaded.apply(START + 3, [_check("fail")], _no_save)
+        assert reloaded.last_answered_minute(CHAIN) == START + 3
 
     def test_an_older_file_loads_and_marks_nobody_who_was_fine(self, tmp_path, caplog):
         """Each pair's recent outcomes are seeded from the counted minutes in its window, so

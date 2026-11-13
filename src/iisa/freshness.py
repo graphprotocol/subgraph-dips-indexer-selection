@@ -64,6 +64,11 @@ def minute_text(index: int) -> str:
     return (_EPOCH + timedelta(minutes=index)).isoformat().replace("+00:00", "Z")
 
 
+def _optional_minute_text(index: Optional[int]) -> Optional[str]:
+    """The minute ``index`` as minute_text gives it, or None for None."""
+    return minute_text(index) if index is not None else None
+
+
 @dataclass(frozen=True)
 class Check:
     """One indexer's outcome on one chain in a pushed minute."""
@@ -153,6 +158,18 @@ class FreshnessState(BaseModel):
     # By chain, how many answered minutes it has had: minutes in which some check there passed or
     # failed. A file saved before this was kept starts every chain from 0.
     answered: dict[str, int] = Field(default_factory=dict)
+    # By chain, its last answered minute, which decides whether its marks and freshness scores
+    # are current. A file saved before this was kept starts from last_counted.
+    last_answered: dict[str, int] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _fill_in_for_an_older_file(self) -> Self:
+        """State saved before the last answered minute was kept takes each chain's last counted
+        minute instead, so a chain current then stays current until its next answered minute.
+        """
+        if "last_answered" not in self.model_fields_set:
+            self.last_answered = dict(self.last_counted)
+        return self
 
 
 def _window(pair: PairState, received: set[int], last_minute: int) -> tuple[int, int]:
@@ -231,6 +248,7 @@ def _prune(state: FreshnessState, last_minute: int) -> None:
             del state.chains[chain]
             state.last_counted.pop(chain, None)
             state.answered.pop(chain, None)
+            state.last_answered.pop(chain, None)
 
 
 def _trim(pair: PairState, last_minute: int) -> None:
@@ -294,9 +312,7 @@ def _report(pair: PairState, received: set[int], last_minute: int, answered: int
         "window_passed": passed,
         "window_counted": counted,
         "last": {**pair.last.model_dump(), "minute": minute_text(pair.last.minute)},
-        "last_counted_minute": (
-            minute_text(pair.last_counted) if pair.last_counted is not None else None
-        ),
+        "last_counted_minute": _optional_minute_text(pair.last_counted),
         "recent_passed": sum(outcome.passed for outcome in recent),
         "recent_counted": len(recent),
         "passed_28d": passed_28d,
@@ -308,7 +324,7 @@ def _report(pair: PairState, received: set[int], last_minute: int, answered: int
 @dataclass(frozen=True)
 class Enforcement:
     """The chains exempt from freshness, whose marks are only recorded and reported, how many
-    minutes a chain's last counted check may be behind ``now`` for its marks to still decide
+    minutes a chain's last answered minute may be behind ``now`` for its marks to still decide
     selection, and ``now``, the service's current minute.
     """
 
@@ -322,28 +338,28 @@ class Enforcement:
         """
         return chain not in self.exempt
 
-    def current(self, last_counted: Optional[int]) -> bool:
-        """Whether a chain whose last counted check was in the minute ``last_counted`` has
-        checks recent enough for its marks to be trusted.
+    def current(self, last_answered: Optional[int]) -> bool:
+        """Whether a chain whose last answered minute was ``last_answered`` has checks recent
+        enough for its marks to be trusted. Its no_evidence checks don't keep it current, as
+        the prober works them out without asking the gateway.
         """
-        return last_counted is not None and self.now - last_counted <= self.max_age_minutes
+        return last_answered is not None and self.now - last_answered <= self.max_age_minutes
 
 
 def _chain_report(
-    chain: str,
-    indexers: dict[str, Any],
-    last_counted: Optional[int],
-    enforcement: Optional[Enforcement],
+    chain: str, indexers: dict[str, Any], state: FreshnessState, enforcement: Optional[Enforcement]
 ) -> dict[str, Any]:
     """1 chain as GET /freshness reports it. Without ``enforcement`` nothing is enforced."""
+    last_answered = state.last_answered.get(chain)
     enforced = enforcing = False
     if enforcement is not None:
         enforced = enforcement.enforced(chain)
-        enforcing = enforced and enforcement.current(last_counted)
+        enforcing = enforced and enforcement.current(last_answered)
     return {
         "enforced": enforced,
         "enforcing": enforcing,
-        "last_counted_minute": minute_text(last_counted) if last_counted is not None else None,
+        "last_counted_minute": _optional_minute_text(state.last_counted.get(chain)),
+        "last_answered_minute": _optional_minute_text(last_answered),
         "indexers": indexers,
     }
 
@@ -377,15 +393,14 @@ def _scores_of(state: FreshnessState) -> dict[str, dict[str, float]]:
 
 @dataclass(frozen=True)
 class _Marks:
-    """The last minute applied, by chain the indexers not marked there, by chain the last
-    minute a check there counted, and by chain each indexer's freshness score on the chains
-    scored. Rebuilt after each push and swapped in with 1 assignment, so selection reads it
-    without the lock.
+    """The last minute applied, by chain the indexers not marked there, by chain its last
+    answered minute, and by chain each indexer's freshness score on the chains scored. Rebuilt
+    after each push and swapped in with 1 assignment, so selection reads it without the lock.
     """
 
     last_minute: Optional[int]
     unmarked: Mapping[str, frozenset[str]]
-    last_counted: Mapping[str, int]
+    last_answered: Mapping[str, int]
     scores: Mapping[str, Mapping[str, float]]
 
 
@@ -394,7 +409,7 @@ def _marks_of(state: FreshnessState) -> _Marks:
         chain: frozenset(indexer for indexer, pair in pairs.items() if not pair.marked)
         for chain, pairs in state.chains.items()
     }
-    return _Marks(state.last_minute, unmarked, dict(state.last_counted), _scores_of(state))
+    return _Marks(state.last_minute, unmarked, dict(state.last_answered), _scores_of(state))
 
 
 class FreshnessStore:
@@ -429,6 +444,7 @@ class FreshnessStore:
             answered = _answered_chains(checks)
             for chain in answered:
                 state.answered[chain] = state.answered.get(chain, 0) + 1
+                state.last_answered[chain] = minute
             for check in checks:
                 _record(state, minute, check)
             state.last_minute = minute
@@ -453,16 +469,16 @@ class FreshnessStore:
         """
         return self._marks.scores.get(chain)
 
-    def last_counted_minute(self, chain: str) -> Optional[int]:
-        """The last minute in which a check on ``chain`` counted, or None when none has in
-        HISTORY_DAYS.
+    def last_answered_minute(self, chain: str) -> Optional[int]:
+        """The last minute in which a check on ``chain`` passed or failed, or None when none has
+        while the chain had records.
         """
-        return self._marks.last_counted.get(chain)
+        return self._marks.last_answered.get(chain)
 
     def snapshot(self, enforcement: Optional[Enforcement] = None) -> dict[str, Any]:
         """Every pair's mark, window, latest outcome and 28-day counts, by chain, with whether
-        each chain is enforced and enforcing under ``enforcement`` and the last minute a check
-        on it counted. An exempt chain is listed even with no indexers.
+        each chain is enforced and enforcing under ``enforcement`` and the last minutes a check
+        on it counted and was answered. An exempt chain is listed even with no indexers.
         """
         exempt = enforcement.exempt if enforcement is not None else frozenset()
         with self._lock:
@@ -478,11 +494,9 @@ class FreshnessStore:
                         for indexer, pair in pairs.items()
                     }
             return {
-                "last_minute": minute_text(last_minute) if last_minute is not None else None,
+                "last_minute": _optional_minute_text(last_minute),
                 "chains": {
-                    chain: _chain_report(
-                        chain, indexers, state.last_counted.get(chain), enforcement
-                    )
+                    chain: _chain_report(chain, indexers, state, enforcement)
                     for chain, indexers in reports.items()
                 },
             }
