@@ -927,6 +927,20 @@ _state = IISAState()
 # =============================================================================
 
 
+# The opt-in list of enforced chains that IISA_FRESHNESS_EXEMPT_CHAINS replaced. Startup warns
+# when it is still set, as whoever set it may expect only the chains it lists to be enforced.
+_RETIRED_ENFORCED_CHAINS = "IISA_FRESHNESS_ENFORCED_CHAINS"
+
+
+def _warn_about_retired_settings(environ: Mapping[str, str]) -> None:
+    if _RETIRED_ENFORCED_CHAINS in environ:
+        logger.warning(
+            "%s is set but no longer read: freshness is enforced on every chain not listed in "
+            "IISA_FRESHNESS_EXEMPT_CHAINS",
+            _RETIRED_ENFORCED_CHAINS,
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """FastAPI lifespan: load settings, init loader + DataManager, recover the
@@ -964,6 +978,8 @@ async def lifespan(_app: FastAPI):
             "IISA_READ_TOKEN is the same as IISA_PUSH_TOKEN, so whoever holds it can push "
             "scores and sync status too. Give readers a token of their own."
         )
+
+    _warn_about_retired_settings(os.environ)
 
     # Initialize providers
     if not _state.initialize(settings):
