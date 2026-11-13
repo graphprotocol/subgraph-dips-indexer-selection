@@ -219,14 +219,20 @@ def _report(pair: PairState, received: set[int], last_minute: int) -> dict[str, 
 
 @dataclass(frozen=True)
 class Enforcement:
-    """The chains whose marks are meant to decide selection, how many minutes a chain's last
-    counted check may be behind ``now`` for them to still do so, and ``now``, the service's
-    current minute.
+    """The chains exempt from freshness, whose marks are only recorded and reported, how many
+    minutes a chain's last counted check may be behind ``now`` for its marks to still decide
+    selection, and ``now``, the service's current minute.
     """
 
-    chains: frozenset[str]
+    exempt: frozenset[str]
     max_age_minutes: int
     now: int
+
+    def enforced(self, chain: str) -> bool:
+        """Whether the marks on ``chain`` are meant to decide selection: on every chain that
+        isn't exempt.
+        """
+        return chain not in self.exempt
 
     def current(self, last_counted: Optional[int]) -> bool:
         """Whether a chain whose last counted check was in the minute ``last_counted`` has
@@ -235,17 +241,20 @@ class Enforcement:
         return last_counted is not None and self.now - last_counted <= self.max_age_minutes
 
 
-_NOTHING_ENFORCED = Enforcement(frozenset(), 0, 0)
-
-
 def _chain_report(
-    chain: str, indexers: dict[str, Any], last_counted: Optional[int], enforcement: Enforcement
+    chain: str,
+    indexers: dict[str, Any],
+    last_counted: Optional[int],
+    enforcement: Optional[Enforcement],
 ) -> dict[str, Any]:
-    """1 chain as GET /freshness reports it."""
-    enforced = chain in enforcement.chains
+    """1 chain as GET /freshness reports it. Without ``enforcement`` nothing is enforced."""
+    enforced = enforcing = False
+    if enforcement is not None:
+        enforced = enforcement.enforced(chain)
+        enforcing = enforced and enforcement.current(last_counted)
     return {
         "enforced": enforced,
-        "enforcing": enforced and enforcement.current(last_counted),
+        "enforcing": enforcing,
         "last_counted_minute": minute_text(last_counted) if last_counted is not None else None,
         "indexers": indexers,
     }
@@ -323,15 +332,16 @@ class FreshnessStore:
         """
         return self._marks.last_counted.get(chain)
 
-    def snapshot(self, enforcement: Enforcement = _NOTHING_ENFORCED) -> dict[str, Any]:
+    def snapshot(self, enforcement: Optional[Enforcement] = None) -> dict[str, Any]:
         """Every pair's mark, window, latest outcome and 28-day counts, by chain, with whether
         each chain is enforced and enforcing under ``enforcement`` and the last minute a check
-        on it counted. An enforced chain is listed even with no indexers.
+        on it counted. An exempt chain is listed even with no indexers.
         """
+        exempt = enforcement.exempt if enforcement is not None else frozenset()
         with self._lock:
             state = self._state
             last_minute = state.last_minute
-            reports: dict[str, dict[str, Any]] = {chain: {} for chain in sorted(enforcement.chains)}
+            reports: dict[str, dict[str, Any]] = {chain: {} for chain in sorted(exempt)}
             if last_minute is not None:
                 for chain, pairs in state.chains.items():
                     reports[chain] = {

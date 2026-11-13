@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from iisa import DataManager, score_loader
 from iisa import iisa_http_endpoints as endpoints
+from iisa.freshness import FreshnessStore
 from iisa.iisa_http_endpoints import IISAState, SelectionRequest, Settings, _select_with_processor
 from iisa.indexer_selection import IndexerSelector
 
@@ -182,7 +183,11 @@ def _scored(records: list[dict], fees: Optional[dict[str, float]] = None) -> pd.
         deployment_id="QmStakeReadTime", chain_id=CHAIN, num_candidates=2, optimistic_dips_fees=fees
     )
     with (
-        patch.object(endpoints, "_state", SimpleNamespace(history=history, sync_status=None)),
+        patch.object(
+            endpoints,
+            "_state",
+            SimpleNamespace(history=history, sync_status=None, freshness=FreshnessStore()),
+        ),
         patch.object(endpoints, "IndexerSelector", side_effect=build),
     ):
         _select_with_processor(request)

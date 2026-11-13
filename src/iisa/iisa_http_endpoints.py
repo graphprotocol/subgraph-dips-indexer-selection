@@ -50,6 +50,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .freshness import (
     HISTORY_DAYS,
+    MINUTES_PER_DAY,
     Check,
     Enforcement,
     FreshnessStore,
@@ -100,11 +101,11 @@ class Settings(BaseSettings):
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
     freshness_file_path: str = "/app/scores/freshness.json"
-    # Chains, comma-separated, on which an indexer marked stale isn't picked for new
-    # agreements. Elsewhere the mark is only recorded and reported.
-    freshness_enforced_chains: Annotated[frozenset[str], NoDecode] = frozenset()
-    # How many minutes behind this service's clock an enforced chain's last counted check may
-    # be. Past that its marks are too old to trust, and selection there ignores them.
+    # Chains, comma-separated, on which a stale mark is only recorded and reported. On every
+    # other chain an indexer marked stale isn't picked for new agreements.
+    freshness_exempt_chains: Annotated[frozenset[str], NoDecode] = frozenset()
+    # How many minutes behind this service's clock a chain's last counted check may be. Past
+    # that its marks are too old to trust, and selection there ignores them.
     freshness_max_age_minutes: int = Field(default=60, ge=1)
     # Bearer token for pushing scores and sync status, also accepted on every read.
     # /health and /select-indexers take no token. When it is unset, a WARNING is
@@ -159,7 +160,7 @@ class Settings(BaseSettings):
             raise ValueError("IISA_SYNC_CHECK_GATEWAY_URL must start with http:// or https://")
         return self
 
-    @field_validator("freshness_enforced_chains", mode="before")
+    @field_validator("freshness_exempt_chains", mode="before")
     @classmethod
     def _split_chains(cls, value: Any) -> Any:
         if isinstance(value, str):
@@ -410,9 +411,9 @@ class WeightedScoresResponse(BaseModel):
 
 
 class DipsIndexersResponse(BaseModel):
-    """Response for GET /dips-indexers: the indexers offering DIPs on the chain. Where freshness
-    is enforced there, selection also leaves out the ones marked stale. ``computed_at`` mirrors
-    the push so callers can reject an out-of-date snapshot. Example::
+    """Response for GET /dips-indexers: the indexers offering DIPs on the chain. Unless the chain
+    is exempt from freshness, selection also leaves out the ones marked stale. ``computed_at``
+    mirrors the push so callers can reject an out-of-date snapshot. Example::
 
         {"computed_at": "2026-06-23T09:00:00+00:00", "count": 2, "indexers": ["0xaa", "0xbb"]}
     """
@@ -592,9 +593,9 @@ class FreshnessPair(BaseModel):
 
 
 class FreshnessChain(BaseModel):
-    """Freshness on 1 chain, by indexer. enforced says the chain is listed as enforced, and
-    enforcing that a check there also counted recently enough for a marked indexer to be
-    left out of new agreements. last_counted_minute is null when no check there has counted.
+    """Freshness on 1 chain, by indexer. enforced says the chain isn't exempt, and enforcing
+    that a check there also counted recently enough for a marked indexer to be left out of new
+    agreements. last_counted_minute is null when no check there has counted.
     """
 
     enforced: bool = False
@@ -1432,7 +1433,7 @@ def dips_indexers(
     """Indexers offering DIPs on ``chain`` (a 422 if omitted), by selection's price test: they
     answered their DIPs probe, support the chain and are priced within the optional
     ``max_grt_per_30_days`` and ``max_grt_per_billion_entities_per_30_days`` ceilings (omit
-    either to skip it). Where freshness is enforced on the chain, selection also leaves out
+    either to skip it). Unless the chain is exempt from freshness, selection also leaves out
     indexers marked stale, which this list still includes. Example: ``?chain=arbitrum-one``.
     """
     _require_read_token(authorization)
@@ -2138,42 +2139,48 @@ def _current_minute() -> int:
 def _enforcement() -> Enforcement:
     settings = get_settings()
     return Enforcement(
-        settings.freshness_enforced_chains, settings.freshness_max_age_minutes, _current_minute()
+        settings.freshness_exempt_chains, settings.freshness_max_age_minutes, _current_minute()
     )
 
 
 def _checks_too_old(request: SelectionRequest, enforcement: Enforcement) -> bool:
-    """True, after a warning saying why, when the request's chain is enforced but no check
-    there counted recently enough for its marks to be trusted.
+    """True when no check on the request's chain counted recently enough for its marks to be
+    trusted. A chain whose checks counted but have since gone past the limit, as when the
+    prober stops, gets a warning on every selection. A chain with no counted check in the
+    HISTORY_DAYS kept, such as one the prober doesn't check, only gets a debug line.
     """
     last_counted = _state.freshness.last_counted_minute(request.chain_id)
     if enforcement.current(last_counted):
         return False
-    if last_counted is None:
-        why = f"no freshness check on it has counted in the last {HISTORY_DAYS} days"
-    else:
-        why = (
-            f"its last counted check was {enforcement.now - last_counted} minutes ago, over "
-            f"the limit of {enforcement.max_age_minutes} set by IISA_FRESHNESS_MAX_AGE_MINUTES"
+    if last_counted is None or enforcement.now - last_counted > HISTORY_DAYS * MINUTES_PER_DAY:
+        logger.debug(
+            "deployment=%s chain=%s: freshness isn't enforced there, since no freshness check "
+            "on it has counted in the last %d days",
+            request.deployment_id,
+            request.chain_id,
+            HISTORY_DAYS,
         )
+        return True
     logger.warning(
-        "deployment=%s chain=%s is listed as enforced but freshness isn't enforced there, "
-        "since %s; candidates are picked as if the chain weren't listed",
+        "deployment=%s chain=%s isn't exempt but freshness isn't enforced there, since its last "
+        "counted check was %d minutes ago, over the limit of %d set by "
+        "IISA_FRESHNESS_MAX_AGE_MINUTES; candidates are picked as if the chain were exempt",
         request.deployment_id,
         request.chain_id,
-        why,
+        enforcement.now - last_counted,
+        enforcement.max_age_minutes,
     )
     return True
 
 
 def _stale_candidates(request: SelectionRequest, candidates: pd.DataFrame) -> list[str]:
-    """Candidates marked stale on the request's chain, or with no freshness record there, when
-    that chain is enforced and its checks are recent enough to trust. Group members are never
-    listed: a stale member keeps its place and still counts towards each metric's scale, as
-    members do on a chain that isn't enforced.
+    """Candidates marked stale on the request's chain, or with no freshness record there,
+    unless that chain is exempt or its checks aren't recent enough to trust. Group members are
+    never listed: a stale member keeps its place and still counts towards each metric's scale,
+    as members do on an exempt chain.
     """
     enforcement = _enforcement()
-    if request.chain_id not in enforcement.chains or _checks_too_old(request, enforcement):
+    if not enforcement.enforced(request.chain_id) or _checks_too_old(request, enforcement):
         return []
     members = {member.lower() for member in request.existing_indexers or []}
     ids = [ix for ix in candidates.get("indexer", pd.Series(dtype=object)) if isinstance(ix, str)]

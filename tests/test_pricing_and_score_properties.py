@@ -20,6 +20,7 @@ from hypothesis import example, given, note
 from hypothesis import strategies as st
 
 from iisa import iisa_http_endpoints as endpoints
+from iisa.freshness import FreshnessStore
 from iisa.iisa_http_endpoints import (
     SelectionRequest,
     _extract_chain_price,
@@ -612,7 +613,7 @@ def _select(case: SelectionCase) -> tuple[list[str], Optional[IndexerSelector]]:
         built.append(IndexerSelector(*args, **kwargs))
         return built[-1]
 
-    state = SimpleNamespace(history=case.table, sync_status=None)
+    state = SimpleNamespace(history=case.table, sync_status=None, freshness=FreshnessStore())
     with (
         patch.object(endpoints, "_state", state),
         patch.object(endpoints, "IndexerSelector", side_effect=build),
