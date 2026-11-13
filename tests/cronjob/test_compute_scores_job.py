@@ -966,6 +966,30 @@ class TestPerformLinearRegression:
 
         assert latency == pytest.approx({"0xnegative": 0.0, "0xa": 100.0, "0xb": 200.0}, abs=3)
 
+    def test_latency_in_ms_is_each_indexers_own_with_most_traffic_on_the_faster(self):
+        """The gateway sends most queries to fast indexers, so the median query is a fast one,
+        while the regression measures each indexer from the median indexer."""
+        true_ms = {"0xfast": 100.0, "0xslow": 500.0}
+
+        assert self._latency_ms(true_ms, [0.9, 0.1]) == pytest.approx(true_ms, abs=3)
+
+    def test_latency_in_ms_is_each_indexers_own_with_80_percent_on_the_2_fastest(self):
+        true_ms = {"0xa": 80.0, "0xb": 120.0, "0xc": 300.0, "0xd": 450.0, "0xe": 900.0}
+
+        latency = self._latency_ms(true_ms, [0.45, 0.35, 0.10, 0.06, 0.04])
+
+        assert latency == pytest.approx(true_ms, abs=3)
+
+    def test_a_fast_indexer_with_most_of_the_traffic_is_not_floored(self):
+        """Most queries go to an indexer that answers in 1ms, so the median query takes about
+        1ms while the median indexer takes 1,000ms; anchoring on the median query would put
+        the fast indexer below 0 and the others about 1,000ms too fast."""
+        true_ms = {"0xinstant": 1.0, "0xslow": 1_000.0, "0xslower": 2_000.0}
+
+        latency = self._latency_ms(true_ms, [0.6, 0.2, 0.2], rows=3_000, noise=0.5)
+
+        assert latency == pytest.approx(true_ms, abs=2)
+
     @pytest.mark.filterwarnings(
         "ignore:divide by zero encountered:RuntimeWarning",
         "ignore:invalid value encountered:RuntimeWarning",
