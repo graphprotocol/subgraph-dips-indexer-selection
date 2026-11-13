@@ -197,12 +197,13 @@ def test_every_candidate_marked_picks_nobody_new(state):
     assert _select(size=3, existing=[FAIR]) == [FAIR]
 
 
-@pytest.mark.parametrize(("minutes", "picked"), [(60, BEST), (61, GOOD)])
-def test_a_candidate_whose_checks_stop_counting_for_over_an_hour_is_left_out(
+@pytest.mark.parametrize(("minutes", "picked"), [(56, BEST), (57, GOOD)])
+def test_a_candidate_whose_checks_stop_counting_for_an_hour_is_left_out(
     state, monkeypatch, minutes, picked
 ):
     """BEST's checks are all void, as when it refuses the prober's payments, while the others
-    pass, so after 60 minutes there is no evidence it is still fresh."""
+    pass, so once its last 5 counted checks are over 60 answered minutes old there is no
+    evidence it is still fresh."""
     _judge(state, {(BEST, CHAIN): "pass", (GOOD, CHAIN): "pass", (FAIR, CHAIN): "pass"}, LAST)
     for minute in range(LAST + 1, LAST + 1 + minutes):
         checks = [

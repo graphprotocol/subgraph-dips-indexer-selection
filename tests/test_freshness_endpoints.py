@@ -537,6 +537,8 @@ class TestRead:
                 "age_seconds": 1778.9,
             },
             "last_counted_minute": minute,
+            "recent_passed": 0,
+            "recent_counted": 1,
             "passed_28d": 0,
             "counted_28d": 1,
             "share_28d": 0.0,

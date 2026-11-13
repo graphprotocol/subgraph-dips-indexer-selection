@@ -218,15 +218,43 @@ class TestAnsweredMinutes:
     """
 
     @pytest.mark.parametrize("silence", ["void", None], ids=["void", "left-out"])
-    @pytest.mark.parametrize(("minutes", "marked"), [(60, False), (61, True)])
-    def test_a_pair_silent_while_others_answer_is_marked(self, silence, minutes, marked):
-        """Its last counted check, in answered minute 10, is too old after 61 more."""
+    @pytest.mark.parametrize(("minutes", "marked"), [(56, False), (57, True)])
+    def test_a_pair_with_under_5_counted_checks_in_60_answered_minutes_is_marked(
+        self, silence, minutes, marked
+    ):
+        """Its last 5 counted checks fall in answered minutes 6 to 10, and the oldest is more
+        than 60 answered minutes old after 57 more."""
         store = FreshnessStore()
         _run(store, ["pass"] * 10 + [silence] * minutes)
 
         pair = _pair(store)
         assert (pair["marked"], pair["judged"]) == (marked, False)
         assert pair["last_counted_minute"] == minute_text(START + 9)
+        recent = 4 if marked else 5
+        assert (pair["recent_passed"], pair["recent_counted"]) == (recent, recent)
+
+    def test_an_indexer_refusing_9_of_10_checks_and_failing_the_rest_is_marked(self):
+        """1 counted check every 10 minutes kept its window from ever holding 5, so it was
+        never judged and kept the mark it had."""
+        store = FreshnessStore()
+        minute = _run(store, ["pass"] * 10)
+        _run(store, (["void"] * 9 + ["fail"]) * 6, start=minute)
+
+        pair = _pair(store)
+        assert (pair["marked"], pair["judged"]) == (True, False)
+        assert (pair["recent_passed"], pair["recent_counted"]) == (0, 5)
+
+    def test_a_marked_indexer_passing_now_and_then_clears_once_3_of_its_last_5_pass(self):
+        store = FreshnessStore()
+        minute = _run(store, ["fail"] * 10)
+
+        marks = []
+        for _ in range(3):
+            minute = _run(store, ["void"] * 9 + ["pass"], start=minute)
+            marks.append(_pair(store)["marked"])
+
+        assert marks == [True, True, False]
+        assert (_pair(store)["recent_passed"], _pair(store)["recent_counted"]) == (3, 5)
 
     def test_a_2_hour_gateway_outage_marks_nobody_new(self):
         """NOEV has no allocation old enough to check, so its no_evidence outcomes come from

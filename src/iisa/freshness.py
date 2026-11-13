@@ -37,10 +37,12 @@ OutcomeKind = Literal["pass", "fail", "no_evidence", "void"]
 
 WINDOW_MINUTES = 10
 MIN_COUNTED_MINUTES = 5
-# A pair none of whose checks has counted in this many of its chain's latest answered minutes is
-# marked: with no evidence it is fresh, it isn't picked. An answered minute on a chain is 1 in
-# which some check there passed or failed, so went through the gateway; an outage that voids
-# every check, or leaves only the no_evidence ones the prober works out alone, ages nobody.
+# A pair whose window holds too few counted minutes is judged on its last MIN_COUNTED_MINUTES
+# counted outcomes instead, while the oldest is no more than this many of its chain's answered
+# minutes old, and is marked once it has too few that recent: with no evidence it is fresh, it
+# isn't picked. An answered minute on a chain is 1 in which some check there passed or failed,
+# so went through the gateway; an outage that voids every check, or leaves only the no_evidence
+# ones the prober works out alone, ages nobody.
 RECENT_ANSWERED_MINUTES = 60
 HISTORY_DAYS = 28
 MINUTES_PER_DAY = 1_440
@@ -250,30 +252,40 @@ def _has_counted(pair: PairState) -> bool:
     return bool(pair.recent) or any(day.counted for day in pair.days.values())
 
 
-def _silent(pair: PairState, answered: int) -> bool:
-    """Whether none of the pair's counted checks falls in its chain's latest
-    RECENT_ANSWERED_MINUTES answered minutes, ``answered`` being the chain's count now."""
-    return not pair.recent or answered - pair.recent[-1].answered > RECENT_ANSWERED_MINUTES
+def _recent(pair: PairState, answered: int) -> list[RecentOutcome]:
+    """The pair's recent outcomes no more than RECENT_ANSWERED_MINUTES answered minutes old,
+    ``answered`` being its chain's count now."""
+    return [o for o in pair.recent if answered - o.answered <= RECENT_ANSWERED_MINUTES]
+
+
+def _recent_mark(pair: PairState, answered: int) -> bool:
+    """The mark from the pair's last MIN_COUNTED_MINUTES counted outcomes: unmarked when all of
+    them are recent and at least half passed, and marked otherwise."""
+    recent = _recent(pair, answered)
+    if len(recent) < MIN_COUNTED_MINUTES:
+        return True
+    return sum(outcome.passed for outcome in recent) * 2 < len(recent)
 
 
 def _update_marks(state: FreshnessState, last_minute: int, answered: Iterable[str]) -> None:
     """Judge every pair on each chain answered in the minute just applied. On any other chain
     every mark stays as it was, as nothing there went through the gateway. A pair with too few
-    counted minutes in its window keeps its mark, unless it is silent, which marks it; a pair
-    that never counted keeps the mark it started with.
+    counted minutes in its window is judged on its recent outcomes instead (_recent_mark); a
+    pair that never counted keeps the mark it started with.
     """
     for chain in answered:
         for pair in state.chains.get(chain, {}).values():
             passed, counted = _window(pair, state.received, last_minute)
             if counted >= MIN_COUNTED_MINUTES:
                 pair.marked = passed * 2 < counted
-            elif _has_counted(pair) and _silent(pair, state.answered[chain]):
-                pair.marked = True
+            elif _has_counted(pair):
+                pair.marked = _recent_mark(pair, state.answered[chain])
 
 
-def _report(pair: PairState, received: set[int], last_minute: int) -> dict[str, Any]:
-    """1 pair as GET /freshness reports it."""
+def _report(pair: PairState, received: set[int], last_minute: int, answered: int) -> dict[str, Any]:
+    """1 pair as GET /freshness reports it, ``answered`` being its chain's answered count."""
     passed, counted = _window(pair, received, last_minute)
+    recent = _recent(pair, answered)
     passed_28d = sum(day.passed for day in pair.days.values())
     counted_28d = sum(day.counted for day in pair.days.values())
     return {
@@ -285,6 +297,8 @@ def _report(pair: PairState, received: set[int], last_minute: int) -> dict[str, 
         "last_counted_minute": (
             minute_text(pair.last_counted) if pair.last_counted is not None else None
         ),
+        "recent_passed": sum(outcome.passed for outcome in recent),
+        "recent_counted": len(recent),
         "passed_28d": passed_28d,
         "counted_28d": counted_28d,
         "share_28d": passed_28d / counted_28d if counted_28d else None,
@@ -458,7 +472,9 @@ class FreshnessStore:
             if last_minute is not None:
                 for chain, pairs in state.chains.items():
                     reports[chain] = {
-                        indexer: _report(pair, state.received, last_minute)
+                        indexer: _report(
+                            pair, state.received, last_minute, state.answered.get(chain, 0)
+                        )
                         for indexer, pair in pairs.items()
                     }
             return {

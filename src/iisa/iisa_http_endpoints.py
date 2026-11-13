@@ -584,8 +584,9 @@ class FreshnessLastCheck(BaseModel):
 
 class FreshnessPair(BaseModel):
     """An indexer's freshness on 1 chain. judged is false when fewer than 5 of the last 10
-    minutes counted, and marked is then the mark carried over, unless none of the indexer's
-    checks has counted for over 60 minutes while others on the chain did, which marks it.
+    minutes counted. marked then comes from its last 5 counted checks, recent_passed of the
+    recent_counted no more than 60 of the chain's answered minutes old: it is unmarked only when
+    all 5 are that recent and at least 3 passed. An indexer that never counted keeps its mark.
     last_counted_minute is null until one of its checks counts.
     """
 
@@ -595,6 +596,8 @@ class FreshnessPair(BaseModel):
     window_counted: int
     last: FreshnessLastCheck
     last_counted_minute: Optional[str] = None
+    recent_passed: int = 0
+    recent_counted: int = 0
     passed_28d: int
     counted_28d: int
     share_28d: Optional[float] = None
