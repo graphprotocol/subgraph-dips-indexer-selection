@@ -69,6 +69,9 @@ def test_each_entry_ages_on_its_own(monkeypatch):
 CHAIN = "arbitrum-one"
 STRONG = ["0x" + digit * 40 for digit in "1234"]
 WEAK = "0x" + "9" * 40
+# Well below the strong indexers, yet its total stays above 15% of theirs, the cut-off under
+# which a group member is replaced in the same selection by a much better candidate.
+WEAK_QUALITY = 0.8
 
 
 def _score_record(indexer: str, quality: float) -> dict:
@@ -114,7 +117,7 @@ def weak_indexer_synced(monkeypatch, tmp_path):
     state = iisa_http_endpoints.IISAState()
     state.initialize(iisa_http_endpoints.get_settings())
     state.load_scores_from_records(
-        [_score_record(indexer, 0.95) for indexer in STRONG] + [_score_record(WEAK, 0.2)]
+        [_score_record(indexer, 0.95) for indexer in STRONG] + [_score_record(WEAK, WEAK_QUALITY)]
     )
     pushed_at = datetime.now(timezone.utc)
     state.load_sync_status_from_dict(

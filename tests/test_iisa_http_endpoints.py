@@ -1204,17 +1204,19 @@ class TestScoresWeightedEndpoint:
         entries_by_id = {e["indexer"]: e for e in body["scores"]}
         assert set(entries_by_id) == {"0xabc", "0xxyz", "0x123"}
 
-        # The network-wide score leaves prices and freshness out: it averages latency,
-        # stake_to_fees, uptime and success rate. Latency and stake_to_fees arrive pre-scaled and
-        # are kept; 98.5% uptime and success each score their own share to the 6th power.
+        # The network-wide score leaves prices and freshness out, so value is stake_to_fees
+        # alone and freshness counts as 1. Latency and stake_to_fees arrive pre-scaled and are
+        # kept; 98.5% uptime and success each score their own share to the 6th power.
         shaped = 0.985**6
+        quality = 0.2 * shaped + 0.8 * 0.8
         abc = entries_by_id["0xabc"]
         assert abc["components"] == pytest.approx(
             {"latency": 0.8, "stake_to_fees": 0.5, "uptime": shaped, "success_rate": shaped}
         )
-        assert abc["weighted_score"] == pytest.approx(
-            (0.8 * 0.10 + 0.5 * 0.25 + shaped * 0.15 + shaped * 0.05) / 0.55
+        assert abc["factors"] == pytest.approx(
+            {"uptime": shaped, "freshness": 1.0, "quality": quality, "value": 0.5}
         )
+        assert abc["weighted_score"] == pytest.approx(shaped * quality * 0.5)
 
         # Each chain is scored against the indexers that support it and priced it, prices in.
         # No chain has freshness checks, so freshness is left out of each chain's score.
@@ -1223,9 +1225,9 @@ class TestScoresWeightedEndpoint:
         assert arbitrum["components"]["base_price"] == pytest.approx(0.0)
         assert arbitrum["components"]["price_per_entity"] == pytest.approx(0.0)
         assert "freshness" not in arbitrum["components"]
-        assert arbitrum["weighted_score"] == pytest.approx(
-            (0.8 * 0.10 + 0.5 * 0.25 + shaped * 0.15 + shaped * 0.05) / 0.85
-        )
+        assert arbitrum["factors"]["freshness"] == 1.0
+        assert arbitrum["factors"]["value"] == pytest.approx(0.45 * 0.5)
+        assert arbitrum["weighted_score"] == pytest.approx(shaped * quality * 0.45 * 0.5)
         # Uptime is scored on abc's own share, so it is the same on base, where abc is alone, as
         # on arbitrum-one beside xyz's 100%.
         assert abc["chains"]["base"]["components"]["uptime"] == pytest.approx(shaped)
@@ -1295,10 +1297,10 @@ class TestScoresWeightedEndpoint:
 
         from iisa import indexer_selection
 
-        def raises(df, weights):
+        def raises(df, left_out):
             raise ValueError("forced failure")
 
-        monkeypatch.setattr(indexer_selection, "_calculate_weighted_scores", raises)
+        monkeypatch.setattr(indexer_selection, "_score_factors", raises)
 
         client = TestClient(app, raise_server_exceptions=False)
         response = client.get("/scores/weighted")
@@ -1306,6 +1308,7 @@ class TestScoresWeightedEndpoint:
         body = response.json()
         assert body["scores"][0]["indexer"] == "0xabc"
         assert body["scores"][0]["weighted_score"] is None
+        assert body["scores"][0]["factors"] == {}
         assert body["scores"][0]["components"]["uptime"] == pytest.approx(0.997**6)
 
     def test_returns_empty_snapshot_when_no_scores_loaded(self):
@@ -2932,22 +2935,10 @@ class TestIndexerPrices:
 class TestLogSelectionReasoning:
     """Tests for _log_selection_reasoning -- one score breakdown line per selected indexer."""
 
-    WEIGHTS = {
-        "stake_to_fees": 0.5,
-        "base_price_per_epoch": 0.25,
-        "lat_lin_reg_coefficient": 0.25,
-        "success_rate": 0.5,
-        "price_per_entity": 0.1,
-    }
-
-    def _processor(self, data, current_group, weights=None):
+    def _processor(self, data, current_group):
         from types import SimpleNamespace
 
-        return SimpleNamespace(
-            data=data,
-            current_group=current_group,
-            weights=self.WEIGHTS if weights is None else weights,
-        )
+        return SimpleNamespace(data=data, current_group=current_group)
 
     def _log_lines(self, processor, caplog):
         from iisa.iisa_http_endpoints import _log_selection_reasoning
@@ -2968,26 +2959,23 @@ class TestLogSelectionReasoning:
                     "norm_uptime_score": 1.0,
                     "norm_success_rate": 0.0,
                     "norm_price_per_entity": nan,
-                    "weighted_score": 0.123456,
+                    "factor_uptime": 1.0,
+                    "factor_freshness": 1.0,
+                    "factor_quality": 0.2,
+                    "factor_value": 0.75,
+                    "weighted_score": 0.15,
                 },
                 {
                     "indexer": "0xb",
                     "norm_stake_to_fees": nan,
-                    "norm_base_price_per_epoch": nan,
-                    "norm_lat_lin_reg_coefficient": nan,
                     "norm_uptime_score": nan,
-                    "norm_success_rate": nan,
-                    "norm_price_per_entity": nan,
+                    "factor_uptime": nan,
                     "weighted_score": nan,
                 },
                 {
                     "indexer": "0xc",
                     "norm_stake_to_fees": 1.0,
-                    "norm_base_price_per_epoch": 1.0,
-                    "norm_lat_lin_reg_coefficient": 1.0,
-                    "norm_uptime_score": 1.0,
-                    "norm_success_rate": 1.0,
-                    "norm_price_per_entity": 1.0,
+                    "factor_uptime": 1.0,
                     "weighted_score": 1.0,
                 },
             ]
@@ -2995,28 +2983,14 @@ class TestLogSelectionReasoning:
 
         lines = self._log_lines(self._processor(data, ["0xb", "0xa"]), caplog)
 
-        # Uptime has no weight and price_per_entity is NaN, so both are left out.
+        # price_per_entity is NaN, so it is left out, and 0xb has nothing to log but its name.
         assert lines == [
-            "selected indexer=0xa score=0.1235 "
+            "selected indexer=0xa score=0.1500 "
+            "factors={'uptime': 1.0, 'freshness': 1.0, 'quality': 0.2, 'value': 0.75} "
             "components={'stake_to_fees': 0.5, 'base_price': 1.0, 'latency': 0.25, "
-            "'success_rate': 0.0} "
-            "weights={'stake_to_fees': 0.5, 'base_price': 0.25, 'latency': 0.25, "
-            "'success_rate': 0.5} "
-            "contributions={'stake_to_fees': 0.1667, 'base_price': 0.1667, "
-            "'latency': 0.0417, 'success_rate': 0.0} "
+            "'uptime': 1.0, 'success_rate': 0.0} "
             "deployment=QmDeployment",
-            "selected indexer=0xb score=0.0000 components={} weights={} contributions={} "
-            "deployment=QmDeployment",
-        ]
-
-    def test_zero_total_weight_logs_no_contributions(self, caplog):
-        data = pd.DataFrame([{"indexer": "0xa", "norm_stake_to_fees": 0.5}])
-
-        lines = self._log_lines(self._processor(data, ["0xa"], {"stake_to_fees": 0.0}), caplog)
-
-        assert lines == [
-            "selected indexer=0xa score=0.0000 components={'stake_to_fees': 0.5} "
-            "weights={'stake_to_fees': 0.0} contributions={} deployment=QmDeployment"
+            "selected indexer=0xb score=0.0000 factors={} components={} deployment=QmDeployment",
         ]
 
     @pytest.mark.parametrize(
@@ -3034,7 +3008,7 @@ class TestLogSelectionReasoning:
 class TestScoreBreakdown:
     """Tests for _score_breakdown -- one indexer's rounded score parts for the selection log."""
 
-    def test_splits_score_over_weighted_metrics(self):
+    def test_gives_the_total_its_factors_and_its_components(self):
         from iisa.iisa_http_endpoints import _score_breakdown
 
         row = pd.Series(
@@ -3042,29 +3016,26 @@ class TestScoreBreakdown:
                 "norm_stake_to_fees": 1.0,
                 "norm_uptime_score": 0.5,
                 "norm_success_rate": float("nan"),
-                "weighted_score": 0.75,
+                "factor_uptime": 0.5,
+                "factor_freshness": 1.0,
+                "factor_quality": 0.123456,
+                "factor_value": 1.0,
+                "weighted_score": 0.061728,
             }
         )
-        weights = {"stake_to_fees": 0.25, "uptime_score": 0.25, "success_rate": 0.5}
 
-        assert _score_breakdown(row, weights) == (
-            0.75,
+        assert _score_breakdown(row) == (
+            0.0617,
+            {"uptime": 0.5, "freshness": 1.0, "quality": 0.123, "value": 1.0},
             {"stake_to_fees": 1.0, "uptime": 0.5},
-            {"stake_to_fees": 0.25, "uptime": 0.25},
-            {"stake_to_fees": 0.5, "uptime": 0.25},
         )
 
-    def test_returns_no_score_and_no_contributions_when_unweighted(self):
+    def test_returns_no_total_and_no_factors_for_an_unscored_row(self):
         from iisa.iisa_http_endpoints import _score_breakdown
 
         row = pd.Series({"norm_stake_to_fees": 1.0})
 
-        assert _score_breakdown(row, {"stake_to_fees": 0.0}) == (
-            None,
-            {"stake_to_fees": 1.0},
-            {"stake_to_fees": 0.0},
-            {},
-        )
+        assert _score_breakdown(row) == (None, {}, {"stake_to_fees": 1.0})
 
 
 class TestEnrichWithChainPrices:
@@ -3676,10 +3647,23 @@ class TestScoreHelpers:
     def test_duplicate_indexer_rows_score_from_the_first_with_a_warning(self, caplog):
         from iisa.iisa_http_endpoints import _scores_by_indexer
 
-        normalized = pd.DataFrame({"indexer": ["0xa", "0xa"], "norm_uptime_score": [1.0, 0.0]})
+        parts = {
+            "norm_freshness": 1.0,
+            "norm_success_rate": 1.0,
+            "norm_lat_lin_reg_coefficient": 1.0,
+            "norm_stake_to_fees": 1.0,
+            "norm_base_price_per_epoch": 1.0,
+            "norm_price_per_entity": 1.0,
+        }
+        normalized = pd.DataFrame(
+            [
+                {"indexer": "0xa", "norm_uptime_score": 1.0, **parts},
+                {"indexer": "0xa", "norm_uptime_score": 0.0, **parts},
+            ]
+        )
 
         with caplog.at_level(logging.WARNING):
-            scores = _scores_by_indexer(normalized, {"uptime_score": 1.0})
+            scores = _scores_by_indexer(normalized, frozenset())
 
         assert scores["0xa"].weighted_score == 1.0
         assert any("more than 1 score row" in r.getMessage() for r in caplog.records)
