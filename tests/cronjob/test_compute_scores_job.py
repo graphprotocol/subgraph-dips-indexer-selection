@@ -224,6 +224,19 @@ class TestTransformToScoresSchema:
         values = result["lat_normalized_score"].dropna()
         assert all(0 <= v <= 1 for v in values), "lat_normalized_score has values outside [0, 1]"
 
+    def test_transform_pushes_latency_in_ms(self, sample_merged_df):
+        sample_merged_df["latency_ms"] = [120.0, 250.0, 0.0]
+
+        result = transform_to_scores_schema(sample_merged_df)
+
+        assert list(result["latency_ms"]) == [120.0, 250.0, 0.0]
+
+    def test_transform_pushes_no_latency_in_ms_without_a_regression(self, sample_merged_df):
+        """Without GeoIP the job runs no regression, so it has no latency to push."""
+        result = transform_to_scores_schema(sample_merged_df)
+
+        assert result["latency_ms"].isna().all()
+
     def test_transform_query_count_preserved(self, sample_merged_df):
         # Act
         result = transform_to_scores_schema(sample_merged_df)
@@ -249,6 +262,7 @@ class TestComputeDegradedScores:
         # only 1.0 is neutral: it scores everyone 1, where 0.5 would score everyone 0.016.
         assert list(result["uptime_score"]) == [1.0, 1.0]
         assert list(result["success_rate"]) == [1.0, 1.0]
+        assert result["latency_ms"].isna().all()
         assert "norm_uptime_score" not in result.columns
         assert "norm_success_rate" not in result.columns
 
@@ -908,6 +922,72 @@ class TestPerformLinearRegression:
         coefficient = rankings.set_index("indexer")["Latency Coefficient"]
         assert coefficient["0xfast"] == pytest.approx(-100, abs=2)
         assert coefficient["0xslow"] == pytest.approx(100, abs=2)
+
+    def test_latency_in_ms_is_the_median_response_time_plus_the_upper_bound_gap(self):
+        """The median query takes 300ms. Each indexer's latency is that plus its upper-bound
+        gap to the median indexer, its gap with a margin for how little data backs it."""
+        rng = np.random.default_rng(7)
+        rows = 2000
+        indexer = rng.choice(["0xfast", "0xmid", "0xslow"], rows)
+        response_times = {"0xfast": 100.0, "0xmid": 300.0, "0xslow": 500.0}
+        df = pd.DataFrame(
+            {
+                "indexer": indexer,
+                "deployment_hash": rng.choice(["deployment_1", "deployment_2"], rows),
+                "indexer_network": "arbitrum",
+                "distance_miles": rng.uniform(0, 1000, rows),
+                "fee": rng.uniform(0.000001, 0.01, rows),
+                "response_time_ms": [response_times[ix] for ix in indexer] + rng.normal(0, 5, rows),
+            }
+        )
+
+        rankings, _ = perform_latency_linear_regression(
+            df,
+            ["response_time_ms"],
+            ["indexer", "deployment_hash", "indexer_network"],
+            ["distance_miles", "fee"],
+        )
+
+        by_indexer = rankings.set_index("indexer")
+        median = df["response_time_ms"].median()
+        expected = median + by_indexer["Latency Coefficient + Error Confidence Interval"]
+        assert by_indexer["latency_ms"].to_dict() == pytest.approx(expected.to_dict())
+        assert by_indexer["latency_ms"].to_dict() == pytest.approx(
+            {"0xfast": 100.0, "0xmid": 300.0, "0xslow": 500.0}, abs=3
+        )
+
+    def test_latency_in_ms_is_floored_at_0(self):
+        """Most queries go to an indexer that answers in 1ms, so the median query takes about
+        1ms, while the median indexer takes 1,000ms: the fast indexer's gap to it is about
+        -999ms, which would give it a latency below 0."""
+        rng = np.random.default_rng(7)
+        rows = 3000
+        indexer = rng.choice(["0xinstant", "0xslow", "0xslower"], rows, p=[0.6, 0.2, 0.2])
+        response_times = {"0xinstant": 1.0, "0xslow": 1_000.0, "0xslower": 2_000.0}
+        df = pd.DataFrame(
+            {
+                "indexer": indexer,
+                "deployment_hash": "deployment_1",
+                "indexer_network": "arbitrum",
+                "distance_miles": rng.uniform(0, 1000, rows),
+                "fee": rng.uniform(0.000001, 0.01, rows),
+                "response_time_ms": [response_times[ix] for ix in indexer]
+                + rng.normal(0, 0.5, rows),
+            }
+        )
+
+        rankings, _ = perform_latency_linear_regression(
+            df,
+            ["response_time_ms"],
+            ["indexer", "deployment_hash", "indexer_network"],
+            ["distance_miles", "fee"],
+        )
+
+        by_indexer = rankings.set_index("indexer")
+        gap = by_indexer["Latency Coefficient + Error Confidence Interval"]
+        assert df["response_time_ms"].median() + gap["0xinstant"] < 0
+        assert by_indexer.loc["0xinstant", "latency_ms"] == 0.0
+        assert by_indexer.loc["0xslower", "latency_ms"] > 0
 
     @pytest.mark.filterwarnings(
         "ignore:divide by zero encountered:RuntimeWarning",

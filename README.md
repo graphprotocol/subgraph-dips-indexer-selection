@@ -66,7 +66,7 @@ Once a day the job replays roughly the last few weeks of real gateway query traf
 
 - **Economic security** — slashable stake measured against the query fees the indexer has earned. More stake standing behind fewer fees means more to lose by misbehaving.
 - **Price** — what the indexer charges to serve the deployment, quoted both per 30 days and per billion entities served.
-- **Latency** — how quickly it answers, estimated with a regression that accounts for the geographic distance between the indexer and where queries originate.
+- **Latency** — how quickly it answers, estimated with a regression that accounts for the geographic distance between the indexer and where queries originate. The regression gives each indexer's gap to the median indexer, with a margin for how little data backs it; adding the median query's response time to that gap gives the indexer's latency in milliseconds (`latency_ms`, never below 0).
 - **Uptime** — how much of the observed window the indexer was available.
 - **Success rate** — the share of its queries that returned a usable result.
 
