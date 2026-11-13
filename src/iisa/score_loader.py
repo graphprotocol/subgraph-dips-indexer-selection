@@ -316,9 +316,10 @@ class DataManager:
             _warn_column_missing([cols.ORG], "org")
             df[cols.ORG] = None
 
-        # A job that measured no latency, as without GeoIP, pushes latency_ms empty for every
-        # row. Dropping the column makes those scores read like an older job's, so selection
-        # keeps scaling latency against the candidates rather than scoring every indexer 0.
+        # A job that measured no latency in ms, as a run without GeoIP or a degraded run, pushes
+        # latency_ms empty for every row. Dropping the column makes those scores read like an
+        # older job's, so selection keeps the job's own latency score rather than scoring every
+        # indexer 0.
         if cols.LATENCY_MS in df.columns and df[cols.LATENCY_MS].isna().all():
             df = df.drop(columns=cols.LATENCY_MS)
 

@@ -2,8 +2,8 @@
 
 The score job pushes latency_ms, each indexer's latency in milliseconds. The service scores it
 on the gateway's latency curve made steeper, so an indexer's score depends only on its own
-latency, not on how fast the other candidates are. Scores from an older job have no latency_ms,
-and for those the service keeps scaling latency against the candidates, with a warning.
+latency, not on how fast the other candidates are. Scores without latency_ms, as from a run
+without GeoIP, a degraded run or an older job, keep the job's own latency score, with a warning.
 """
 
 import logging
@@ -73,7 +73,7 @@ class TestCurve:
 
 
 class TestOlderJob:
-    """Scores from a job that doesn't push latency_ms keep today's latency score."""
+    """Scores without latency_ms keep the latency score from before it."""
 
     def test_the_pushed_pool_scaled_score_is_kept_with_a_warning(self, caplog):
         with caplog.at_level(logging.WARNING, logger="iisa.indexer_selection"):
@@ -82,6 +82,10 @@ class TestOlderJob:
         assert scores == [0.2, 0.9]
         (warning,) = [r.getMessage() for r in caplog.records]
         assert "latency_ms" in warning
+        # Whoever is on call should look at the score job's last run first.
+        assert "without GeoIP" in warning
+        assert "degraded" in warning
+        assert "lat_normalized_score" in warning
         assert "0 held back" in warning
 
     def test_without_a_pushed_score_latency_is_scaled_against_the_candidates(self):
