@@ -46,9 +46,9 @@ MIN_INDEXER_SCORE = 0.15
 # ...but only by a candidate whose total beats the member's by more than this fraction of B.
 REPLACEMENT_MARGIN = 0.50
 
-# Once the group has a synced indexer, a candidate that says it has synced keeps its head start
-# over the others only while its total is at least this fraction of B; below it, it competes on
-# its total alone.
+# Once the group has a synced indexer, not counting a member being replaced, a candidate that
+# says it has synced keeps its head start over the others only while its total is at least this
+# fraction of B; below it, it competes on its total alone.
 MIN_SYNCED_THRESHOLD = 0.60
 
 # An indexer's total is uptime x freshness x quality x value, each in [0, 1]; docs/scoring.md
@@ -622,7 +622,7 @@ class IndexerSelector:
         """
         if not self.synced_indexers:
             return
-        ahead = self._synced_first(candidates)
+        ahead = self._synced_first(candidates, replacing_indexer)
         if replacing_indexer is not None:
             replaced_score = self._score_of(replacing_indexer)
             if replaced_score is None:
@@ -639,9 +639,9 @@ class IndexerSelector:
         self, replacing_indexer: Optional[IndexerId] = None, prefer_synced: bool = True
     ) -> Optional[IndexerId]:
         """Pick the highest-scoring eligible indexer to add, or to replace replacing_indexer
-        (whose swap the decentralisation check then simulates), or None if none qualify.
-        Unpickable indexers are skipped (see _unpickable_indexers). prefer_synced, when False,
-        ranks candidates on score alone, as if none were synced.
+        (left out of the group for the decentralisation check and the synced head start).
+        None if none qualify. Unpickable indexers are skipped (see _unpickable_indexers).
+        prefer_synced, when False, ranks candidates on score alone, as if none were synced.
         """
         # A stale candidate can fill an empty place once no other is left, but never replace.
         fill_in = self._filling_with_stale and replacing_indexer is None
@@ -670,7 +670,11 @@ class IndexerSelector:
         )
 
         # Iterate pools in order, checking decentralisation
-        pools = self._candidate_pools(candidates) if prefer_synced else [("all", candidates)]
+        pools = (
+            self._candidate_pools(candidates, replacing_indexer)
+            if prefer_synced
+            else [("all", candidates)]
+        )
         for pool_name, pool_df in pools:
             for indexer in pool_df["indexer"]:
                 if self._meets_decentralization_requirements(
@@ -707,37 +711,48 @@ class IndexerSelector:
         )
         return None
 
-    def _candidate_pools(self, candidates: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+    def _candidate_pools(
+        self, candidates: pd.DataFrame, replacing_indexer: Optional[IndexerId] = None
+    ) -> list[tuple[str, pd.DataFrame]]:
         """Split score-sorted candidates into named pools, drawn from in order.
 
-        Prefer already-synced candidates so queries serve right after
-        acceptance: the first synced indexer gets in at any score, later ones
-        must reach MIN_SYNCED_THRESHOLD of B or fall back to competing on merit.
+        Prefer already-synced candidates so queries serve right after acceptance: the first
+        synced indexer, with a member being replaced not counted, gets in at any score, later
+        ones must reach MIN_SYNCED_THRESHOLD of B or fall back to competing on merit.
         """
         if not self.synced_indexers:
             return [("all", candidates)]
 
-        synced = self._synced_first(candidates)
+        synced = self._synced_first(candidates, replacing_indexer)
         unsynced = candidates[~candidates["indexer"].isin(synced["indexer"])]
         logger.info(
             "deployment=%s candidates: %d synced eligible, %d unsynced (group_has_synced=%s)",
             self.deployment_id,
             len(synced),
             len(unsynced),
-            self._group_has_synced(),
+            self._group_has_synced(replacing_indexer),
         )
         return [("synced", synced), ("unsynced", unsynced)]
 
-    def _group_has_synced(self) -> bool:
-        """Whether anyone in the group as it stands, earlier picks included, says it has synced."""
-        return bool({i.lower() for i in self.current_group} & self.synced_indexers)
+    def _group_has_synced(self, replacing_indexer: Optional[IndexerId] = None) -> bool:
+        """Whether anyone in the group as it stands, earlier picks included, says it has synced.
+        A member being replaced doesn't count, since it leaves the group if the swap goes ahead.
+        """
+        group = {i.lower() for i in self.current_group}
+        if replacing_indexer is not None:
+            group.discard(replacing_indexer.lower())
+        return bool(group & self.synced_indexers)
 
-    def _synced_first(self, candidates: pd.DataFrame) -> pd.DataFrame:
-        """The candidates drawn from first because they say they have synced the deployment."""
+    def _synced_first(
+        self, candidates: pd.DataFrame, replacing_indexer: Optional[IndexerId] = None
+    ) -> pd.DataFrame:
+        """The candidates drawn from first because they say they have synced the deployment.
+        replacing_indexer, when set, is the member the pick would replace.
+        """
         all_synced_candidates = candidates[
             candidates["indexer"].str.lower().isin(self.synced_indexers)
         ]
-        if self._group_has_synced():
+        if self._group_has_synced(replacing_indexer):
             # Already have a synced indexer: threshold applies
             threshold = MIN_SYNCED_THRESHOLD * self._best_candidate_total(candidates)
             return all_synced_candidates[all_synced_candidates["weighted_score"] >= threshold]
