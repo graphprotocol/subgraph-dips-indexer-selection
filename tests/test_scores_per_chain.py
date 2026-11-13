@@ -119,6 +119,104 @@ def test_a_count_that_cant_be_read_is_logged_and_one_not_sent_is_not(client, cap
     assert "'lots'" in warnings[0]
 
 
+def _client_with_queries(queries_by_chain) -> TestClient:
+    """A service holding 2 indexers priced on arbitrum-one, the first with ``queries_by_chain``."""
+    iisa_http_endpoints.get_settings.cache_clear()
+    iisa_http_endpoints._state.initialize(Settings())
+    data = pd.DataFrame(
+        {
+            "indexer": [ABC, XYZ],
+            "% up_x": [98.5, 100.0],
+            "average_status": [0.985, 1.0],
+            "dips_info_available": [True, True],
+            "dips_supported_networks": ['["arbitrum-one"]', '["arbitrum-one"]'],
+            "dips_min_grt_per_30_days": ['{"arbitrum-one": "100"}', '{"arbitrum-one": "50"}'],
+            "queries_by_chain": [queries_by_chain, None],
+        }
+    )
+    manager = MagicMock()
+    manager.snapshot = ScoresSnapshot(
+        data=data, computed_at=datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
+    )
+    iisa_http_endpoints._state.data_manager = manager
+    iisa_http_endpoints._state._history = data
+    iisa_http_endpoints._state._initialized = True
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _answered(response) -> dict:
+    """The body of a response that must not be a 500."""
+    assert response.status_code == 200
+    return response.json()
+
+
+# ABC's entry from each endpoint that reports it.
+_ENDPOINTS = {
+    "scores-weighted": lambda client: next(
+        entry
+        for entry in _answered(client.get("/scores/weighted"))["scores"]
+        if entry["indexer"] == ABC
+    ),
+    "get-score": lambda client: _answered(client.post("/get-score", json={"indexer_id": ABC})),
+}
+
+
+def _queries_and_warnings(client: TestClient, caplog, endpoint: str) -> tuple[object, list[str]]:
+    """ABC's queries on arbitrum-one from 1 call to ``endpoint``, and the warnings about queries
+    the call logged."""
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        entry = _ENDPOINTS[endpoint](client)
+    warnings = [r.getMessage() for r in caplog.records if "queries_by_chain" in r.getMessage()]
+    return entry["chains"]["arbitrum-one"]["queries"], warnings
+
+
+@pytest.mark.parametrize("endpoint", list(_ENDPOINTS))
+@pytest.mark.parametrize(
+    "count",
+    [-5, 2.5, True, float("nan"), float("inf"), float("-inf"), "1200"],
+    ids=["negative", "fractional", "bool", "nan", "infinity", "minus-infinity", "text"],
+)
+def test_a_count_that_isnt_a_whole_number_of_0_or_more_is_null_with_a_warning(
+    count, endpoint, caplog
+):
+    client = _client_with_queries({"arbitrum-one": count})
+
+    queries, warnings = _queries_and_warnings(client, caplog, endpoint)
+
+    assert queries is None
+    assert len(warnings) == 1
+    assert "arbitrum-one" in warnings[0]
+
+
+@pytest.mark.parametrize("endpoint", list(_ENDPOINTS))
+@pytest.mark.parametrize("sent", [[1_200], "lots"], ids=["list", "text"])
+def test_queries_by_chain_that_isnt_a_map_is_null_with_a_warning(sent, endpoint, caplog):
+    client = _client_with_queries(sent)
+
+    queries, warnings = _queries_and_warnings(client, caplog, endpoint)
+
+    assert queries is None
+    assert len(warnings) == 1
+
+
+@pytest.mark.parametrize("endpoint", list(_ENDPOINTS))
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [({"base": 40}, None), ({"arbitrum-one": 0}, 0), ({"arbitrum-one": 1_200.0}, 1_200)],
+    ids=["chain-not-in-map", "zero", "whole-float"],
+)
+def test_a_missing_chain_is_null_and_a_whole_count_comes_through_without_a_warning(
+    sent, expected, endpoint, caplog
+):
+    client = _client_with_queries(sent)
+
+    queries, warnings = _queries_and_warnings(client, caplog, endpoint)
+
+    assert queries == expected
+    assert warnings == []
+
+
 def test_an_indexer_not_loaded_is_not_found(client):
     body = client.post("/get-score", json={"indexer_id": "0xnobody"}).json()
 
