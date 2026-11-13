@@ -101,8 +101,9 @@ class Settings(BaseSettings):
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
     freshness_file_path: str = "/app/scores/freshness.json"
-    # Chains, comma-separated, on which a stale mark is only recorded and reported. On every
-    # other chain an indexer marked stale isn't picked for new agreements.
+    # Chains, comma-separated, on which a stale mark is only recorded and reported and freshness
+    # isn't weighed. On every other chain an indexer marked stale isn't picked for new
+    # agreements.
     freshness_exempt_chains: Annotated[frozenset[str], NoDecode] = frozenset()
     # How many minutes behind this service's clock a chain's last counted check may be. Past
     # that its marks are too old to trust, and selection there ignores them.
@@ -1927,15 +1928,17 @@ def _enrich_with_chain_prices(
 
 def _weighed_freshness(chain_id: str) -> Optional[Mapping[str, float]]:
     """Each indexer's freshness score on ``chain_id``, or None where freshness isn't weighed: on
-    a chain whose checks don't yet cover 7 days, and on one whose last counted check is older
-    than IISA_FRESHNESS_MAX_AGE_MINUTES by this service's clock, which is when enforcement stops
+    an exempt chain, whose checks are taken as untrustworthy or impossible to pass, on a chain
+    whose checks don't yet cover 7 days, and on one whose last counted check is older than
+    IISA_FRESHNESS_MAX_AGE_MINUTES by this service's clock, which is when enforcement stops
     trusting its marks too. The scores are worked out at each push, so they stop changing when
     the prober stops or every check is void. Reads neither through the freshness lock.
     """
     scores = _state.freshness.scores_on(chain_id)
-    if scores is None:
+    enforcement = _enforcement()
+    if scores is None or not enforcement.enforced(chain_id):
         return None
-    if not _enforcement().current(_state.freshness.last_counted_minute(chain_id)):
+    if not enforcement.current(_state.freshness.last_counted_minute(chain_id)):
         return None
     return scores
 

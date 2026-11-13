@@ -200,16 +200,27 @@ class TestSelection:
         assert data.loc[TWIN, "norm_freshness"] == pytest.approx(0.9**6)
         assert data.loc[TWIN_TOO, "norm_freshness"] == pytest.approx((1 / 10_080) ** 6)
 
-    def test_an_indexer_with_no_record_on_a_scored_chain_scores_0(self, service, monkeypatch):
-        """The chain is exempt, so TWIN_TOO isn't left out as stale for having no record."""
-        monkeypatch.setenv("IISA_FRESHNESS_EXEMPT_CHAINS", CHAIN)
-        iisa_http_endpoints.get_settings.cache_clear()
+    def test_an_indexer_with_no_record_on_a_scored_chain_scores_0(self, service):
+        """TWIN_TOO is also left out as stale for having no record, but still scored."""
         service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
 
         data = _selector().data.set_index("indexer")
 
         assert data.loc[TWIN_TOO, "norm_freshness"] == 0.0
         assert data.loc[TWIN, "norm_freshness"] == pytest.approx(0.9**6)
+
+    def test_an_exempt_chain_leaves_freshness_out(self, service, monkeypatch):
+        """A chain is exempted when its checks can't be trusted or passed, which holds for the
+        score as much as for the mark."""
+        monkeypatch.setenv("IISA_FRESHNESS_EXEMPT_CHAINS", CHAIN)
+        iisa_http_endpoints.get_settings.cache_clear()
+        service.freshness = _store(
+            {(TWIN, CHAIN): (19_800, 20_000), (TWIN, OTHER_CHAIN): (19_800, 20_000)}
+        )
+
+        assert _selector(CHAIN).data["norm_freshness"].isna().all()
+        weighed = _selector(OTHER_CHAIN).data.set_index("indexer")["norm_freshness"]
+        assert weighed.to_dict() == pytest.approx({TWIN: 0.99**6, TWIN_TOO: 0.0})
 
     @pytest.mark.parametrize("records", ["under-7-days", "none"])
     def test_freshness_is_left_out_rather_than_scored_0(self, service, records):
