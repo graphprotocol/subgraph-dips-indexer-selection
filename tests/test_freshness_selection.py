@@ -27,6 +27,8 @@ OTHER_CHAIN = "mainnet"
 DEPLOYMENT = "QmFakeFreshnessDeployment"
 # BEST outscores GOOD, which outscores FAIR, on every metric.
 BEST, GOOD, FAIR = ("0x" + pair * 20 for pair in ("a1", "b2", "c3"))
+# An indexer with no scores, so never a candidate, whose allocation is too young to check.
+NEWCOMER = "0x" + "d4" * 20
 
 
 def _record(indexer: str, rank: int) -> dict[str, Any]:
@@ -92,6 +94,16 @@ def _push_voids(state: IISAState, chain: str, minutes: range) -> None:
     """Push a void outcome for every indexer on ``chain`` in each of ``minutes``."""
     for minute in minutes:
         checks = [Check(ix, chain, "void", reason="key_out_of_funds") for ix in (BEST, GOOD, FAIR)]
+        state.freshness.apply(minute, checks, lambda _: None)
+
+
+def _outage(state: IISAState, minutes: range) -> None:
+    """Push each of ``minutes`` as during a gateway outage: every check through the gateway is
+    void, while the prober goes on finding no evidence for NEWCOMER without asking it.
+    """
+    for minute in minutes:
+        checks = [Check(ix, CHAIN, "void", reason="gateway_error") for ix in (BEST, GOOD, FAIR)]
+        checks.append(Check(NEWCOMER, CHAIN, "no_evidence"))
         state.freshness.apply(minute, checks, lambda _: None)
 
 
@@ -197,9 +209,29 @@ def test_every_candidate_marked_picks_nobody_new(state):
     assert _select(size=3, existing=[FAIR]) == [FAIR]
 
 
+@pytest.mark.parametrize(("minutes", "picked"), [(56, BEST), (57, GOOD)])
+def test_a_candidate_whose_checks_stop_counting_for_an_hour_is_left_out(
+    state, monkeypatch, minutes, picked
+):
+    """BEST's checks are all void, as when it refuses the prober's payments, while the others
+    pass, so once its last 5 counted checks are over 60 answered minutes old there is no
+    evidence it is still fresh."""
+    _judge(state, {(BEST, CHAIN): "pass", (GOOD, CHAIN): "pass", (FAIR, CHAIN): "pass"}, LAST)
+    for minute in range(LAST + 1, LAST + 1 + minutes):
+        checks = [
+            Check(BEST, CHAIN, "void", reason="payment_refused"),
+            Check(GOOD, CHAIN, "pass"),
+            Check(FAIR, CHAIN, "pass"),
+        ]
+        state.freshness.apply(minute, checks, lambda _: None)
+    _clock(monkeypatch, LAST + minutes)
+
+    assert _select() == [picked]
+
+
 class TestChecksTooOld:
-    """On a chain that isn't exempt the marks decide selection only while a check there
-    counted within IISA_FRESHNESS_MAX_AGE_MINUTES, 60 by default, of the service's clock.
+    """On a chain that isn't exempt the marks decide selection only while a check there passed
+    or failed within IISA_FRESHNESS_MAX_AGE_MINUTES, 60 by default, of the service's clock.
     """
 
     @pytest.mark.parametrize(("age", "picked"), [(0, GOOD), (60, GOOD), (61, BEST)])
@@ -220,7 +252,7 @@ class TestChecksTooOld:
 
         (warning,) = _not_enforced(caplog)
         assert f"chain={CHAIN}" in warning
-        assert "last counted check was 90 minutes ago" in warning
+        assert "no check on it has passed or failed for 90 minutes" in warning
         assert "60" in warning
         assert not any("as stale" in r.getMessage() for r in caplog.records)
 
@@ -251,7 +283,40 @@ class TestChecksTooOld:
             assert _select() == [BEST]
 
         assert state.freshness.last_minute == LAST + 61
-        assert "61 minutes ago" in _not_enforced(caplog)[0]
+        assert "for 61 minutes" in _not_enforced(caplog)[0]
+
+    def test_an_outage_past_the_limit_stops_enforcement_while_no_evidence_goes_on(
+        self, state, monkeypatch, caplog
+    ):
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+        _outage(state, range(LAST + 1, LAST + 61))
+        _clock(monkeypatch, LAST + 60)
+        assert _select() == [GOOD]
+
+        _outage(state, range(LAST + 61, LAST + 62))
+        _clock(monkeypatch, LAST + 61)
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            assert _select() == [BEST]
+
+        assert "for 61 minutes" in _not_enforced(caplog)[0]
+
+    def test_the_first_answered_minute_after_an_outage_brings_enforcement_back(
+        self, state, monkeypatch
+    ):
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+        _outage(state, range(LAST + 1, LAST + 120))
+        _clock(monkeypatch, LAST + 120)
+        assert _select() == [BEST]
+
+        checks = [
+            Check(BEST, CHAIN, "void", reason="gateway_error"),
+            Check(GOOD, CHAIN, "pass"),
+            Check(FAIR, CHAIN, "void", reason="gateway_error"),
+            Check(NEWCOMER, CHAIN, "no_evidence"),
+        ]
+        state.freshness.apply(LAST + 120, checks, lambda _: None)
+
+        assert _select() == [GOOD]
 
     def test_counted_checks_arriving_again_bring_enforcement_back(self, state, monkeypatch):
         _judge(state, ALL_PASS_BUT_BEST, last=LAST)
@@ -262,15 +327,19 @@ class TestChecksTooOld:
 
         assert _select() == [GOOD]
 
-    @pytest.mark.parametrize("pushes", ["none", "only-voids"])
-    def test_chain_that_never_had_a_counted_check_is_not_enforced_and_does_not_warn(
+    @pytest.mark.parametrize("pushes", ["none", "only-voids", "only-no-evidence"])
+    def test_chain_that_never_had_an_answered_check_is_not_enforced_and_does_not_warn(
         self, state, monkeypatch, caplog, pushes
     ):
         """A chain the prober never checks, such as every chain while it is off, would
-        otherwise warn on every selection.
+        otherwise warn on every selection. A chain where every indexer's allocation is too
+        young to check only ever finds no evidence, which the prober works out without asking
+        the gateway, so nothing shows its marks are current there either.
         """
         if pushes == "only-voids":
             _push_voids(state, CHAIN, range(LAST - 9, LAST + 1))
+        if pushes == "only-no-evidence":
+            _judge(state, {(ix, CHAIN): "no_evidence" for ix in (BEST, GOOD, FAIR)}, last=LAST)
         _clock(monkeypatch, LAST)
 
         with caplog.at_level(logging.DEBUG, logger="iisa-service"):
@@ -279,11 +348,11 @@ class TestChecksTooOld:
         assert _not_enforced(caplog) == []
         (note,) = _not_enforced(caplog, logging.DEBUG)
         assert f"chain={CHAIN}" in note
-        assert "no freshness check on it has counted in the last 28 days" in note
+        assert "no freshness check on it has passed or failed in the last 28 days" in note
 
     def test_checks_that_counted_over_28_days_ago_do_not_warn(self, state, monkeypatch, caplog):
-        """Pushes holding only voids keep a chain's last counted minute on record, but a check
-        that counted that long ago is no longer in the 28 days kept.
+        """Pushes holding only voids keep a chain's last answered minute on record, but a check
+        that passed or failed that long ago is no longer in the 28 days kept.
         """
         _judge(state, ALL_PASS_BUT_BEST, last=LAST)
         _clock(monkeypatch, LAST + 28 * 1_440 + 1)
@@ -323,7 +392,7 @@ class TestChecksTooOld:
         with caplog.at_level(logging.WARNING, logger="iisa-service"):
             assert _select() == [BEST]
 
-        assert "6 minutes ago" in _not_enforced(caplog)[0]
+        assert "for 6 minutes" in _not_enforced(caplog)[0]
 
     def test_exempt_chain_never_warns(self, state, monkeypatch, caplog):
         _exempt(monkeypatch, CHAIN)
@@ -463,6 +532,7 @@ class TestReportedEnforcement:
                     "enforced": False,
                     "enforcing": False,
                     "last_counted_minute": None,
+                    "last_answered_minute": None,
                     "indexers": {},
                 }
             },
@@ -471,18 +541,28 @@ class TestReportedEnforcement:
     def test_each_chain_says_whether_it_is_enforcing_and_when_a_check_last_counted(
         self, state, monkeypatch
     ):
+        """OTHER_CHAIN's last check found no evidence, which counts but isn't an answer."""
         _exempt(monkeypatch, "amoy")
         _judge(state, {(BEST, CHAIN): "pass", (BEST, OTHER_CHAIN): "pass"}, last=LAST)
-        state.freshness.apply(LAST + 1, [Check(BEST, CHAIN, "pass")], lambda _: None)
+        state.freshness.apply(
+            LAST + 1,
+            [Check(BEST, CHAIN, "pass"), Check(NEWCOMER, OTHER_CHAIN, "no_evidence")],
+            lambda _: None,
+        )
         _clock(monkeypatch, LAST + 61)
 
         chains = TestClient(app).get("/freshness").json()["chains"]
 
         assert {
-            chain: (body["enforced"], body["enforcing"], body["last_counted_minute"])
+            chain: (
+                body["enforced"],
+                body["enforcing"],
+                body["last_counted_minute"],
+                body["last_answered_minute"],
+            )
             for chain, body in chains.items()
         } == {
-            CHAIN: (True, True, minute_text(LAST + 1)),
-            OTHER_CHAIN: (True, False, minute_text(LAST)),
-            "amoy": (False, False, None),
+            CHAIN: (True, True, minute_text(LAST + 1), minute_text(LAST + 1)),
+            OTHER_CHAIN: (True, False, minute_text(LAST + 1), minute_text(LAST)),
+            "amoy": (False, False, None, None),
         }

@@ -106,8 +106,9 @@ class Settings(BaseSettings):
     # isn't weighed. On every other chain an indexer marked stale isn't picked for new
     # agreements.
     freshness_exempt_chains: Annotated[frozenset[str], NoDecode] = frozenset()
-    # How many minutes behind this service's clock a chain's last counted check may be. Past
-    # that its marks are too old to trust, and selection there ignores them.
+    # How many minutes behind this service's clock a chain's last answered minute, the last in
+    # which a check there passed or failed, may be. Past that its marks are too old to trust,
+    # and selection there ignores them and leaves freshness out.
     freshness_max_age_minutes: int = Field(default=60, ge=1)
     # Bearer token for pushing scores and sync status, also accepted on every read.
     # /health and /select-indexers take no token. When it is unset, a WARNING is
@@ -584,7 +585,10 @@ class FreshnessLastCheck(BaseModel):
 
 class FreshnessPair(BaseModel):
     """An indexer's freshness on 1 chain. judged is false when fewer than 5 of the last 10
-    minutes counted, and marked is then the mark carried over.
+    minutes counted. marked then comes from its last 5 counted checks, recent_passed of the
+    recent_counted no more than 60 of the chain's answered minutes old: it is unmarked only when
+    all 5 are that recent and at least 3 passed. An indexer that never counted keeps its mark.
+    last_counted_minute is null until one of its checks counts.
     """
 
     marked: bool
@@ -592,6 +596,9 @@ class FreshnessPair(BaseModel):
     window_passed: int
     window_counted: int
     last: FreshnessLastCheck
+    last_counted_minute: Optional[str] = None
+    recent_passed: int = 0
+    recent_counted: int = 0
     passed_28d: int
     counted_28d: int
     share_28d: Optional[float] = None
@@ -599,13 +606,15 @@ class FreshnessPair(BaseModel):
 
 class FreshnessChain(BaseModel):
     """Freshness on 1 chain, by indexer. enforced says the chain isn't exempt, and enforcing
-    that a check there also counted recently enough for a marked indexer to be left out of new
-    agreements. last_counted_minute is null when no check there has counted.
+    that a check there also passed or failed recently enough, at last_answered_minute, for a
+    marked indexer to be left out of new agreements. last_counted_minute is the last minute a
+    check there counted, no evidence included. Each is null when no such check is on record.
     """
 
     enforced: bool = False
     enforcing: bool = False
     last_counted_minute: Optional[str] = None
+    last_answered_minute: Optional[str] = None
     indexers: dict[str, FreshnessPair] = {}
 
 
@@ -1928,16 +1937,16 @@ def _enrich_with_chain_prices(
 def _weighed_freshness(chain_id: str) -> Optional[Mapping[str, float]]:
     """Each indexer's freshness score on ``chain_id``, or None where freshness isn't weighed: on
     an exempt chain, whose checks are taken as untrustworthy or impossible to pass, on a chain
-    whose checks don't yet cover 7 days, and on one whose last counted check is older than
+    whose checks don't yet cover 7 days, and on one where no check has passed or failed within
     IISA_FRESHNESS_MAX_AGE_MINUTES by this service's clock, which is when enforcement stops
-    trusting its marks too. The scores are worked out at each push, so they stop changing when
-    the prober stops or every check is void. Reads neither through the freshness lock.
+    trusting its marks too. The scores are worked out at each push, so they go stale when the
+    prober stops or no check goes through the gateway. Reads neither through the freshness lock.
     """
     scores = _state.freshness.scores_on(chain_id)
     enforcement = _enforcement()
     if scores is None or not enforcement.enforced(chain_id):
         return None
-    if not enforcement.current(_state.freshness.last_counted_minute(chain_id)):
+    if not enforcement.current(_state.freshness.last_answered_minute(chain_id)):
         return None
     return scores
 
@@ -2278,30 +2287,32 @@ def _enforcement() -> Enforcement:
 
 
 def _checks_too_old(request: SelectionRequest, enforcement: Enforcement) -> bool:
-    """True when no check on the request's chain counted recently enough for its marks to be
-    trusted. A chain whose checks counted but have since gone past the limit, as when the
-    prober stops, gets a warning on every selection. A chain with no counted check in the
-    HISTORY_DAYS kept, such as one the prober doesn't check, only gets a debug line.
+    """True when no check on the request's chain passed or failed recently enough for its
+    marks to be trusted. A no_evidence check doesn't count here, as the prober works it out
+    without asking the gateway. A chain whose checks did pass or fail but not within the limit,
+    as when the prober stops or the gateway is down, gets a warning on every selection. A chain
+    with no such check in the HISTORY_DAYS kept, such as one the prober doesn't check, only
+    gets a debug line.
     """
-    last_counted = _state.freshness.last_counted_minute(request.chain_id)
-    if enforcement.current(last_counted):
+    last_answered = _state.freshness.last_answered_minute(request.chain_id)
+    if enforcement.current(last_answered):
         return False
-    if last_counted is None or enforcement.now - last_counted > HISTORY_DAYS * MINUTES_PER_DAY:
+    if last_answered is None or enforcement.now - last_answered > HISTORY_DAYS * MINUTES_PER_DAY:
         logger.debug(
             "deployment=%s chain=%s: freshness isn't enforced there, since no freshness check "
-            "on it has counted in the last %d days",
+            "on it has passed or failed in the last %d days",
             request.deployment_id,
             request.chain_id,
             HISTORY_DAYS,
         )
         return True
     logger.warning(
-        "deployment=%s chain=%s isn't exempt but freshness isn't enforced there, since its last "
-        "counted check was %d minutes ago, over the limit of %d set by "
+        "deployment=%s chain=%s isn't exempt but freshness isn't enforced there, since no check "
+        "on it has passed or failed for %d minutes, over the limit of %d set by "
         "IISA_FRESHNESS_MAX_AGE_MINUTES; candidates are picked as if the chain were exempt",
         request.deployment_id,
         request.chain_id,
-        enforcement.now - last_counted,
+        enforcement.now - last_answered,
         enforcement.max_age_minutes,
     )
     return True

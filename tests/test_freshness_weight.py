@@ -30,6 +30,8 @@ CHAIN = "arbitrum-one"
 OTHER_CHAIN = "mainnet"
 DEPLOYMENT = "QmFakeFreshnessWeightDeployment"
 TWIN, TWIN_TOO, NEWCOMER = ("0x" + pair * 20 for pair in ("a1", "b2", "c3"))
+# An indexer with no scores, so never a candidate, whose allocation is too young to check.
+YOUNG = "0x" + "d4" * 20
 DAY = 1_440
 # 2026-11-10T22:00:00Z, the service's last minute in these tests.
 LAST = minute_index(datetime(2026, 11, 10, 22, 0, tzinfo=timezone.utc))
@@ -242,7 +244,7 @@ class TestSelection:
 
 
 class TestChecksStopCounting:
-    """Freshness is weighed only while a check on the chain counted within
+    """Freshness is weighed only while a check on the chain passed or failed within
     IISA_FRESHNESS_MAX_AGE_MINUTES, 60 by default, of the service's clock, as enforcement
     judges it: the scores are worked out at each push, so they stop changing with the checks.
     """
@@ -265,6 +267,37 @@ class TestChecksStopCounting:
         monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: LAST + 61)
 
         assert _selector().data["norm_freshness"].isna().all()
+
+    def test_an_outage_past_the_limit_leaves_freshness_out_while_no_evidence_goes_on(
+        self, service, monkeypatch
+    ):
+        """The gateway is down, so TWIN's checks are void, while the prober goes on finding no
+        evidence for YOUNG without asking it."""
+        service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
+        for minute in range(LAST + 1, LAST + 62):
+            checks = [Check(TWIN, CHAIN, "void"), Check(YOUNG, CHAIN, "no_evidence")]
+            service.freshness.apply(minute, checks, lambda _: None)
+        monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: LAST + 60)
+        assert _selector().data["norm_freshness"].notna().all()
+
+        monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: LAST + 61)
+        assert _selector().data["norm_freshness"].isna().all()
+
+    def test_the_first_answered_minute_after_an_outage_brings_freshness_back(
+        self, service, monkeypatch
+    ):
+        service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
+        for minute in range(LAST + 1, LAST + 120):
+            checks = [Check(TWIN, CHAIN, "void"), Check(YOUNG, CHAIN, "no_evidence")]
+            service.freshness.apply(minute, checks, lambda _: None)
+        monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: LAST + 120)
+        assert _selector().data["norm_freshness"].isna().all()
+
+        checks = [Check(TWIN, CHAIN, "pass"), Check(YOUNG, CHAIN, "no_evidence")]
+        service.freshness.apply(LAST + 120, checks, lambda _: None)
+
+        data = _selector().data.set_index("indexer")
+        assert data.loc[TWIN, "norm_freshness"] == pytest.approx((18_001 / 20_001) ** 6)
 
     def test_freshness_comes_back_once_checks_count_again(self, service, monkeypatch):
         service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)})
