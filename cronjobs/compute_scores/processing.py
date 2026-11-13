@@ -1911,10 +1911,14 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["lat_coefficient_std_error"] = 0.0
     scores["lat_coefficient_upper_bound"] = 0.0
     scores["lat_normalized_score"] = 0.5
-    scores["uptime_score"] = 0.5
+    # The service scores uptime and success rate on each indexer's own share raised to the 6th
+    # power, so 1.0 is the only neutral value: it scores everyone 1 on both, as equal values did
+    # under the old rule of scoring against the best candidate, where 0.5 would score everyone
+    # 0.016 and drag every weighted score down.
+    scores["uptime_score"] = 1.0
     scores["observed_duration_seconds"] = None
     scores["uptime_duration_seconds"] = None
-    scores["success_rate"] = 0.5
+    scores["success_rate"] = 1.0
     scores[UPTIME_BY_CHAIN] = None
     scores[SUCCESS_RATE_BY_CHAIN] = None
     scores["stake_to_fees"] = None

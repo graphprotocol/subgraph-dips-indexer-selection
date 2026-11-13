@@ -138,7 +138,7 @@ def _by_indexer(rows: list[dict[str, Any]], columns: list[str]) -> dict[str, lis
 def _is_fallback(rows: list[dict[str, Any]]) -> bool:
     """Whether rows are the fallback scores: equal for everyone, with nothing measured."""
     return all(
-        row["norm_stake_to_fees"] == 0.5 and row["success_rate"] == 0.5 and row[MEASURED_AT] is None
+        row["norm_stake_to_fees"] == 0.5 and row["success_rate"] == 1.0 and row[MEASURED_AT] is None
         for row in rows
     )
 

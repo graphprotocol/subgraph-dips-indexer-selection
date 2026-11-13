@@ -245,8 +245,10 @@ class TestComputeDegradedScores:
         result = processing.compute_degraded_scores(urls)
 
         # Assert
-        assert list(result["uptime_score"]) == [0.5, 0.5]
-        assert list(result["success_rate"]) == [0.5, 0.5]
+        # The service scores each indexer's own uptime and success rate to the 6th power, so
+        # only 1.0 is neutral: it scores everyone 1, where 0.5 would score everyone 0.016.
+        assert list(result["uptime_score"]) == [1.0, 1.0]
+        assert list(result["success_rate"]) == [1.0, 1.0]
         assert "norm_uptime_score" not in result.columns
         assert "norm_success_rate" not in result.columns
 
