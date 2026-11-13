@@ -17,6 +17,7 @@ from iisa.iisa_http_endpoints import (
     IISAState,
     SelectionRequest,
     Settings,
+    _select_checking_sync_claims,
     _select_with_processor,
     app,
 )
@@ -202,11 +203,74 @@ def test_stale_group_member_is_scored_as_if_the_chain_were_exempt(state, monkeyp
     assert _scores(size=2, existing=[BEST]) == plain
 
 
-def test_every_candidate_marked_picks_nobody_new(state):
-    _judge(state, {(BEST, CHAIN): "fail", (GOOD, CHAIN): "fail", (FAIR, CHAIN): "no_evidence"})
+ALL_FAIL = {(BEST, CHAIN): "fail", (GOOD, CHAIN): "fail", (FAIR, CHAIN): "no_evidence"}
 
-    assert _select(size=3) == []
-    assert _select(size=3, existing=[FAIR]) == [FAIR]
+
+def test_with_every_candidate_marked_the_best_scorers_fill_the_places(state, caplog):
+    """Dipper needs the number of indexers it asked for, so with no fresh candidate left the
+    places go to the stale ones, best score first, with a warning naming the chain."""
+    _judge(state, ALL_FAIL)
+
+    with caplog.at_level(logging.WARNING, logger="iisa-service"):
+        assert _select(size=2) == [BEST, GOOD]
+
+    (warning,) = [r.getMessage() for r in caplog.records if "marked stale" in r.getMessage()]
+    assert f"chain={CHAIN}" in warning
+    assert "2 of 2" in warning
+
+
+def test_stale_candidates_fill_only_the_places_left_after_the_members(state):
+    _judge(state, ALL_FAIL)
+
+    assert _select(size=3, existing=[FAIR]) == [FAIR, BEST, GOOD]
+    assert _select(size=2, existing=[FAIR]) == [FAIR, BEST]
+
+
+def test_stale_candidates_filling_places_are_scored_as_on_an_exempt_chain(state, monkeypatch):
+    """Once the stale candidates fill places they are the ones being compared, so they set
+    each metric's scale, as every candidate does on an exempt chain."""
+    _judge(state, ALL_FAIL)
+    _exempt(monkeypatch, CHAIN)
+    plain = _scores(size=3, existing=[FAIR])
+    _exempt(monkeypatch, "")
+
+    assert _scores(size=3, existing=[FAIR]) == plain
+
+
+def test_a_fresh_candidate_is_picked_before_any_stale_one(state):
+    """FAIR scores worst, but it is the only fresh candidate."""
+    _judge(state, {(BEST, CHAIN): "fail", (GOOD, CHAIN): "fail", (FAIR, CHAIN): "pass"})
+
+    assert _select(size=1) == [FAIR]
+    assert _select(size=2) == [FAIR, BEST]
+
+
+def test_no_warning_when_fresh_candidates_fill_every_place(state, caplog):
+    _judge(state, ALL_PASS_BUT_BEST)
+
+    with caplog.at_level(logging.WARNING, logger="iisa-service"):
+        assert _select(size=2) == [GOOD, FAIR]
+
+    assert not any("marked stale" in r.getMessage() for r in caplog.records)
+
+
+def test_a_stale_candidate_filling_a_place_never_replaces_a_member(state):
+    """GOOD scores close to BEST, far enough above FAIR to replace it were GOOD fresh. With
+    every candidate stale, BEST fills the empty place, and GOOD, still stale, may not take
+    FAIR's."""
+    state.load_scores_from_records([_record(BEST, 0), _record(GOOD, 0.2), _record(FAIR, 2)])
+    _judge(state, ALL_FAIL)
+
+    assert _select(size=2, existing=[FAIR]) == [FAIR, BEST]
+
+
+@pytest.mark.parametrize(("best", "group"), [("pass", [BEST]), ("fail", [FAIR])])
+def test_a_stale_candidate_never_replaces_a_member(state, best, group):
+    """FAIR scores far below BEST, so a fresh BEST takes its place; a stale one never does,
+    since the group is already full."""
+    _judge(state, {(BEST, CHAIN): best, (GOOD, CHAIN): "fail", (FAIR, CHAIN): "pass"})
+
+    assert _select(size=1, existing=[FAIR]) == group
 
 
 @pytest.mark.parametrize(("minutes", "picked"), [(56, BEST), (57, GOOD)])
@@ -396,6 +460,27 @@ class TestChecksTooOld:
         assert _not_enforced(caplog, logging.DEBUG) == []
 
 
+class _RefusingChecker:
+    """Stands in for the gateway check of synced claims, confirming none."""
+
+    async def unconfirmed(self, deployment_id: str, indexers: list[str]) -> dict[str, str]:
+        return dict.fromkeys(indexers, "latest block is 900s old")
+
+
+async def test_selecting_again_after_a_failed_claim_check_still_leaves_out_the_stale(
+    state, monkeypatch
+):
+    """GOOD's claim to have synced wins it the first pick; the gateway doesn't confirm it, so
+    selection runs again without the claim. BEST is stale, so GOOD is still the pick."""
+    _judge(state, ALL_PASS_BUT_BEST)
+    monkeypatch.setattr(iisa_http_endpoints, "_synced_indexers_for", lambda _deployment: {GOOD})
+    monkeypatch.setattr(state, "sync_checker", _RefusingChecker())
+
+    response = await _select_checking_sync_claims(_request(CHAIN, 1, None))
+
+    assert [indexer.id for indexer in response.indexers] == [GOOD]
+
+
 def test_select_indexers_over_http_leaves_out_the_marked_candidate(state):
     _judge(state, ALL_PASS_BUT_BEST)
 
@@ -406,6 +491,18 @@ def test_select_indexers_over_http_leaves_out_the_marked_candidate(state):
 
     assert response.status_code == 200, response.text
     assert [indexer["id"] for indexer in response.json()["indexers"]] == [GOOD]
+
+
+def test_select_indexers_over_http_fills_the_places_with_stale_candidates(state):
+    _judge(state, ALL_FAIL)
+
+    response = TestClient(app).post(
+        "/select-indexers",
+        json={"deployment_id": DEPLOYMENT, "chain_id": CHAIN, "num_candidates": 2},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [indexer["id"] for indexer in response.json()["indexers"]] == [BEST, GOOD]
 
 
 def test_selection_does_not_wait_for_a_push_being_applied(state):
