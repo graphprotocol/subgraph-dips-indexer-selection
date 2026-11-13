@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.14.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.13.0...v2.14.0) (2026-11-13)
+
+
+### Added
+
+* **cronjob:** report each indexer's latency in milliseconds ([#450](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/450)) ([7baed01](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/7baed016331be32835bf27c545e74bee1522a958))
+* **cronjob:** report each indexer's queries on each chain ([#457](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/457)) ([eebfc49](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/eebfc49c04151155db6ce3fb542265e5c9aa1c75))
+* **service:** drop the network-wide score ([#458](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/458)) ([2b16778](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/2b16778ff72e95ae07d1fb3ca75b0bac04a4148c))
+* **service:** multiply uptime, freshness, quality and value ([#454](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/454)) ([fdf3db1](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/fdf3db11bc8ebd4d648618c8cf6e8d64d83f519f))
+* **service:** pick stale indexers when no fresh one is left ([#451](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/451)) ([7619e5b](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/7619e5bf86ff4b34e01ed282441242fd8d158750))
+* **service:** score latency on a fixed curve ([#452](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/452)) ([7089a22](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/7089a2248dfebb2532f854e86e1515846c229227))
+
+
+### Fixed
+
+* **service:** keep a synced challenger ahead when replacing ([#456](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/456)) ([60dc1f3](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/60dc1f3fe0e89f7489499e6c450fc9bccccc718f))
+* **service:** score entity price against the payer's ceiling ([#449](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/449)) ([90e8d6e](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/90e8d6ec2024e8ab87a88804027306e0eb0b13be))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-eebfc49 ([#461](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/461)) ([ca1ea39](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ca1ea398014b6dc74be3c43e657e79c2e126c900))
+
 ## [2.13.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.12.0...v2.13.0) (2026-11-13)
 
 
