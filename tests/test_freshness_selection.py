@@ -256,16 +256,6 @@ class TestChecksTooOld:
         assert "60" in warning
         assert not any("as stale" in r.getMessage() for r in caplog.records)
 
-    def test_each_selection_warns(self, state, monkeypatch, caplog):
-        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
-        _clock(monkeypatch, LAST + 90)
-
-        with caplog.at_level(logging.WARNING, logger="iisa-service"):
-            _select()
-            _select()
-
-        assert len(_not_enforced(caplog)) == 2
-
     def test_pushes_holding_only_voids_stop_enforcement_after_the_limit(
         self, state, monkeypatch, caplog
     ):
@@ -566,3 +556,61 @@ class TestReportedEnforcement:
             OTHER_CHAIN: (True, False, minute_text(LAST + 1), minute_text(LAST)),
             "amoy": (False, False, None, None),
         }
+
+
+class TestLapseWarningLimit:
+    """The warning that freshness isn't enforced on a chain whose checks have stopped passing
+    or failing is logged at most once per chain every 10 minutes of the service's clock, since
+    a prober that is down or off would otherwise log 1 on every selection for up to 28 days.
+    """
+
+    def test_the_first_selection_warns(self, state, monkeypatch, caplog):
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+        _clock(monkeypatch, LAST + 90)
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            assert _select() == [BEST]
+
+        (warning,) = _not_enforced(caplog)
+        assert "at most once every 10 minutes" in warning
+        assert "0 held back" in warning
+
+    def test_repeat_selections_within_10_minutes_do_not_warn(self, state, monkeypatch, caplog):
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            for minute in (LAST + 90, LAST + 90, LAST + 95, LAST + 99):
+                _clock(monkeypatch, minute)
+                assert _select() == [BEST]
+
+        assert len(_not_enforced(caplog)) == 1
+
+    def test_a_selection_10_minutes_on_warns_with_how_many_were_held_back(
+        self, state, monkeypatch, caplog
+    ):
+        _judge(state, ALL_PASS_BUT_BEST, last=LAST)
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            for minute in (LAST + 90, LAST + 90, LAST + 99, LAST + 100):
+                _clock(monkeypatch, minute)
+                _select()
+
+        first, later = _not_enforced(caplog)
+        assert "0 held back" in first
+        assert "for 100 minutes" in later
+        assert "2 held back" in later
+
+    def test_each_chain_is_limited_on_its_own(self, state, monkeypatch, caplog):
+        outcomes = {**ALL_PASS_BUT_BEST}
+        outcomes.update({(ix, OTHER_CHAIN): o for (ix, _), o in ALL_PASS_BUT_BEST.items()})
+        _judge(state, outcomes, last=LAST)
+        _clock(monkeypatch, LAST + 90)
+
+        with caplog.at_level(logging.WARNING, logger="iisa-service"):
+            for chain in (CHAIN, OTHER_CHAIN, CHAIN, OTHER_CHAIN):
+                assert _select(chain=chain) == [BEST]
+
+        warnings = _not_enforced(caplog)
+        assert len(warnings) == 2
+        assert f"chain={CHAIN} " in warnings[0]
+        assert f"chain={OTHER_CHAIN} " in warnings[1]
