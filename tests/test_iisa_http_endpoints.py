@@ -1206,14 +1206,14 @@ class TestScoresWeightedEndpoint:
 
         # The network-wide score leaves prices and freshness out: it averages latency,
         # stake_to_fees, uptime and success rate. Latency and stake_to_fees arrive pre-scaled and
-        # are kept; 98.5% uptime and success sit halfway between the 97%-of-best cutoff and the
-        # best.
+        # are kept; 98.5% uptime and success each score their own share to the 6th power.
+        shaped = 0.985**6
         abc = entries_by_id["0xabc"]
         assert abc["components"] == pytest.approx(
-            {"latency": 0.8, "stake_to_fees": 0.5, "uptime": 0.5, "success_rate": 0.5}
+            {"latency": 0.8, "stake_to_fees": 0.5, "uptime": shaped, "success_rate": shaped}
         )
         assert abc["weighted_score"] == pytest.approx(
-            (0.8 * 0.10 + 0.5 * 0.25 + 0.5 * 0.15 + 0.5 * 0.05) / 0.55
+            (0.8 * 0.10 + 0.5 * 0.25 + shaped * 0.15 + shaped * 0.05) / 0.55
         )
 
         # Each chain is scored against the indexers that support it and priced it, prices in.
@@ -1224,10 +1224,11 @@ class TestScoresWeightedEndpoint:
         assert arbitrum["components"]["price_per_entity"] == pytest.approx(0.0)
         assert "freshness" not in arbitrum["components"]
         assert arbitrum["weighted_score"] == pytest.approx(
-            (0.8 * 0.10 + 0.5 * 0.25 + 0.5 * 0.15 + 0.5 * 0.05) / 0.85
+            (0.8 * 0.10 + 0.5 * 0.25 + shaped * 0.15 + shaped * 0.05) / 0.85
         )
-        # abc is alone on base, so it is the best uptime there.
-        assert abc["chains"]["base"]["components"]["uptime"] == pytest.approx(1.0)
+        # Uptime is scored on abc's own share, so it is the same on base, where abc is alone, as
+        # on arbitrum-one beside xyz's 100%.
+        assert abc["chains"]["base"]["components"]["uptime"] == pytest.approx(shaped)
 
         xyz = entries_by_id["0xxyz"]
         assert set(xyz["chains"]) == {"arbitrum-one"}
@@ -1269,7 +1270,7 @@ class TestScoresWeightedEndpoint:
         # _normalize_metrics fills NaN with 0 across every norm_* column, so a
         # NaN latency input lands as a 0.0 latency in the response — not skipped.
         assert components["latency"] == 0.0
-        assert components["uptime"] == 1.0
+        assert components["uptime"] == pytest.approx(0.997**6)
 
     def test_weighted_score_none_when_calculation_raises(self, monkeypatch):
         from iisa import iisa_http_endpoints
@@ -1305,7 +1306,7 @@ class TestScoresWeightedEndpoint:
         body = response.json()
         assert body["scores"][0]["indexer"] == "0xabc"
         assert body["scores"][0]["weighted_score"] is None
-        assert body["scores"][0]["components"]["uptime"] == 1.0
+        assert body["scores"][0]["components"]["uptime"] == pytest.approx(0.997**6)
 
     def test_returns_empty_snapshot_when_no_scores_loaded(self):
         from iisa import iisa_http_endpoints
