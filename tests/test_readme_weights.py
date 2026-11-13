@@ -1,6 +1,6 @@
 """Guard the README's selection-weights table against the code.
 
-The README documents the six selection weights for human readers, but those
+The README documents the seven selection weights for human readers, but those
 values are tuning knobs that live in ``DEFAULT_WEIGHTS`` in
 ``src/iisa/indexer_selection.py``. This test parses the table out of the README
 and asserts it matches the code, so the documentation cannot silently go stale
@@ -22,6 +22,7 @@ LABEL_TO_KEY = {
     "Price (per 30 days)": "base_price_per_epoch",
     "Latency": "lat_lin_reg_coefficient",
     "Uptime": "uptime_score",
+    "Freshness": "freshness",
     "Success rate": "success_rate",
     "Price (per billion entities)": "price_per_entity",
 }

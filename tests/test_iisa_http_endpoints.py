@@ -1204,24 +1204,27 @@ class TestScoresWeightedEndpoint:
         entries_by_id = {e["indexer"]: e for e in body["scores"]}
         assert set(entries_by_id) == {"0xabc", "0xxyz", "0x123"}
 
-        # The network-wide score leaves prices out: it averages latency, stake_to_fees, uptime and
-        # success rate. Latency and stake_to_fees arrive pre-scaled and are kept; 98.5% uptime and
-        # success sit halfway between the 97%-of-best cutoff and the best.
+        # The network-wide score leaves prices and freshness out: it averages latency,
+        # stake_to_fees, uptime and success rate. Latency and stake_to_fees arrive pre-scaled and
+        # are kept; 98.5% uptime and success sit halfway between the 97%-of-best cutoff and the
+        # best.
         abc = entries_by_id["0xabc"]
         assert abc["components"] == pytest.approx(
             {"latency": 0.8, "stake_to_fees": 0.5, "uptime": 0.5, "success_rate": 0.5}
         )
         assert abc["weighted_score"] == pytest.approx(
-            (0.8 * 0.20 + 0.5 * 0.30 + 0.5 * 0.15 + 0.5 * 0.05) / 0.70
+            (0.8 * 0.10 + 0.5 * 0.25 + 0.5 * 0.15 + 0.5 * 0.05) / 0.55
         )
 
         # Each chain is scored against the indexers that support it and priced it, prices in.
+        # No chain has freshness checks, so freshness is left out of each chain's score.
         assert set(abc["chains"]) == {"arbitrum-one", "base"}
         arbitrum = abc["chains"]["arbitrum-one"]
         assert arbitrum["components"]["base_price"] == pytest.approx(0.0)
         assert arbitrum["components"]["price_per_entity"] == pytest.approx(0.0)
+        assert "freshness" not in arbitrum["components"]
         assert arbitrum["weighted_score"] == pytest.approx(
-            0.8 * 0.20 + 0.5 * 0.30 + 0.5 * 0.15 + 0.5 * 0.05
+            (0.8 * 0.10 + 0.5 * 0.25 + 0.5 * 0.15 + 0.5 * 0.05) / 0.85
         )
         # abc is alone on base, so it is the best uptime there.
         assert abc["chains"]["base"]["components"]["uptime"] == pytest.approx(1.0)

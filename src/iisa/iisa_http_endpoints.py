@@ -101,8 +101,9 @@ class Settings(BaseSettings):
     sync_status_file_path: str = "/app/scores/sync_status.json"
     sync_status_staleness_hours: float = 6.0
     freshness_file_path: str = "/app/scores/freshness.json"
-    # Chains, comma-separated, on which a stale mark is only recorded and reported. On every
-    # other chain an indexer marked stale isn't picked for new agreements.
+    # Chains, comma-separated, on which a stale mark is only recorded and reported and freshness
+    # isn't weighed. On every other chain an indexer marked stale isn't picked for new
+    # agreements.
     freshness_exempt_chains: Annotated[frozenset[str], NoDecode] = frozenset()
     # How many minutes behind this service's clock a chain's last counted check may be. Past
     # that its marks are too old to trust, and selection there ignores them.
@@ -331,7 +332,9 @@ class ScoreRequest(BaseModel):
 
 
 class ChainScore(BaseModel):
-    """An indexer's weighted score and component scores, prices included, on one chain.
+    """An indexer's weighted score and component scores, prices and freshness included, on one
+    chain. Freshness is left out on a chain whose checks don't yet cover 7 days or have stopped
+    counting.
 
     Scored against every indexer that supports the chain and has priced it, as selection does
     before it applies a request's budget, blocklist and expected fees.
@@ -346,7 +349,8 @@ class ScoreResponse(BaseModel):
     Response for the /get-score endpoint.
 
     weighted_score and components compare the indexer with every loaded indexer and leave out
-    prices, which depend on the chain. chains has the full score for each chain it has priced.
+    prices and freshness, which depend on the chain. chains has the full score for each chain
+    it has priced.
     """
 
     indexer_id: str
@@ -1290,8 +1294,9 @@ def scores_snapshot(
     )
 
 
-# Prices only exist once a chain is chosen, so the network-wide score leaves these weights out.
-_PRICE_WEIGHTS = ("base_price_per_epoch", "price_per_entity")
+# Prices and freshness only exist once a chain is chosen, so the network-wide score leaves
+# these weights out.
+_CHAIN_WEIGHTS = ("base_price_per_epoch", "price_per_entity", "freshness")
 
 
 def _scores_by_indexer(
@@ -1350,10 +1355,10 @@ def _scores_by_indexer(
 def _network_scores(
     history: pd.DataFrame, indexer_id: Optional[str] = None
 ) -> dict[str, ChainScore]:
-    """Each indexer scored against every loaded indexer, with prices left out."""
+    """Each indexer scored against every loaded indexer, with prices and freshness left out."""
     from .indexer_selection import DEFAULT_WEIGHTS, _normalize_metrics
 
-    weights = {k: v for k, v in DEFAULT_WEIGHTS.items() if k not in _PRICE_WEIGHTS}
+    weights = {k: v for k, v in DEFAULT_WEIGHTS.items() if k not in _CHAIN_WEIGHTS}
     return _scores_by_indexer(_normalize_metrics(history.copy()), weights, indexer_id)
 
 
@@ -1387,7 +1392,9 @@ def _chain_scores(
         pool, _ = _keep_with_chain_price(pool, chain)
         if pool.empty:
             continue
-        normalized = _normalize_metrics(_enrich_with_chain_prices(pool, chain))
+        normalized = _normalize_metrics(
+            _with_chain_freshness(_enrich_with_chain_prices(pool, chain), chain)
+        )
         for row_indexer, score in _scores_by_indexer(
             normalized, DEFAULT_WEIGHTS, indexer_id
         ).items():
@@ -1919,6 +1926,42 @@ def _enrich_with_chain_prices(
     return df
 
 
+def _weighed_freshness(chain_id: str) -> Optional[Mapping[str, float]]:
+    """Each indexer's freshness score on ``chain_id``, or None where freshness isn't weighed: on
+    an exempt chain, whose checks are taken as untrustworthy or impossible to pass, on a chain
+    whose checks don't yet cover 7 days, and on one whose last counted check is older than
+    IISA_FRESHNESS_MAX_AGE_MINUTES by this service's clock, which is when enforcement stops
+    trusting its marks too. The scores are worked out at each push, so they stop changing when
+    the prober stops or every check is void. Reads neither through the freshness lock.
+    """
+    scores = _state.freshness.scores_on(chain_id)
+    enforcement = _enforcement()
+    if scores is None or not enforcement.enforced(chain_id):
+        return None
+    if not enforcement.current(_state.freshness.last_counted_minute(chain_id)):
+        return None
+    return scores
+
+
+def _with_chain_freshness(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
+    """``history`` with each indexer's freshness score on ``chain_id`` in a freshness column,
+    replacing any it held: 0 for an indexer with no record there, and NaN for everyone where
+    _weighed_freshness gives no scores, so the weighted score leaves freshness out there rather
+    than scoring everyone 0.
+    """
+    df = history.copy()
+    scores = _weighed_freshness(chain_id)
+    if scores is None or "indexer" not in df.columns:
+        df["freshness"] = math.nan
+        return df
+
+    def score_of(indexer: Any) -> float:
+        return scores.get(indexer.lower(), 0.0) if isinstance(indexer, str) else 0.0
+
+    df["freshness"] = df["indexer"].map(score_of).astype(float)
+    return df
+
+
 def _indexer_prices(
     history: pd.DataFrame, idx_id: str, chain_id: str
 ) -> tuple[Optional[float], Optional[float]]:
@@ -2055,6 +2098,7 @@ _BREAKDOWN_COMPONENTS = (
     ("norm_uptime_score", "uptime"),
     ("norm_success_rate", "success_rate"),
     ("norm_price_per_entity", "price_per_entity"),
+    ("norm_freshness", "freshness"),
 )
 
 
@@ -2257,8 +2301,10 @@ def _prepare_selection(request: SelectionRequest) -> Union[_Selection, Selection
             ),
         )
 
-    # Enrich with chain-specific price columns for normalization
-    enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
+    # Enrich with the chain's prices and freshness scores for normalization
+    enriched_history = _with_chain_freshness(
+        _enrich_with_chain_prices(filtered_history, request.chain_id), request.chain_id
+    )
     request = _without_stale_candidates(request, enriched_history)
     return _Selection(request, enriched_history, _synced_indexers_for(request.deployment_id))
 
@@ -2276,7 +2322,7 @@ def _selection_response(selection: _Selection, processor: IndexerSelector) -> Se
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """Run IndexerSelector and return a SelectionResponse for the deployment.
 
-    The selector weights stake-to-fees, base price, latency, uptime,
+    The selector weights stake-to-fees, base price, latency, uptime, freshness,
     success rate, and price-per-entity; lower is better for prices and
     latency, higher for the rest.
     """
