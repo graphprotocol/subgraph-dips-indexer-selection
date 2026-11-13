@@ -123,7 +123,7 @@ Marks only stay trustworthy while checks keep counting, so a listed chain is enf
 | `cronjobs/compute_scores/` | The daily measurement job: gateway-traffic replay, metric computation, and the client that pushes scores. |
 | `k8s/` | The Kubernetes manifests for the service and the daily job. |
 | `tests/` | The service's tests, run in CI against the exact versions pinned in `uv.lock`, which the service image installs, under the Python in `.python-version` that the image runs. |
-| `tests/cronjob/` | The daily job's tests, run in CI against what its `requirements.txt` resolves to. |
+| `tests/cronjob/` | The daily job's tests, run in CI against the exact versions in its `requirements.txt`, which its image installs. That file is compiled from the ranges in `requirements.in` with `uv pip compile`; its first lines give the command. |
 
 ## Running the tests
 

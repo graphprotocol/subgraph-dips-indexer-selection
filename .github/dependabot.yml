@@ -21,20 +21,21 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
-  # CI's type check and cronjob tests install this list with pyproject.toml's, and both fail when
-  # a package the 2 share needs a version the other refuses (e.g. pyarrow 26 against a <25 cap).
-  # Each merged bump rebuilds the image, which then needs a manual kubectl apply.
-  - package-ecosystem: pip
+  # Cronjob deps: the ranges in requirements.in and the lock compiled from them, requirements.txt.
+  # Dependabot compiles the lock again with the options its first lines record. CI's cronjob tests
+  # install the lock with pyproject.toml's ranges, and fail when a package the 2 share needs a
+  # version the other refuses (e.g. pyarrow 26 against a <25 cap). Each merged bump rebuilds the
+  # image, which then needs a manual kubectl apply.
+  - package-ecosystem: uv
     directory: /cronjobs/compute_scores
     schedule:
       interval: weekly
     versioning-strategy: increase
-    # Every update, majors included, goes in 1 weekly PR. With only ranges and no lock file,
-    # Dependabot can't tell a major from a patch, so an update-types filter pushes each bump into
-    # its own PR. The service group above can split because uv.lock holds exact versions.
+    # As for the service: majors stay out of the group, since the lock holds exact versions.
     groups:
       cronjob-python:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   - package-ecosystem: docker
     directories:
