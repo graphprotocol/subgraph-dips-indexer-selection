@@ -331,7 +331,8 @@ class ScoreRequest(BaseModel):
 
 
 class ChainScore(BaseModel):
-    """An indexer's weighted score and component scores, prices included, on one chain.
+    """An indexer's weighted score and component scores, prices and freshness included, on one
+    chain. Freshness is left out on a chain whose checks don't yet cover 7 days.
 
     Scored against every indexer that supports the chain and has priced it, as selection does
     before it applies a request's budget, blocklist and expected fees.
@@ -346,7 +347,8 @@ class ScoreResponse(BaseModel):
     Response for the /get-score endpoint.
 
     weighted_score and components compare the indexer with every loaded indexer and leave out
-    prices, which depend on the chain. chains has the full score for each chain it has priced.
+    prices and freshness, which depend on the chain. chains has the full score for each chain
+    it has priced.
     """
 
     indexer_id: str
@@ -1274,8 +1276,9 @@ def scores_snapshot(
     )
 
 
-# Prices only exist once a chain is chosen, so the network-wide score leaves these weights out.
-_PRICE_WEIGHTS = ("base_price_per_epoch", "price_per_entity")
+# Prices and freshness only exist once a chain is chosen, so the network-wide score leaves
+# these weights out.
+_CHAIN_WEIGHTS = ("base_price_per_epoch", "price_per_entity", "freshness")
 
 
 def _scores_by_indexer(
@@ -1334,10 +1337,10 @@ def _scores_by_indexer(
 def _network_scores(
     history: pd.DataFrame, indexer_id: Optional[str] = None
 ) -> dict[str, ChainScore]:
-    """Each indexer scored against every loaded indexer, with prices left out."""
+    """Each indexer scored against every loaded indexer, with prices and freshness left out."""
     from .indexer_selection import DEFAULT_WEIGHTS, _normalize_metrics
 
-    weights = {k: v for k, v in DEFAULT_WEIGHTS.items() if k not in _PRICE_WEIGHTS}
+    weights = {k: v for k, v in DEFAULT_WEIGHTS.items() if k not in _CHAIN_WEIGHTS}
     return _scores_by_indexer(_normalize_metrics(history.copy()), weights, indexer_id)
 
 
@@ -1371,7 +1374,9 @@ def _chain_scores(
         pool, _ = _keep_with_chain_price(pool, chain)
         if pool.empty:
             continue
-        normalized = _normalize_metrics(_enrich_with_chain_prices(pool, chain))
+        normalized = _normalize_metrics(
+            _with_chain_freshness(_enrich_with_chain_prices(pool, chain), chain)
+        )
         for row_indexer, score in _scores_by_indexer(
             normalized, DEFAULT_WEIGHTS, indexer_id
         ).items():
@@ -1903,6 +1908,26 @@ def _enrich_with_chain_prices(
     return df
 
 
+def _with_chain_freshness(history: pd.DataFrame, chain_id: str) -> pd.DataFrame:
+    """``history`` with each indexer's freshness score on ``chain_id`` in a freshness column,
+    replacing any it held: 0 for an indexer with no record there, and NaN for everyone on a
+    chain whose checks don't yet cover 7 days, so the weighted score leaves freshness out there
+    rather than scoring everyone 0. Reads the scores worked out after the last push, never the
+    freshness lock.
+    """
+    df = history.copy()
+    scores = _state.freshness.scores_on(chain_id)
+    if scores is None or "indexer" not in df.columns:
+        df["freshness"] = math.nan
+        return df
+
+    def score_of(indexer: Any) -> float:
+        return scores.get(indexer.lower(), 0.0) if isinstance(indexer, str) else 0.0
+
+    df["freshness"] = df["indexer"].map(score_of).astype(float)
+    return df
+
+
 def _indexer_prices(
     history: pd.DataFrame, idx_id: str, chain_id: str
 ) -> tuple[Optional[float], Optional[float]]:
@@ -2039,6 +2064,7 @@ _BREAKDOWN_COMPONENTS = (
     ("norm_uptime_score", "uptime"),
     ("norm_success_rate", "success_rate"),
     ("norm_price_per_entity", "price_per_entity"),
+    ("norm_freshness", "freshness"),
 )
 
 
@@ -2241,8 +2267,10 @@ def _prepare_selection(request: SelectionRequest) -> Union[_Selection, Selection
             ),
         )
 
-    # Enrich with chain-specific price columns for normalization
-    enriched_history = _enrich_with_chain_prices(filtered_history, request.chain_id)
+    # Enrich with the chain's prices and freshness scores for normalization
+    enriched_history = _with_chain_freshness(
+        _enrich_with_chain_prices(filtered_history, request.chain_id), request.chain_id
+    )
     request = _without_stale_candidates(request, enriched_history)
     return _Selection(request, enriched_history, _synced_indexers_for(request.deployment_id))
 
@@ -2260,7 +2288,7 @@ def _selection_response(selection: _Selection, processor: IndexerSelector) -> Se
 def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     """Run IndexerSelector and return a SelectionResponse for the deployment.
 
-    The selector weights stake-to-fees, base price, latency, uptime,
+    The selector weights stake-to-fees, base price, latency, uptime, freshness,
     success rate, and price-per-entity; lower is better for prices and
     latency, higher for the rest.
     """

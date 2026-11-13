@@ -3,8 +3,8 @@
 A prober checks every indexer on every chain it offers DIPs on once a minute and pushes that
 minute's outcomes to the service. From them this module keeps, for each indexer and chain, a
 stale mark worked out from the last 10 minutes, and daily counts of passed and counted checks
-for the last 28 days. Minutes and days are counted from the Unix epoch in UTC, so a day here
-is a UTC day.
+for the last 28 days, from which it scores the indexer's freshness on the chain. Minutes and
+days are counted from the Unix epoch in UTC, so a day here is a UTC day.
 """
 
 import logging
@@ -17,11 +17,14 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .share_score import shaped_share
+
 __all__ = [
     "Check",
     "Enforcement",
     "FreshnessState",
     "FreshnessStore",
+    "freshness_score",
     "load_state",
     "minute_index",
     "minute_text",
@@ -35,6 +38,10 @@ WINDOW_MINUTES = 10
 MIN_COUNTED_MINUTES = 5
 HISTORY_DAYS = 28
 MINUTES_PER_DAY = 1_440
+# Freshness is weighed on a chain only once it has this many minutes of checks, 7 days, and an
+# indexer's share of checks passed is taken over at least this many, so a newcomer can't score
+# 1 on a good hour.
+MIN_SCORED_MINUTES = 7 * MINUTES_PER_DAY
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -260,16 +267,45 @@ def _chain_report(
     }
 
 
+def freshness_score(passed: int, counted: int) -> float:
+    """An indexer's freshness score on a chain from its checks passed and counted over the
+    last HISTORY_DAYS: its share passed, over at least MIN_SCORED_MINUTES checks, shaped.
+    """
+    return shaped_share(passed / max(counted, MIN_SCORED_MINUTES))
+
+
+def _pair_score(pair: PairState) -> float:
+    days = pair.days.values()
+    return freshness_score(sum(day.passed for day in days), sum(day.counted for day in days))
+
+
+def _scores_of(state: FreshnessState) -> dict[str, dict[str, float]]:
+    """By chain, each indexer's freshness score there, for the chains whose earliest pair was
+    first seen at least MIN_SCORED_MINUTES before the last minute applied.
+    """
+    last_minute = state.last_minute
+    if last_minute is None:
+        return {}
+    return {
+        chain: {indexer: _pair_score(pair) for indexer, pair in pairs.items()}
+        for chain, pairs in state.chains.items()
+        if pairs
+        and last_minute - min(pair.first_minute for pair in pairs.values()) >= MIN_SCORED_MINUTES
+    }
+
+
 @dataclass(frozen=True)
 class _Marks:
-    """The last minute applied, by chain the indexers not marked there, and by chain the last
-    minute a check there counted. Rebuilt after each push and swapped in with 1 assignment,
-    so selection reads it without the lock.
+    """The last minute applied, by chain the indexers not marked there, by chain the last
+    minute a check there counted, and by chain each indexer's freshness score on the chains
+    scored. Rebuilt after each push and swapped in with 1 assignment, so selection reads it
+    without the lock.
     """
 
     last_minute: Optional[int]
     unmarked: Mapping[str, frozenset[str]]
     last_counted: Mapping[str, int]
+    scores: Mapping[str, Mapping[str, float]]
 
 
 def _marks_of(state: FreshnessState) -> _Marks:
@@ -277,7 +313,7 @@ def _marks_of(state: FreshnessState) -> _Marks:
         chain: frozenset(indexer for indexer, pair in pairs.items() if not pair.marked)
         for chain, pairs in state.chains.items()
     }
-    return _Marks(state.last_minute, unmarked, dict(state.last_counted))
+    return _Marks(state.last_minute, unmarked, dict(state.last_counted), _scores_of(state))
 
 
 class FreshnessStore:
@@ -325,6 +361,13 @@ class FreshnessStore:
         """
         unmarked = self._marks.unmarked.get(chain, frozenset())
         return {indexer for indexer in indexers if indexer.lower() not in unmarked}
+
+    def scores_on(self, chain: str) -> Optional[Mapping[str, float]]:
+        """Each indexer's freshness score on ``chain``, by address in lower case, or None when
+        the chain has fewer than MIN_SCORED_MINUTES of checks or none, so freshness isn't
+        weighed there. An indexer missing from the answer has no record on the chain.
+        """
+        return self._marks.scores.get(chain)
 
     def last_counted_minute(self, chain: str) -> Optional[int]:
         """The last minute in which a check on ``chain`` counted, or None when none has in
