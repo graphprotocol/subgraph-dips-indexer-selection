@@ -157,13 +157,17 @@ class AddressRule:
         this rule doesn't allow. A host written as a name passes: it is judged as IISA connects.
 
         A URL that can't be read at all passes too. The HTTP library reads URLs the same way, so
-        it fails on that URL itself, before any connection.
+        it fails on that URL itself, before any connection. This check runs outside each call's
+        own error handling, so it must never raise anything but `Refused`.
         """
-        # The parser the HTTP library uses, so the host judged here is the host it connects to.
+        # The parser the HTTP library uses. The host is taken as written, which is what the
+        # library connects to; decoding it as an international name could fail where the
+        # connection would not, such as on a label that starts "xn--" but is not valid.
         from yarl import URL
 
         try:
             parsed = URL(url)
+            host = parsed.raw_host
         except (ValueError, TypeError):
             return
         # Neither rule allows another scheme: only http and https calls go through the checks
@@ -173,9 +177,9 @@ class AddressRule:
                 f"refused a {parsed.scheme or 'schemeless'} URL: IISA calls indexers only over "
                 "http or https"
             )
-        if not parsed.host:
+        if not host:
             raise Refused("refused a URL with no host")
-        ip = _as_address(parsed.host)
+        ip = _as_address(host)
         if ip is not None and not self.allows(ip):
             raise Refused(f"refused {ip}: not a public address; {ONLY_FOR_LOCAL_NETWORKS}")
 

@@ -118,6 +118,19 @@ async def test_a_call_refused_while_connecting_is_not_tried_again(fetch, unreach
     assert any("refused indexer.example" in r.getMessage() for r in caplog.records), caplog.text
 
 
+@pytest.mark.parametrize("fetch, unreachable", FETCHES)
+async def test_a_host_that_is_not_valid_punycode_leaves_the_indexer_unreachable(
+    fetch, unreachable, monkeypatch
+):
+    # The fetches run together, so 1 that raised would fail them all, for every indexer.
+    monkeypatch.setattr(processing, "DIPS_INFO_MAX_RETRIES", 1)
+    monkeypatch.setattr(processing, "GRAPH_NODE_VERSION_MAX_RETRIES", 1)
+    monkeypatch.setattr(sync_status_fetcher, "MAX_RETRIES", 1)
+    session = _Session(error=aiohttp.ClientConnectionError("no such host"))
+
+    assert await fetch(session, "https://xn--a.example") is unreachable
+
+
 def _indexer_app(hits):
     """A stand-in indexer that answers all 3 calls and counts them."""
 

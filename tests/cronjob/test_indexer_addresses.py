@@ -26,6 +26,7 @@ from indexer_addresses import (  # noqa: E402
     Refused,
     is_public,
     refusal_behind,
+    refused_url,
 )
 
 NOT_PUBLIC = [
@@ -149,6 +150,24 @@ def test_a_url_that_cannot_be_read_is_left_for_the_http_library_to_refuse():
     AddressRule().check_url(unreadable)
     with pytest.raises(ValueError):
         aiohttp.client.URL(unreadable)
+
+
+# A label that starts "xn--" but is not valid punycode. Decoding it fails, so a check that
+# decoded the host would raise on a URL any indexer can register.
+NOT_VALID_PUNYCODE = ["https://xn--a.example", "http://xn--/", "https://indexer.xn--zz"]
+
+
+@pytest.mark.parametrize("allow_private_addresses", [False, True])
+@pytest.mark.parametrize("url", NOT_VALID_PUNYCODE)
+def test_a_host_that_is_not_valid_punycode_is_judged_as_written(url, allow_private_addresses):
+    AddressRule(allow_private_addresses=allow_private_addresses).check_url(url)
+
+
+@pytest.mark.parametrize("url", NOT_VALID_PUNYCODE)
+def test_the_first_check_never_raises_on_a_registered_url(url, monkeypatch):
+    monkeypatch.delenv(ALLOW_PRIVATE_ADDRESSES_ENV, raising=False)
+
+    assert refused_url(url) is None
 
 
 def test_a_refusal_says_how_a_local_network_lifts_it():
