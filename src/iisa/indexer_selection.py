@@ -46,9 +46,9 @@ MIN_INDEXER_SCORE = 0.15
 # ...but only by a candidate whose total beats the member's by more than this fraction of B.
 REPLACEMENT_MARGIN = 0.50
 
-# Once the group has a synced indexer, a candidate that says it has synced keeps its head start
-# over the others only while its total is at least this fraction of B; below it, it competes on
-# its total alone.
+# Once the group has a synced indexer, not counting a member being replaced, a candidate that
+# says it has synced keeps its head start over the others only while its total is at least this
+# fraction of B; below it, it competes on its total alone.
 MIN_SYNCED_THRESHOLD = 0.60
 
 # An indexer's total is uptime x freshness x quality x value, each in [0, 1]; docs/scoring.md
@@ -636,9 +636,9 @@ class IndexerSelector:
         self, replacing_indexer: Optional[IndexerId] = None, prefer_synced: bool = True
     ) -> Optional[IndexerId]:
         """Pick the highest-scoring eligible indexer to add, or to replace replacing_indexer
-        (whose swap the decentralisation check then simulates), or None if none qualify.
-        Unpickable indexers are skipped (see _unpickable_indexers). prefer_synced, when False,
-        ranks candidates on score alone, as if none were synced.
+        (left out of the group for the decentralisation check and the synced head start).
+        None if none qualify. Unpickable indexers are skipped (see _unpickable_indexers).
+        prefer_synced, when False, ranks candidates on score alone, as if none were synced.
         """
         # A stale candidate can fill an empty place once no other is left, but never replace.
         fill_in = self._filling_with_stale and replacing_indexer is None
@@ -713,9 +713,9 @@ class IndexerSelector:
     ) -> list[tuple[str, pd.DataFrame]]:
         """Split score-sorted candidates into named pools, drawn from in order.
 
-        Prefer already-synced candidates so queries serve right after
-        acceptance: the first synced indexer gets in at any score, later ones
-        must reach MIN_SYNCED_THRESHOLD of B or fall back to competing on merit.
+        Prefer already-synced candidates so queries serve right after acceptance: the first
+        synced indexer, with a member being replaced not counted, gets in at any score, later
+        ones must reach MIN_SYNCED_THRESHOLD of B or fall back to competing on merit.
         """
         if not self.synced_indexers:
             return [("all", candidates)]
@@ -791,9 +791,9 @@ def _normalize_metrics(
 ) -> pd.DataFrame:
     """Normalise each metric to [0, 1], where 1 is best. The 2 ceilings, when given, replace the
     observed max for the 2 prices; scale_rows, when given, are the rows that set each metric's
-    best and worst. A missing or unreadable metric scores 0, except those in
-    _LEFT_OUT_WHEN_MISSING, which stay missing. Norm columns outside _PRECOMPUTED_NORM_COLUMNS
-    are recomputed; those inside score 0 when outside [0, 1].
+    best and worst. A missing metric scores 0, except those in _LEFT_OUT_WHEN_MISSING, which stay
+    missing; an unreadable one, such as text, always scores 0. Norm columns outside
+    _PRECOMPUTED_NORM_COLUMNS are recomputed; those inside score 0 when outside [0, 1].
     """
     latency, precomputed = _latency_metric(merged)
     # (norm column, source column, normaliser), in the order the columns are added.

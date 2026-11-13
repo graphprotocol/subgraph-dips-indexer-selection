@@ -86,7 +86,7 @@ Missing data is never given a neutral value: an indexer with no uptime, no succe
 
 Selection keeps a working group stable unless something is clearly better, through 3 cut-offs. Each is a fraction of $B$, the best total among the candidates the request can pick from at that moment, because fixed numbers would bite much harder on products than they did on sums.
 
-A group member can be replaced only when its total is under $0.15 \, B$, and only by a candidate whose total beats it by more than $0.50 \, B$. Once the group has an indexer that says it has synced the deployment, another candidate that says so keeps its head start over the rest only while its total is at least $0.60 \, B$; below that it competes on its total alone.
+A group member can be replaced only when its total is under $0.15 \, B$, and only by a candidate whose total beats it by more than $0.50 \, B$. Once the group has an indexer that says it has synced the deployment, another candidate that says so keeps its head start over the rest only while its total is at least $0.60 \, B$; below that it competes on its total alone. A member being replaced doesn't count here, since it is leaving: when it was the group's only synced indexer, a synced challenger gets the head start the first synced indexer always gets.
 
 Since $B$ is the best candidate's own total, the best candidate always beats a member under $0.15 \, B$ by more than $0.85 \, B$. The margin therefore matters only when a lower candidate is tried first, as a synced one is. It also means a synced indexer that gets into a group on its claim alone is swapped out in the same selection if its total is under $0.15 \, B$.
 
