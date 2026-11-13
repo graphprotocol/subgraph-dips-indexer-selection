@@ -68,7 +68,7 @@ The curve has the shape of the gateway's own latency score, made steeper: it is 
 | 500 ms | 0.044 |
 | 1,000 ms | 0.001 |
 
-The daily score job works out each indexer's latency from real gateway traffic. Its regression gives each indexer's gap to the median indexer, which accounts for how far away the indexer is and for the queries it was sent, plus a margin of 1.5 standard errors so that an estimate backed by little data looks slower. Adding the median query's response time to that gap gives the indexer's latency in milliseconds, never below 0. An indexer without a latency scores 0. Scores from a job older than this measure keep the older latency score, scaled against the other candidates, and the service logs a warning while they do.
+The daily score job works out each indexer's latency from real gateway traffic. Its regression gives each indexer's gap to the median indexer, which accounts for how far away the indexer is and for the queries it was sent, plus a margin of 1.5 standard errors so that an estimate backed by little data looks slower. Adding the median indexer's own latency to that gap gives the indexer's latency in milliseconds, never below 0. The median indexer's latency is the median response time once each query's own indexer gap is taken out, since the median query alone would lean towards the fast indexers the gateway sends most queries to. An indexer without a latency scores 0. Scores with no latency in milliseconds at all, as from a score job run without GeoIP, a degraded run or a job older than the measure, keep the job's own latency score, scaled across every indexer the job measured, and the service logs a warning while they do.
 
 ## Value, V
 
