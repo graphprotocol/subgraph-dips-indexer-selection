@@ -38,9 +38,8 @@ IndexerId = EthAddressStr
 # Module-level logger
 logger = logging.getLogger(__name__)
 
-# Selection's 3 cut-offs, each a fraction of B, the best total among the candidates a request
-# can pick from at that moment. Totals are products, which run lower than sums (a good indexer
-# totals about 0.5), so fixed cut-offs would bite much harder than they did on the old sum.
+# Selection's 3 cut-offs are fractions of B, the best total a request can pick from, since a
+# product runs low (a good indexer totals about 0.5) and fixed numbers would bite too hard.
 # A group member totalling under this fraction of B can be replaced...
 MIN_INDEXER_SCORE = 0.15
 
@@ -83,15 +82,10 @@ SCORE_FACTORS = ("uptime", "freshness", "quality", "value")
 
 
 class IndexerSelector:
-    """Score and pick the best indexers for one subgraph deployment.
-
-    Takes the DataManager's metrics, normalises them, combines them into a
-    total score, and assigns or replaces indexers, honouring the denylist
-    and decentralisation floor.
-
-    One job lifetime: built for a single add-or-replace then discarded; whether
-    it adds or replaces depends on how many indexers already serve the subgraph
-    and how their quality compares to the best alternative.
+    """Score and pick the best indexers for one subgraph deployment, honouring the denylist and
+    decentralisation floor. Built for a single add-or-replace, then discarded: whether it adds
+    or replaces depends on how many indexers already serve the subgraph and how their quality
+    compares to the best alternative.
     """
 
     def __init__(
@@ -109,13 +103,10 @@ class IndexerSelector:
         stale_indexers: Optional[list[IndexerId]] = None,
         entity_price_ceiling: Optional[float] = None,
     ):
-        """Initialize the selector and run scoring for one deployment.
-        Non-obvious args: optimistic_dips_fees lowers stake_to_fees for indexers
-        that already hold agreements (load-balancing), price_ceiling and
-        entity_price_ceiling, the payer's ceilings on the base and per-entity
-        prices, are what those prices are scored against, synced_indexers
-        are preferred so queries serve right after acceptance, and stale_indexers
-        are candidates marked stale, picked only for places no other candidate can fill.
+        """Run scoring for one deployment. optimistic_dips_fees lowers stake_to_fees for indexers
+        that already hold agreements (load-balancing); price_ceiling and entity_price_ceiling are
+        the payer's ceilings the 2 prices are scored against; synced_indexers are preferred so
+        queries serve right after acceptance; stale_indexers fill only places nobody else can.
         """
         self.data = pd.DataFrame(history)
         self.deployment_id = deployment_id
@@ -370,12 +361,9 @@ class IndexerSelector:
 
     def _start_filling_with_stale(self) -> bool:
         """Let the stale candidates fill the group's remaining places, and score everyone again
-        with them setting each metric's scale, since they are now the ones being compared.
-        False when they already may, or there are none.
-
-        A group short of its target is worth more to the request than a group of fresh
-        indexers only, so a stale candidate gets a place no fresh one can take. It never
-        replaces a member: see _find_best_replacement_or_select_best_indexer.
+        with them setting each metric's scale. False when they already may, or there are none.
+        A full group is worth more than a group of fresh indexers only, so a stale candidate
+        gets a place no fresh one can take, but never replaces a member.
         """
         if self._filling_with_stale or not self.stale_indexers:
             return False
@@ -562,13 +550,10 @@ class IndexerSelector:
     def _swap_for(
         self, existing_indexer: IndexerId
     ) -> Optional[tuple[IndexerId, IndexerId, float]]:
-        """Return (existing_indexer, candidate, improvement) when existing_indexer
-        scores below MIN_INDEXER_SCORE of B and a candidate beats it by more than
-        REPLACEMENT_MARGIN of B; None otherwise.
-
-        A synced candidate is preferred. When that one gains too little, the best candidate
-        whatever its sync status is tried, so a synced candidate that falls short does not
-        end the search for this indexer's replacement.
+        """Return (existing_indexer, candidate, improvement) when existing_indexer scores below
+        MIN_INDEXER_SCORE of B and a candidate beats it by more than REPLACEMENT_MARGIN of B;
+        None otherwise. A synced candidate is tried first, and when it gains too little the best
+        candidate whatever its sync status is tried, so the search doesn't end there.
         """
         current_score = self._score_of(existing_indexer)
         if current_score is None:
@@ -630,12 +615,10 @@ class IndexerSelector:
     def _note_claims_that_could_win(
         self, candidates: pd.DataFrame, replacing_indexer: Optional[IndexerId]
     ) -> None:
-        """Record the candidates that this pick could choose because they say they have synced.
-
-        They are the candidates drawn from first (see _synced_first) that would also leave the
-        group meeting the decentralisation requirements and, when a member is being replaced,
-        beat it by more than REPLACEMENT_MARGIN of B. Any other candidate can only be picked on
-        its score, so whether its claim is true changes nothing here.
+        """Record the candidates this pick could choose because they say they have synced: those
+        drawn from first (see _synced_first) that also keep the group decentralised and, when a
+        member is being replaced, beat it by more than REPLACEMENT_MARGIN of B. Any other
+        candidate is picked on its score alone, so its claim changes nothing here.
         """
         if not self.synced_indexers:
             return
@@ -655,13 +638,10 @@ class IndexerSelector:
     def _find_best_replacement_or_select_best_indexer(
         self, replacing_indexer: Optional[IndexerId] = None, prefer_synced: bool = True
     ) -> Optional[IndexerId]:
-        """Pick the highest-scoring eligible indexer to add or to replace one.
-        Skips indexers already in the group, on the denylist, with pending
-        (unaccepted) agreements, that previously declined this subgraph, or marked
-        stale, unless the pick fills a place no other candidate can.
-        replacing_indexer, when set, simulates the swap for the decentralisation
-        check. prefer_synced, when False, ranks candidates on score alone, as if
-        none were synced. Returns the best indexer ID, or None if none qualify.
+        """Pick the highest-scoring eligible indexer to add, or to replace replacing_indexer
+        (whose swap the decentralisation check then simulates), or None if none qualify.
+        Unpickable indexers are skipped (see _unpickable_indexers). prefer_synced, when False,
+        ranks candidates on score alone, as if none were synced.
         """
         # A stale candidate can fill an empty place once no other is left, but never replace.
         fill_in = self._filling_with_stale and replacing_indexer is None
@@ -781,9 +761,8 @@ class IndexerSelector:
 
 
 # Norm columns the CronJob ships already normalised and the selector keeps: latency, for scores
-# without latency_ms, and stake_to_fees in degraded mode (a neutral 0.5). Every other metric in
-# _normalize_metrics is recomputed from its raw value, so a pre-scaled copy can't replace the
-# selector's own scaling.
+# without latency_ms, and stake_to_fees in degraded mode (a neutral 0.5). Every other metric is
+# recomputed from its raw value, so a pre-scaled copy can't replace the selector's own scaling.
 _PRECOMPUTED_NORM_COLUMNS = frozenset({NORM_LAT_LIN_REG_COEFFICIENT, "norm_stake_to_fees"})
 
 # Latency in ms is scored on a fixed curve, the shape of the gateway's own latency score made
@@ -813,14 +792,11 @@ def _normalize_metrics(
     scale_rows: Optional[pd.Series] = None,
     entity_price_ceiling: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Normalise each metric to [0, 1] where 1 is best (lower-is-better inverted).
-
-    price_ceiling and entity_price_ceiling, when given, are what the base and per-entity prices
-    are scored against instead of the observed max. scale_rows, when given, marks the rows that
-    set each metric's best and worst; other rows are scored against them.
-    Missing metrics score 0, except those in _LEFT_OUT_WHEN_MISSING, which stay missing, and a
-    value that does not read as a number, such as text, scores 0. Input norm_ columns outside
-    _PRECOMPUTED_NORM_COLUMNS are recomputed; those inside score 0 when outside [0, 1].
+    """Normalise each metric to [0, 1], where 1 is best. The 2 ceilings, when given, replace the
+    observed max for the 2 prices; scale_rows, when given, are the rows that set each metric's
+    best and worst. A missing or unreadable metric scores 0, except those in
+    _LEFT_OUT_WHEN_MISSING, which stay missing. Norm columns outside _PRECOMPUTED_NORM_COLUMNS
+    are recomputed; those inside score 0 when outside [0, 1].
     """
     latency, precomputed = _latency_metric(merged)
     # (norm column, source column, normaliser), in the order the columns are added.
@@ -876,11 +852,9 @@ def _latency_metric(
     merged: pd.DataFrame,
 ) -> tuple[tuple[str, str, _Normaliser], frozenset[str]]:
     """The latency metric, as (norm column, source column, normaliser), and the norm columns to
-    keep as pushed. latency_ms is scored on the fixed curve. Scores without it keep the latency
-    score from before it, with a warning: the job's pushed lat_normalized_score, scaled across
-    every indexer the job measured, or else the regression's upper bound scaled against the
-    candidates. A run without GeoIP and a degraded run measure no latency in ms, and nor did a
-    job older than latency_ms.
+    keep as pushed. latency_ms is scored on the fixed curve. Scores without it (a run without
+    GeoIP, a degraded run or an older job) keep, with a warning, the job's pushed
+    lat_normalized_score, or else the regression's upper bound scaled against the candidates.
     """
     if LATENCY_MS in merged.columns:
         # No row sets a scale here, as no indexer's score depends on another's.
@@ -1040,12 +1014,9 @@ def _normalize_price_per_entity(
     entity_price_ceiling: Optional[float] = None,
     scale_rows: Optional[pd.Series] = None,
 ) -> pd.Series:
-    """Normalize price per entity (lower is better).
-
-    With the payer's ceiling above 0, a price scores 1 - price / ceiling, so 0 at the ceiling.
-    Without it, the observed max takes its place. The service turns a missing price into 0
-    before this, so a value that is not a finite number >= 0 is unreadable and gets 0, the
-    worst score.
+    """Normalize price per entity (lower is better): 1 - price / ceiling with the payer's ceiling
+    above 0, else against the observed max. The service turns a missing price into 0 before
+    this, so a value that is not a finite number >= 0 is unreadable and gets 0, the worst score.
     """
     prices = pd.to_numeric(price_per_entity, errors="coerce").astype(float)
     prices = prices.where(np.isfinite(prices) & (prices >= 0))
