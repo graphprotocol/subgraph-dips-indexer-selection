@@ -242,6 +242,16 @@ def test_no_warning_when_fresh_candidates_fill_every_place(state, caplog):
     assert not any("marked stale" in r.getMessage() for r in caplog.records)
 
 
+def test_a_stale_candidate_filling_a_place_never_replaces_a_member(state):
+    """GOOD scores close to BEST, far enough above FAIR to replace it were GOOD fresh. With
+    every candidate stale, BEST fills the empty place, and GOOD, still stale, may not take
+    FAIR's."""
+    state.load_scores_from_records([_record(BEST, 0), _record(GOOD, 0.2), _record(FAIR, 2)])
+    _judge(state, ALL_FAIL)
+
+    assert _select(size=2, existing=[FAIR]) == [FAIR, BEST]
+
+
 @pytest.mark.parametrize(("best", "group"), [("pass", [BEST]), ("fail", [FAIR])])
 def test_a_stale_candidate_never_replaces_a_member(state, best, group):
     """FAIR scores far below BEST, so a fresh BEST takes its place; a stale one never does,
