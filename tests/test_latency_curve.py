@@ -20,15 +20,13 @@ from iisa.indexer_selection import (
     LATENCY_WIDTH_MS,
     _normalize_metrics,
 )
-from iisa.log_limit import LogLimit
 from iisa.score_columns import NORM_LAT_LIN_REG_COEFFICIENT, SEL_LATENCY_CI
 from iisa.score_loader import DataManager, FileScoreLoader
 
 
 @pytest.fixture(autouse=True)
-def fresh_fallback_warnings(monkeypatch):
-    """Each test starts with no fallback warning logged yet, at a fixed minute."""
-    monkeypatch.setattr(indexer_selection, "_LATENCY_FALLBACK_WARNINGS", LogLimit(10))
+def fixed_minute(monkeypatch):
+    """Each test starts at a fixed minute; conftest gives it a fresh fallback warning limit."""
     monkeypatch.setattr(indexer_selection, "_current_minute", lambda: 1_000)
 
 

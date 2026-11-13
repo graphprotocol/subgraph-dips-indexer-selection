@@ -3648,7 +3648,10 @@ class TestScoreHelpers:
     def test_network_scores_leave_prices_out_without_a_missing_column_warning(self, caplog):
         from iisa.iisa_http_endpoints import _network_scores
 
-        history = pd.DataFrame({"indexer": ["0xa", "0xb"], "% up_x": [100.0, 98.5]})
+        # With latency_ms, latency is scored on its curve rather than falling back with a warning.
+        history = pd.DataFrame(
+            {"indexer": ["0xa", "0xb"], "% up_x": [100.0, 98.5], "latency_ms": [100.0, 200.0]}
+        )
 
         with caplog.at_level(logging.WARNING):
             scores = _network_scores(history)
