@@ -965,12 +965,15 @@ class TestPushScoresEndpoint:
         client = TestClient(app, raise_server_exceptions=False)
         payload = self._sample_payload()
         payload[0]["uptime_score"] = uptime
+        payload[0]["dips_info_available"] = True
+        payload[0]["dips_min_grt_per_30_days"] = '{"arbitrum-one": "1"}'
+        payload[0]["dips_supported_networks"] = '["arbitrum-one"]'
 
         response = client.post("/scores", json=payload)
 
         assert response.status_code == 200
         weighted = client.get("/scores/weighted").json()["scores"]
-        assert weighted[0]["components"]["uptime"] == 0.0
+        assert weighted[0]["chains"]["arbitrum-one"]["components"]["uptime"] == 0.0
 
     @pytest.mark.parametrize("dropped", [["org"], ["dst_lat"], ["dst_lon", "org"]])
     def test_push_without_org_or_location_can_be_served(self, dropped, tmp_path, monkeypatch):
@@ -1151,6 +1154,15 @@ class TestScoresSnapshotEndpoint:
         assert response.status_code == 200
 
 
+# 1 indexer's DIPs columns pricing arbitrum-one, so it has a chain to be scored on.
+_PRICED_ON_ARBITRUM = {
+    "dips_info_available": [True],
+    "dips_supported_networks": ['["arbitrum-one"]'],
+    "dips_min_grt_per_30_days": ['{"arbitrum-one": "100"}'],
+    "dips_min_grt_per_billion_entities_per_30_days": ["0.4"],
+}
+
+
 class TestScoresWeightedEndpoint:
     """Tests for GET /scores/weighted (bulk weighted scores)."""
 
@@ -1204,29 +1216,28 @@ class TestScoresWeightedEndpoint:
         entries_by_id = {e["indexer"]: e for e in body["scores"]}
         assert set(entries_by_id) == {"0xabc", "0xxyz", "0x123"}
 
-        # The network-wide score leaves prices and freshness out, so value is stake_to_fees
-        # alone and freshness counts as 1. Latency and stake_to_fees arrive pre-scaled and are
-        # kept; 98.5% uptime and success each score their own share to the 6th power.
-        shaped = 0.985**6
-        quality = 0.2 * shaped + 0.8 * 0.8
-        abc = entries_by_id["0xabc"]
-        assert abc["components"] == pytest.approx(
-            {"latency": 0.8, "stake_to_fees": 0.5, "uptime": shaped, "success_rate": shaped}
-        )
-        assert abc["factors"] == pytest.approx(
-            {"uptime": shaped, "freshness": 1.0, "quality": quality, "value": 0.5}
-        )
-        assert abc["weighted_score"] == pytest.approx(shaped * quality * 0.5)
+        # An indexer is scored per chain only, so no total sits beside its chains.
+        assert {key for entry in body["scores"] for key in entry} == {"indexer", "chains"}
 
         # Each chain is scored against the indexers that support it and priced it, prices in.
         # No chain has freshness checks, so freshness is left out of each chain's score.
+        # Latency and stake_to_fees arrive pre-scaled and are kept; 98.5% uptime and success
+        # each score their own share to the 6th power.
+        shaped = 0.985**6
+        quality = 0.2 * shaped + 0.8 * 0.8
+        abc = entries_by_id["0xabc"]
         assert set(abc["chains"]) == {"arbitrum-one", "base"}
         arbitrum = abc["chains"]["arbitrum-one"]
+        assert arbitrum["components"]["latency"] == pytest.approx(0.8)
+        assert arbitrum["components"]["stake_to_fees"] == pytest.approx(0.5)
+        assert arbitrum["components"]["uptime"] == pytest.approx(shaped)
+        assert arbitrum["components"]["success_rate"] == pytest.approx(shaped)
         assert arbitrum["components"]["base_price"] == pytest.approx(0.0)
         assert arbitrum["components"]["price_per_entity"] == pytest.approx(0.0)
         assert "freshness" not in arbitrum["components"]
-        assert arbitrum["factors"]["freshness"] == 1.0
-        assert arbitrum["factors"]["value"] == pytest.approx(0.45 * 0.5)
+        assert arbitrum["factors"] == pytest.approx(
+            {"uptime": shaped, "freshness": 1.0, "quality": quality, "value": 0.45 * 0.5}
+        )
         assert arbitrum["weighted_score"] == pytest.approx(shaped * quality * 0.45 * 0.5)
         # Uptime is scored on abc's own share, so it is the same on base, where abc is alone, as
         # on arbitrum-one beside xyz's 100%.
@@ -1237,7 +1248,7 @@ class TestScoresWeightedEndpoint:
         assert xyz["chains"]["arbitrum-one"]["components"]["base_price"] == pytest.approx(0.5)
         assert xyz["chains"]["arbitrum-one"]["components"]["price_per_entity"] == pytest.approx(0.5)
 
-        # 0x123 has priced no chain, so it only has the network-wide score.
+        # 0x123 has priced no chain, so it is listed with no score.
         assert entries_by_id["0x123"]["chains"] == {}
 
     def test_nan_component_normalised_to_zero(self):
@@ -1258,6 +1269,7 @@ class TestScoresWeightedEndpoint:
                     "norm_stake_to_fees": [0.5],
                     "% up_x": [99.7],
                     "average_status": [0.99],
+                    **_PRICED_ON_ARBITRUM,
                 }
             ),
             computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
@@ -1268,7 +1280,7 @@ class TestScoresWeightedEndpoint:
         response = client.get("/scores/weighted")
         assert response.status_code == 200
         body = response.json()
-        components = body["scores"][0]["components"]
+        components = body["scores"][0]["chains"]["arbitrum-one"]["components"]
         # _normalize_metrics fills NaN with 0 across every norm_* column, so a
         # NaN latency input lands as a 0.0 latency in the response — not skipped.
         assert components["latency"] == 0.0
@@ -1289,6 +1301,7 @@ class TestScoresWeightedEndpoint:
                     "indexer": ["0xabc"],
                     "url": ["https://a.example/"],
                     "% up_x": [99.7],
+                    **_PRICED_ON_ARBITRUM,
                 }
             ),
             computed_at=datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc),
@@ -1297,7 +1310,7 @@ class TestScoresWeightedEndpoint:
 
         from iisa import indexer_selection
 
-        def raises(df, left_out):
+        def raises(df):
             raise ValueError("forced failure")
 
         monkeypatch.setattr(indexer_selection, "_score_factors", raises)
@@ -1307,9 +1320,10 @@ class TestScoresWeightedEndpoint:
         assert response.status_code == 200
         body = response.json()
         assert body["scores"][0]["indexer"] == "0xabc"
-        assert body["scores"][0]["weighted_score"] is None
-        assert body["scores"][0]["factors"] == {}
-        assert body["scores"][0]["components"]["uptime"] == pytest.approx(0.997**6)
+        arbitrum = body["scores"][0]["chains"]["arbitrum-one"]
+        assert arbitrum["weighted_score"] is None
+        assert arbitrum["factors"] == {}
+        assert arbitrum["components"]["uptime"] == pytest.approx(0.997**6)
 
     def test_returns_empty_snapshot_when_no_scores_loaded(self):
         from iisa import iisa_http_endpoints
@@ -1576,7 +1590,7 @@ class TestGetScoreEndpoint:
     @patch("iisa.iisa_http_endpoints.DataManager")
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
     def test_get_score_found(self, mock_loader_class, mock_dm_class, mock_history_df):
-        """Verify returns score and components for existing indexer."""
+        """Verify returns each chain's score for an existing indexer, and no total beside them."""
         # Arrange
         from iisa import iisa_http_endpoints
         from iisa.iisa_http_endpoints import Settings, app
@@ -1600,12 +1614,12 @@ class TestGetScoreEndpoint:
         data = response.json()
         assert data["indexer_id"] == "0xABC"
         assert data["found"] is True
-        assert data["weighted_score"] is not None
-        assert isinstance(data["components"], dict)
-        # Prices only appear per chain: 450 GRT against arbitrum-one's highest price of 500.
-        assert "base_price" not in data["components"]
+        assert set(data) == {"indexer_id", "found", "chains"}
         assert set(data["chains"]) == {"arbitrum-one"}
-        assert data["chains"]["arbitrum-one"]["components"]["base_price"] == pytest.approx(0.1)
+        arbitrum = data["chains"]["arbitrum-one"]
+        assert arbitrum["weighted_score"] is not None
+        # 450 GRT against arbitrum-one's highest price of 500.
+        assert arbitrum["components"]["base_price"] == pytest.approx(0.1)
 
     @patch("iisa.iisa_http_endpoints.DataManager")
     @patch("iisa.iisa_http_endpoints.FileScoreLoader")
@@ -1634,8 +1648,7 @@ class TestGetScoreEndpoint:
         data = response.json()
         assert data["indexer_id"] == "0xNONEXISTENT"
         assert data["found"] is False
-        assert data["weighted_score"] is None
-        assert data["components"] is None
+        assert data["chains"] is None
 
     def test_get_score_no_data(self):
         """Verify 503 when data not loaded."""
@@ -1704,8 +1717,14 @@ class TestGetScoreEndpoint:
                 "% up_x": [99.5, 98.0, 96.0],
                 "average_status": [0.99, 0.95, 0.90],
                 "stake_to_fees": [3.0, 2.0, 1.0],
-                "base_price_per_epoch": [100.0, 300.0, 500.0],
-                "price_per_entity": [0.1, 0.3, 0.5],
+                "dips_info_available": [True, True, True],
+                "dips_supported_networks": ['["arbitrum-one"]'] * 3,
+                "dips_min_grt_per_30_days": [
+                    '{"arbitrum-one": "100"}',
+                    '{"arbitrum-one": "300"}',
+                    '{"arbitrum-one": "500"}',
+                ],
+                "dips_min_grt_per_billion_entities_per_30_days": ["0.1", "0.3", "0.5"],
             }
         )
 
@@ -1726,10 +1745,11 @@ class TestGetScoreEndpoint:
         for indexer_id in ("0xaaa", "0xbbb", "0xccc"):
             single = client.post("/get-score", json={"indexer_id": indexer_id})
             assert single.status_code == 200
-            body = single.json()
-            assert body["weighted_score"] == pytest.approx(bulk_by_id[indexer_id]["weighted_score"])
-            assert body["components"] == pytest.approx(bulk_by_id[indexer_id]["components"])
-            single_scores[indexer_id] = body["weighted_score"]
+            chain = single.json()["chains"]["arbitrum-one"]
+            bulk_chain = bulk_by_id[indexer_id]["chains"]["arbitrum-one"]
+            assert chain["weighted_score"] == pytest.approx(bulk_chain["weighted_score"])
+            assert chain["components"] == pytest.approx(bulk_chain["components"])
+            single_scores[indexer_id] = chain["weighted_score"]
 
         # Scores differ across indexers — not the degenerate constant the
         # single-row normalisation produced for every indexer.
@@ -3616,18 +3636,23 @@ class TestPricedChains:
 class TestScoreHelpers:
     """Tests for the helpers behind /get-score and /scores/weighted."""
 
-    def test_network_scores_leave_prices_out_without_a_missing_column_warning(self, caplog):
-        from iisa.iisa_http_endpoints import _network_scores
+    def test_chain_scores_need_no_missing_column_warning(self, caplog):
+        from iisa.iisa_http_endpoints import _chain_scores
 
         # With latency_ms, latency is scored on its curve rather than falling back with a warning.
         history = pd.DataFrame(
-            {"indexer": ["0xa", "0xb"], "% up_x": [100.0, 98.5], "latency_ms": [100.0, 200.0]}
+            {
+                "indexer": ["0xa", "0xb"],
+                "% up_x": [100.0, 98.5],
+                "latency_ms": [100.0, 200.0],
+                "dips_min_grt_per_30_days": ['{"base": "40"}', '{"base": "60"}'],
+            }
         )
 
         with caplog.at_level(logging.WARNING):
-            scores = _network_scores(history)
+            scores = _chain_scores(history, ["base"])
 
-        assert "base_price" not in scores["0xa"].components
+        assert "base_price" in scores["0xa"]["base"].components
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_chain_scores_skip_indexers_that_have_not_priced_the_chain(self):
@@ -3663,7 +3688,7 @@ class TestScoreHelpers:
         )
 
         with caplog.at_level(logging.WARNING):
-            scores = _scores_by_indexer(normalized, frozenset())
+            scores = _scores_by_indexer(normalized, "arb")
 
         assert scores["0xa"].weighted_score == 1.0
         assert any("more than 1 score row" in r.getMessage() for r in caplog.records)
