@@ -13,12 +13,10 @@ import sync_status_fetcher  # noqa: E402
 from freshness_config import FreshnessConfig, load_freshness_config  # noqa: E402
 
 FAKE_KEY = "fake-freshness-key-0000"
-PAYER = "0x" + "9" * 40
 ENABLED = {
     "FRESHNESS_PROBE_ENABLED": "true",
     "FRESHNESS_GATEWAY_URL": "https://gateway.example.com/api/",
     "FRESHNESS_GATEWAY_API_KEY": FAKE_KEY,
-    "FRESHNESS_GATEWAY_PAYERS": PAYER,
 }
 
 
@@ -41,7 +39,6 @@ def test_defaults_when_switched_on():
         refresh_interval=900.0,
         request_timeout=25.0,
         max_concurrency=50,
-        gateway_payers=(PAYER,),
     )
     assert config.min_allocation_age_seconds == 7 * 86_400
     assert FAKE_KEY not in repr(config)
@@ -161,46 +158,20 @@ def test_fetcher_refuses_to_start_when_enabled_without_url_or_key(fetcher_env, c
 
 
 @pytest.mark.parametrize(
-    ("payers", "expected"),
+    "removed",
     [
-        ("", "FRESHNESS_GATEWAY_PAYERS is required"),
-        (" , ", "FRESHNESS_GATEWAY_PAYERS is required"),
-        ("0x1234", "FRESHNESS_GATEWAY_PAYERS must be 0x addresses"),
-        (PAYER + ";" + PAYER, "FRESHNESS_GATEWAY_PAYERS must be 0x addresses"),
+        {},
+        {"FRESHNESS_GATEWAY_PAYERS": "not-an-address"},
+        {"FRESHNESS_GATEWAY_COLLECTOR": "not-an-address"},
     ],
+    ids=["unset", "payers-left-set", "collector-left-set"],
 )
-def test_the_gateways_payers_are_required(payers, expected):
-    config, problem = load_freshness_config({**ENABLED, "FRESHNESS_GATEWAY_PAYERS": payers})
-
-    assert config is None
-    assert problem.startswith(expected)
-
-
-def test_the_gateways_collector_is_optional_and_in_lower_case():
-    collector = "0x" + "CD" * 20
-    unset, _ = load_freshness_config(ENABLED)
-    config, problem = load_freshness_config(
-        {**ENABLED, "FRESHNESS_GATEWAY_COLLECTOR": f" {collector} "}
-    )
-
-    assert unset.gateway_collector is None
-    assert problem is None
-    assert config.gateway_collector == collector.lower()
-
-
-@pytest.mark.parametrize("collector", ["0x1234", f"{PAYER},{PAYER}"])
-def test_a_collector_that_isnt_1_address_is_a_problem(collector):
-    config, problem = load_freshness_config({**ENABLED, "FRESHNESS_GATEWAY_COLLECTOR": collector})
-
-    assert config is None
-    assert problem == "FRESHNESS_GATEWAY_COLLECTOR must be a 0x address"
-
-
-def test_payers_are_a_comma_separated_list_in_lower_case():
-    second = "0x" + "AB" * 20
-    config, problem = load_freshness_config(
-        {**ENABLED, "FRESHNESS_GATEWAY_PAYERS": f" {PAYER}, {second},{PAYER} "}
-    )
+def test_the_config_loads_without_payers_or_a_collector(removed):
+    """Refused payments are void whatever the gateway's escrow holds, so the prober no longer
+    reads it, nor the 2 settings that named whose escrow to read; a value left set is ignored."""
+    config, problem = load_freshness_config({**ENABLED, **removed})
 
     assert problem is None
-    assert config.gateway_payers == (PAYER, second.lower())
+    assert config is not None
+    assert not hasattr(config, "gateway_payers")
+    assert not hasattr(config, "gateway_collector")

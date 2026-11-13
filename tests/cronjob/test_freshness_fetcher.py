@@ -16,12 +16,10 @@ sys.path.insert(0, str(JOBS_PATH))
 import freshness_prober  # noqa: E402
 import sync_status_fetcher  # noqa: E402
 
-PAYER = "0x" + "9" * 40
 ENABLED = {
     "FRESHNESS_PROBE_ENABLED": "true",
     "FRESHNESS_GATEWAY_URL": "https://gateway.example.com/api",
     "FRESHNESS_GATEWAY_API_KEY": "fake-freshness-key-0000",
-    "FRESHNESS_GATEWAY_PAYERS": PAYER,
 }
 
 

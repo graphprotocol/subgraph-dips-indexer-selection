@@ -114,7 +114,7 @@ def _prober(
     )
 
 
-# Every code POST /freshness accepts, by outcome (CONTRACT.md).
+# Every code the prober may send, by outcome. POST /freshness accepts any code of this shape.
 CONTRACT_REASONS = {
     "pass": {None},
     "fail": {
@@ -124,7 +124,6 @@ CONTRACT_REASONS = {
         "indexer_error",
         "indexer_timeout",
         "indexer_unavailable",
-        "payment_refused",
     },
     "no_evidence": {None, "no_eligible_subgraph"},
     "void": {
@@ -134,7 +133,6 @@ CONTRACT_REASONS = {
         "pairing_unknown",
         "general_fault",
         "payment_refused",
-        "escrow_empty",
         "subgraph_broken",
         "not_sent",
     },
