@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.15.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.14.0...v2.15.0) (2026-11-16)
+
+
+### Added
+
+* **api:** report score constants and when freshness counts ([#464](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/464)) ([ba2f9ae](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/ba2f9ae75cce4f6fd5fe549d83dab780d5c00b32))
+
+
+### Changed
+
+* **deps:** bump the service-python group with 2 updates ([#462](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/462)) ([a39d120](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/a39d120f815a277924ac2b6cad589e72b6489975))
+* **k8s:** update cronjob image to sha-2542b50 ([#463](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/463)) ([e5895d1](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/e5895d10f9a64955e6862201a01f24d35f56472e))
+
 ## [2.14.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.13.0...v2.14.0) (2026-11-13)
 
 
