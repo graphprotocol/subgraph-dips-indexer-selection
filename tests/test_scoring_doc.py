@@ -150,3 +150,18 @@ def test_the_worked_example_adds_up():
     for column, label in labels.items():
         stated = [float(value) for value in rows[label]]
         assert factors[column].round(3).tolist() == stated, f"the page's {label} row is wrong"
+
+
+@pytest.mark.parametrize(
+    ("copy", "job"),
+    [
+        ("iisa.indexer_selection.BLEND_PRIOR_QUERIES", "chain_quality.PRIOR_QUERIES"),
+        ("iisa.indexer_selection.BLEND_FULL_WEIGHT_QUERIES", "chain_quality.FULL_WEIGHT_QUERIES"),
+    ],
+)
+def test_the_services_copies_of_the_jobs_blend_match_it(copy, job):
+    """The service reports the job's blend numbers without using them, so each copy must equal
+    the job's row, which the cronjob tests check against the job's code."""
+    values = dict(CONSTANTS)
+
+    assert _number(values[copy]) == _number(values[job]), f"{copy} and {job} differ on the page"
