@@ -38,8 +38,8 @@ OutcomeKind = Literal["pass", "fail", "no_evidence", "void"]
 WINDOW_MINUTES = 10
 MIN_COUNTED_MINUTES = 5
 # A pair with too few counted minutes in its window is judged on its last MIN_COUNTED_MINUTES
-# counted outcomes, and marked unless all fall within this many of its chain's answered minutes:
-# those in which some check there passed or failed, so an outage that answers nothing ages nobody.
+# counted outcomes: marked unless it has that many, all within this many of its chain's answered
+# minutes, those in which a check passed or failed, so an outage that answers nothing ages nobody.
 RECENT_ANSWERED_MINUTES = 60
 HISTORY_DAYS = 28
 MINUTES_PER_DAY = 1_440
