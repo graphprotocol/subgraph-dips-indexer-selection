@@ -612,12 +612,16 @@ class FreshnessPair(BaseModel):
 class FreshnessChain(BaseModel):
     """Freshness on 1 chain, by indexer. enforced says the chain isn't exempt, and enforcing
     that a check there also passed or failed recently enough, at last_answered_minute, for a
-    marked indexer to be left out of new agreements. last_counted_minute is the last minute a
-    check there counted, no evidence included. Each is null when no such check is on record.
+    marked indexer to be left out of new agreements. weighed says freshness counts in the
+    chain's scores, once enforcing and 7 days past first_minute, when its first record began.
+    last_counted_minute is the last minute a check counted there, no evidence included. Each
+    minute is null when no such check is on record.
     """
 
     enforced: bool = False
     enforcing: bool = False
+    first_minute: Optional[str] = None
+    weighed: bool = False
     last_counted_minute: Optional[str] = None
     last_answered_minute: Optional[str] = None
     indexers: dict[str, FreshnessPair] = {}

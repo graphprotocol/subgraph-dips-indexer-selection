@@ -618,6 +618,8 @@ class TestReportedEnforcement:
                 "amoy": {
                     "enforced": False,
                     "enforcing": False,
+                    "first_minute": None,
+                    "weighed": False,
                     "last_counted_minute": None,
                     "last_answered_minute": None,
                     "indexers": {},

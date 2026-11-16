@@ -356,9 +356,12 @@ def _chain_report(
     if enforcement is not None:
         enforced = enforcement.enforced(chain)
         enforcing = enforced and enforcement.current(last_answered)
+    pairs = state.chains.get(chain, {})
     return {
         "enforced": enforced,
         "enforcing": enforcing,
+        "first_minute": _optional_minute_text(_first_minute(pairs)),
+        "weighed": enforcing and _covers_scored_minutes(pairs, state.last_minute),
         "last_counted_minute": _optional_minute_text(state.last_counted.get(chain)),
         "last_answered_minute": _optional_minute_text(last_answered),
         "indexers": indexers,
@@ -377,18 +380,29 @@ def _pair_score(pair: PairState) -> float:
     return freshness_score(sum(day.passed for day in days), sum(day.counted for day in days))
 
 
+def _first_minute(pairs: Mapping[str, PairState]) -> Optional[int]:
+    """The minute the earliest of a chain's ``pairs`` was first seen, or None with none."""
+    return min((pair.first_minute for pair in pairs.values()), default=None)
+
+
+def _covers_scored_minutes(pairs: Mapping[str, PairState], last_minute: Optional[int]) -> bool:
+    """Whether a chain's ``pairs`` began at least MIN_SCORED_MINUTES before ``last_minute``, the
+    last minute applied, so its freshness scores count.
+    """
+    first = _first_minute(pairs)
+    return (
+        first is not None and last_minute is not None and last_minute - first >= MIN_SCORED_MINUTES
+    )
+
+
 def _scores_of(state: FreshnessState) -> dict[str, dict[str, float]]:
     """By chain, each indexer's freshness score there, for the chains whose earliest pair was
     first seen at least MIN_SCORED_MINUTES before the last minute applied.
     """
-    last_minute = state.last_minute
-    if last_minute is None:
-        return {}
     return {
         chain: {indexer: _pair_score(pair) for indexer, pair in pairs.items()}
         for chain, pairs in state.chains.items()
-        if pairs
-        and last_minute - min(pair.first_minute for pair in pairs.values()) >= MIN_SCORED_MINUTES
+        if _covers_scored_minutes(pairs, state.last_minute)
     }
 
 
