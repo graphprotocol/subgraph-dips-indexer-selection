@@ -37,12 +37,9 @@ OutcomeKind = Literal["pass", "fail", "no_evidence", "void"]
 
 WINDOW_MINUTES = 10
 MIN_COUNTED_MINUTES = 5
-# A pair whose window holds too few counted minutes is judged on its last MIN_COUNTED_MINUTES
-# counted outcomes instead, while the oldest is no more than this many of its chain's answered
-# minutes old, and is marked once it has too few that recent: with no evidence it is fresh, it
-# isn't picked. An answered minute on a chain is 1 in which some check there passed or failed,
-# so went through the gateway; an outage that voids every check, or leaves only the no_evidence
-# ones the prober works out alone, ages nobody.
+# A pair with too few counted minutes in its window is judged on its last MIN_COUNTED_MINUTES
+# counted outcomes, and marked unless all fall within this many of its chain's answered minutes:
+# those in which some check there passed or failed, so an outage that answers nothing ages nobody.
 RECENT_ANSWERED_MINUTES = 60
 HISTORY_DAYS = 28
 MINUTES_PER_DAY = 1_440
@@ -130,11 +127,10 @@ class PairState(BaseModel):
     @model_validator(mode="after")
     def _fill_in_for_an_older_file(self) -> Self:
         """A pair saved before last_counted and recent were kept gets them from the counted
-        minutes in its window, each taken as answered at 0, the count every chain starts from
-        when loaded from such a file. A pair saved unmarked with fewer than MIN_COUNTED_MINUTES
-        of them gets passes before them up to that many, so a pair that was fine then stays
-        fine until its own outcomes replace them or RECENT_ANSWERED_MINUTES answered minutes
-        go by. A pair saved marked starts from its own outcomes only.
+        minutes in its window, each taken as answered at 0, the count such a file's chains start
+        at. Saved unmarked with fewer than MIN_COUNTED_MINUTES of them, it gets passes before them
+        up to that many, so it stays fine until its own outcomes replace them or
+        RECENT_ANSWERED_MINUTES answered minutes go by. Saved marked, it starts from its own only.
         """
         counted = sorted((m, outcome) for m, outcome in self.minutes.items() if outcome != "void")
         if "recent" not in self.model_fields_set:
