@@ -52,6 +52,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import score_columns as cols
 from .freshness import (
     HISTORY_DAYS,
+    MIN_SCORED_MINUTES,
     MINUTES_PER_DAY,
     Check,
     Enforcement,
@@ -60,7 +61,15 @@ from .freshness import (
     minute_index,
     minute_text,
 )
-from .indexer_selection import EthAddressStr, IndexerSelector, IpfsHashStr
+from .indexer_selection import (
+    BLEND_FULL_WEIGHT_QUERIES,
+    BLEND_PRIOR_QUERIES,
+    QUALITY_WEIGHTS,
+    VALUE_WEIGHTS,
+    EthAddressStr,
+    IndexerSelector,
+    IpfsHashStr,
+)
 from .log_limit import LogLimit
 from .score_loader import (
     STALE_SCORES_CRITICAL_HOURS,
@@ -68,6 +77,7 @@ from .score_loader import (
     FileScoreLoader,
     ScoresPayloadError,
 )
+from .share_score import SHARE_EXPONENT
 from .sync_check import MAX_CHECKS_PER_SELECTION, SyncClaimChecker
 from .sync_status_loader import SyncStatusData
 
@@ -407,6 +417,36 @@ class WeightedScoreEntry(BaseModel):
     chains: dict[str, ChainScore] = {}
 
 
+class ScoreFormula(BaseModel):
+    """The constants the scores are worked out with, so a reader can show the working. Uptime,
+    success rate and freshness are shares raised to share_exponent; quality and value weigh the
+    components named in their weights. The job blends each chain's uptime and success rate with
+    the indexer's over all its chains, the chain's own counting n / (n + blend_prior_queries)
+    with n queries there, and in full from blend_full_weight_queries. A freshness share is taken
+    over at least freshness_min_checks, and a chain is weighed once its checks span that many.
+    """
+
+    share_exponent: int
+    quality_weights: dict[str, float]
+    value_weights: dict[str, float]
+    blend_prior_queries: int
+    blend_full_weight_queries: int
+    freshness_min_checks: int
+
+
+def _score_formula() -> ScoreFormula:
+    """The constants behind the scores, each weight keyed by the component it weighs."""
+    component = {norm.removeprefix("norm_"): name for norm, name in _BREAKDOWN_COMPONENTS}
+    return ScoreFormula(
+        share_exponent=SHARE_EXPONENT,
+        quality_weights={component[metric]: w for metric, w in QUALITY_WEIGHTS.items()},
+        value_weights={component[metric]: w for metric, w in VALUE_WEIGHTS.items()},
+        blend_prior_queries=BLEND_PRIOR_QUERIES,
+        blend_full_weight_queries=BLEND_FULL_WEIGHT_QUERIES,
+        freshness_min_checks=MIN_SCORED_MINUTES,
+    )
+
+
 class WeightedScoresResponse(BaseModel):
     """Response for GET /scores/weighted: bulk total-scores snapshot.
 
@@ -418,6 +458,7 @@ class WeightedScoresResponse(BaseModel):
     computed_at: Optional[str] = None
     count: int = 0
     scores: list[WeightedScoreEntry] = []
+    formula: ScoreFormula = Field(default_factory=_score_formula)
 
 
 class DipsIndexersResponse(BaseModel):

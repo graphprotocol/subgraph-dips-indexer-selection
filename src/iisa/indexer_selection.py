@@ -74,6 +74,11 @@ VALUE_WEIGHTS: Mapping[str, float] = MappingProxyType(
     }
 )
 
+# The score job's chain blend, chain_quality.PRIOR_QUERIES and FULL_WEIGHT_QUERIES, which the
+# service only reports; docs/scoring.md's constants table ties these copies to the job's.
+BLEND_PRIOR_QUERIES = 250
+BLEND_FULL_WEIGHT_QUERIES = 10_000
+
 # The 4 factors whose product is the total, in the order they are reported.
 SCORE_FACTORS = ("uptime", "freshness", "quality", "value")
 
