@@ -21,6 +21,7 @@ from iisa.freshness import (
     PairState,
     freshness_score,
     minute_index,
+    minute_text,
 )
 from iisa.iisa_http_endpoints import IISAState, SelectionRequest, Settings, _select_with_processor
 from iisa.indexer_selection import IndexerSelector, _calculate_scores
@@ -336,3 +337,38 @@ class TestReportedScores:
         )
 
         assert body["chains"][CHAIN]["components"]["freshness"] == pytest.approx(0.9**6)
+
+
+class TestReportSaysWhetherFreshnessIsWeighed:
+    """GET /freshness says, for each chain, when its checks began and whether freshness counts
+    in its scores, so a reader showing a score can say why freshness is 1 there."""
+
+    @pytest.mark.parametrize(
+        ("days_of_checks", "age", "exempt", "weighed"),
+        [(7, 0, False, True), (6, 0, False, False), (7, 61, False, False), (7, 0, True, False)],
+        ids=["weighed", "under-7-days", "checks-stopped", "exempt"],
+    )
+    def test_weighed_matches_the_scores(
+        self, service, monkeypatch, days_of_checks, age, exempt, weighed
+    ):
+        if exempt:
+            monkeypatch.setenv("IISA_FRESHNESS_EXEMPT_CHAINS", CHAIN)
+            iisa_http_endpoints.get_settings.cache_clear()
+        service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)}, days_of_checks)
+        monkeypatch.setattr(iisa_http_endpoints, "_current_minute", lambda: LAST + age)
+        client = TestClient(iisa_http_endpoints.app)
+
+        report = client.get("/freshness").json()["chains"][CHAIN]
+        entries = client.get("/scores/weighted").json()["scores"]
+        twin = next(entry for entry in entries if entry["indexer"] == TWIN)
+
+        assert report["weighed"] is weighed
+        assert ("freshness" in twin["chains"][CHAIN]["components"]) is weighed
+
+    def test_first_minute_is_when_the_chains_earliest_record_began(self, service):
+        service.freshness = _store({(TWIN, CHAIN): (18_000, 20_000)}, days_of_checks=6)
+        service.freshness.apply(LAST + 1, [Check(NEWCOMER, CHAIN, "pass")], lambda _: None)
+
+        report = TestClient(iisa_http_endpoints.app).get("/freshness").json()["chains"][CHAIN]
+
+        assert report["first_minute"] == minute_text(LAST - 6 * DAY)

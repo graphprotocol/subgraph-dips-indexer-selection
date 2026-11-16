@@ -122,6 +122,8 @@ Both have $S = 0.98^{6} = 0.886$ and $L = 0.872$, so $Q = 0.2 \times 0.886 + 0.8
 | Fewest checks a freshness share is taken over | `iisa.freshness.MIN_SCORED_MINUTES` | 10,080 |
 | Queries on a chain at which its own uptime and success rate count in full | `chain_quality.FULL_WEIGHT_QUERIES` | 10,000 |
 | Queries in the blend weight n / (n + 250) | `chain_quality.PRIOR_QUERIES` | 250 |
+| Queries at which a chain counts in full, as `GET /scores/weighted` reports it | `iisa.indexer_selection.BLEND_FULL_WEIGHT_QUERIES` | 10,000 |
+| Queries in the blend weight, as `GET /scores/weighted` reports it | `iisa.indexer_selection.BLEND_PRIOR_QUERIES` | 250 |
 | Standard errors added to a latency gap | `processing.LATENCY_COEFFICIENT_STANDARD_ERROR_MULTIPLIER` | 1.5 |
 | Latency curve's midpoint, in ms | `iisa.indexer_selection.LATENCY_MIDPOINT_MS` | 250 |
 | Latency curve's width, in ms | `iisa.indexer_selection.LATENCY_WIDTH_MS` | 80 |

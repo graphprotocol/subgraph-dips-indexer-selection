@@ -37,12 +37,9 @@ OutcomeKind = Literal["pass", "fail", "no_evidence", "void"]
 
 WINDOW_MINUTES = 10
 MIN_COUNTED_MINUTES = 5
-# A pair whose window holds too few counted minutes is judged on its last MIN_COUNTED_MINUTES
-# counted outcomes instead, while the oldest is no more than this many of its chain's answered
-# minutes old, and is marked once it has too few that recent: with no evidence it is fresh, it
-# isn't picked. An answered minute on a chain is 1 in which some check there passed or failed,
-# so went through the gateway; an outage that voids every check, or leaves only the no_evidence
-# ones the prober works out alone, ages nobody.
+# A pair with too few counted minutes in its window is judged on its last MIN_COUNTED_MINUTES
+# counted outcomes: marked unless it has that many, all within this many of its chain's answered
+# minutes, those in which a check passed or failed, so an outage that answers nothing ages nobody.
 RECENT_ANSWERED_MINUTES = 60
 HISTORY_DAYS = 28
 MINUTES_PER_DAY = 1_440
@@ -130,11 +127,10 @@ class PairState(BaseModel):
     @model_validator(mode="after")
     def _fill_in_for_an_older_file(self) -> Self:
         """A pair saved before last_counted and recent were kept gets them from the counted
-        minutes in its window, each taken as answered at 0, the count every chain starts from
-        when loaded from such a file. A pair saved unmarked with fewer than MIN_COUNTED_MINUTES
-        of them gets passes before them up to that many, so a pair that was fine then stays
-        fine until its own outcomes replace them or RECENT_ANSWERED_MINUTES answered minutes
-        go by. A pair saved marked starts from its own outcomes only.
+        minutes in its window, each taken as answered at 0, the count such a file's chains start
+        at. Saved unmarked with fewer than MIN_COUNTED_MINUTES of them, it gets passes before them
+        up to that many, so it stays fine until its own outcomes replace them or
+        RECENT_ANSWERED_MINUTES answered minutes go by. Saved marked, it starts from its own only.
         """
         counted = sorted((m, outcome) for m, outcome in self.minutes.items() if outcome != "void")
         if "recent" not in self.model_fields_set:
@@ -360,9 +356,12 @@ def _chain_report(
     if enforcement is not None:
         enforced = enforcement.enforced(chain)
         enforcing = enforced and enforcement.current(last_answered)
+    pairs = state.chains.get(chain, {})
     return {
         "enforced": enforced,
         "enforcing": enforcing,
+        "first_minute": _optional_minute_text(_first_minute(pairs)),
+        "weighed": enforcing and _covers_scored_minutes(pairs, state.last_minute),
         "last_counted_minute": _optional_minute_text(state.last_counted.get(chain)),
         "last_answered_minute": _optional_minute_text(last_answered),
         "indexers": indexers,
@@ -381,18 +380,29 @@ def _pair_score(pair: PairState) -> float:
     return freshness_score(sum(day.passed for day in days), sum(day.counted for day in days))
 
 
+def _first_minute(pairs: Mapping[str, PairState]) -> Optional[int]:
+    """The minute the earliest of a chain's ``pairs`` was first seen, or None with none."""
+    return min((pair.first_minute for pair in pairs.values()), default=None)
+
+
+def _covers_scored_minutes(pairs: Mapping[str, PairState], last_minute: Optional[int]) -> bool:
+    """Whether a chain's ``pairs`` began at least MIN_SCORED_MINUTES before ``last_minute``, the
+    last minute applied, so its freshness scores count.
+    """
+    first = _first_minute(pairs)
+    return (
+        first is not None and last_minute is not None and last_minute - first >= MIN_SCORED_MINUTES
+    )
+
+
 def _scores_of(state: FreshnessState) -> dict[str, dict[str, float]]:
     """By chain, each indexer's freshness score there, for the chains whose earliest pair was
     first seen at least MIN_SCORED_MINUTES before the last minute applied.
     """
-    last_minute = state.last_minute
-    if last_minute is None:
-        return {}
     return {
         chain: {indexer: _pair_score(pair) for indexer, pair in pairs.items()}
         for chain, pairs in state.chains.items()
-        if pairs
-        and last_minute - min(pair.first_minute for pair in pairs.values()) >= MIN_SCORED_MINUTES
+        if _covers_scored_minutes(pairs, state.last_minute)
     }
 
 

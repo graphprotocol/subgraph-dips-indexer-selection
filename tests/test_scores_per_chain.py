@@ -221,3 +221,30 @@ def test_an_indexer_not_loaded_is_not_found(client):
     body = client.post("/get-score", json={"indexer_id": "0xnobody"}).json()
 
     assert body == {"indexer_id": "0xnobody", "found": False, "chains": None}
+
+
+def test_scores_weighted_reports_the_constants_the_scores_are_worked_out_with(client):
+    """A reader showing a score's working needs the weights and exponents it was built with,
+    keyed by the names the chains' components use, so the page can't drift from the code."""
+    formula = client.get("/scores/weighted").json()["formula"]
+
+    assert formula == {
+        "share_exponent": 6,
+        "quality_weights": {"success_rate": 0.2, "latency": 0.8},
+        "value_weights": {"stake_to_fees": 0.45, "base_price": 0.45, "price_per_entity": 0.1},
+        "blend_prior_queries": 250,
+        "blend_full_weight_queries": 10_000,
+        "freshness_min_checks": 10_080,
+    }
+    components = _weighted(client)[ABC]["chains"]["arbitrum-one"]["components"]
+    assert {*formula["quality_weights"], *formula["value_weights"]} <= set(components)
+
+
+def test_the_constants_come_with_scores_not_yet_loaded():
+    iisa_http_endpoints.get_settings.cache_clear()
+    iisa_http_endpoints._state.initialize(Settings())
+    iisa_http_endpoints._state.data_manager = None
+
+    body = TestClient(app).get("/scores/weighted").json()
+
+    assert (body["count"], body["formula"]["share_exponent"]) == (0, 6)
