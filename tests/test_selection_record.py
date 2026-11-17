@@ -25,7 +25,9 @@ from iisa.freshness import Check, minute_index
 from iisa.iisa_http_endpoints import IISAState, Settings, app
 from iisa.indexer_selection import IndexerSelector
 from iisa.selection_record import (
+    LINE_LEAD_BYTES,
     LOG_PREFIX,
+    MAX_LINE_BYTES,
     MAX_RECORD_BYTES,
     MAX_RECORDS_PER_DEPLOYMENT,
     MAX_STORE_BYTES,
@@ -666,7 +668,9 @@ class TestTheReplyIsUntouched:
         (error,) = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert DEPLOYMENT in error.getMessage() and error.exc_info is not None
 
-    def test_a_selection_that_gets_no_answer_leaves_no_record(self, load, logged, monkeypatch):
+    def test_a_request_refused_or_failed_inside_the_service_leaves_no_record(
+        self, load, logged, monkeypatch
+    ):
         load(*RANKED)
 
         def broken(*_args: Any) -> None:
@@ -734,6 +738,34 @@ def test_a_record_still_over_the_limit_without_its_long_lists_keeps_only_its_hea
     assert kept["selection_id"] == whole["selection_id"]
     assert kept["request"]["num_candidates"] == 2 and kept["outcome"] == "selected"
     assert len(json.dumps(kept)) < 2_000
+
+
+def _log_line(message: str) -> bytes:
+    """The line the service's log format writes for 1 of its INFO messages, newline and all."""
+    logged = logging.LogRecord("iisa-service", logging.INFO, __file__, 0, message, None, None)
+    return (logging.Formatter(endpoints._LOG_FORMAT).format(logged) + "\n").encode()
+
+
+def test_the_size_limit_counts_the_whole_log_line(load, select):
+    """Whatever collects the log sees the whole line: the time, the logger's name and the
+    level, then LOG_PREFIX, then the JSON. Records are sized 1 byte apart across the limit.
+    """
+    load(*RANKED)
+    whole = select(num_candidates=2)
+
+    def sized(size: int) -> SelectionRecord:
+        request = {**whole["request"], "blocklist": ["x" * size]}
+        return SelectionRecord.model_validate({**whole, "request": request})
+
+    unpadded = len(sized(0).model_dump_json().encode())
+    kept_whole = set()
+    for size in range(MAX_LINE_BYTES - 300, MAX_LINE_BYTES + 2):
+        kept = record_json(sized(size - unpadded))
+        assert len(_log_line(LOG_PREFIX + kept.decode())) <= MAX_LINE_BYTES
+        kept_whole.add(json.loads(kept)["truncated"] is False)
+
+    assert kept_whole == {True, False}
+    assert len(_log_line(LOG_PREFIX)) <= LINE_LEAD_BYTES
 
 
 def test_a_record_is_held_at_the_size_the_limit_measured_it_at(load):

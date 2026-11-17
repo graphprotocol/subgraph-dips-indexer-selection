@@ -2,10 +2,11 @@
 
 A selection's reply carries only the picked indexers and their prices. Its record holds the
 reasoning: the request, every candidate with the score it was judged on, who was left out and
-why, each change made to the group, and the final group. Each record is logged as 1 JSON line,
-the durable copy, and the most recent are kept here for GET /selections. They are kept in this
-process's memory only, so they are lost when the service restarts, and they are only complete
-while 1 process answers both the selections and the reads, as the service runs today.
+why, each change made to the group, and the final group. Each record is logged as 1 JSON line
+and the most recent are kept here for GET /selections. They are kept in this process's memory
+only, so a restart loses them and leaves the log line, which lasts as long as the cluster keeps
+the service's logs. They are also only complete while 1 process answers both the selections
+and the reads, as the service runs today.
 """
 
 import logging
@@ -16,7 +17,9 @@ from typing import Literal, Optional, get_args
 from pydantic import BaseModel, Field
 
 __all__ = [
+    "LINE_LEAD_BYTES",
     "LOG_PREFIX",
+    "MAX_LINE_BYTES",
     "MAX_RECORDS_PER_DEPLOYMENT",
     "MAX_RECORD_BYTES",
     "MAX_STORE_BYTES",
@@ -42,12 +45,17 @@ MAX_STORE_BYTES = 128 * 1024 * 1024
 # up to about 1 KB on holding a record, most of it a deployment ID of 128 characters at 4
 # bytes each, so with twice that counted the memory held stays within the limit.
 RECORD_OVERHEAD_BYTES = 2 * 1024
-# The largest a record may be as JSON, room for a few hundred candidates at about 600 bytes
+# The longest a record's log line may be, room for a few hundred candidates at about 600 bytes
 # each. /select-indexers takes no token and a request can name thousands of indexers, so
 # without this 1 request could write megabytes to the log and push out hundreds of records.
-MAX_RECORD_BYTES = 256 * 1024
+MAX_LINE_BYTES = 256 * 1024
 # What each record's log line starts with, so the lines can be found and the JSON cut out.
 LOG_PREFIX = "selection_record "
+# Room kept on the line for all but the JSON: the time, logger name and level that the
+# service's log format writes first, 48 bytes, then LOG_PREFIX and the newline at the end.
+LINE_LEAD_BYTES = 128
+# The largest a record may be as JSON, so that its whole log line is within MAX_LINE_BYTES.
+MAX_RECORD_BYTES = MAX_LINE_BYTES - LINE_LEAD_BYTES
 
 # The price checks, in the order they run. RecordedFilteredOut.reason says what each means.
 PriceCheck = Literal[
@@ -292,8 +300,8 @@ class SelectionRecord(BaseModel):
 
 def record_json(record: SelectionRecord) -> bytes:
     """The record as 1 line of JSON in UTF-8, the bytes its size is counted in. One over
-    MAX_RECORD_BYTES is cut down, with a warning: to who was picked and how or, if that is
-    still over the limit, to its header.
+    MAX_RECORD_BYTES, whose log line would be over MAX_LINE_BYTES, is cut down, with a
+    warning: to who was picked and how or, if that is still over the limit, to its header.
     """
     kept = record.model_dump_json().encode()
     size = len(kept)

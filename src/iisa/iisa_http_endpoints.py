@@ -723,11 +723,10 @@ def _documented_errors(*codes: int) -> dict[int | str, dict[str, Any]]:
 # Service State
 # =============================================================================
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# Configure logging. What the format writes before a message counts towards the limit on a
+# selection record's log line, and selection_record.LINE_LEAD_BYTES is the room kept for it.
+_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
 logger = logging.getLogger("iisa-service")
 
 
@@ -1803,8 +1802,8 @@ def selection_records(
     """The most recent selections for ``deployment`` (a 422 if omitted), newest first, each
     with every candidate's score and its parts, sync status, pool, whether it was picked and
     why not, each change to the group, and the final group. Kept in memory only, at most 20
-    for a deployment and 128 MB in all, the oldest dropped first, so a restart loses them all;
-    each is also logged as 1 JSON line starting ``selection_record``, the copy that lasts.
+    for a deployment and 128 MB in all, oldest dropped first, so a restart loses them all. Each
+    is also logged as 1 JSON line starting ``selection_record``, kept as long as the logs are.
     """
     _require_read_token(authorization)
     kept = _state.selection_records.for_deployment(deployment)
