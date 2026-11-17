@@ -130,6 +130,18 @@ Marks only stay trustworthy while checks keep going through the gateway, so a ch
 
 Freshness is also 1 of the factors, on the request's chain. An indexer's score there is its share of checks passed over the last 28 days, taken over at least 10,080 checks (7 days of minutes) so a newcomer can't score 1 on a good hour, then raised to the 6th power, so 90% scores about 0.53 and 80% about 0.26. An indexer with no record on the chain scores 0. On a chain whose earliest freshness record is less than 7 days old, or that has none, such as every chain while the prober is off, freshness is left out and counts as 1, rather than every indexer scoring 0. The same goes for a chain where no check has passed or failed within `IISA_FRESHNESS_MAX_AGE_MINUTES` by the service's clock, the rule that also stops its marks deciding selection, since the scores go stale with the checks: once the prober stops, or nothing goes through the gateway, freshness drops out there until a check passes or fails again. An exempt chain ignores freshness altogether, the factor as well as the mark, since a chain is exempted when its checks can't be trusted or passed.
 
+### The record of each selection
+
+A selection's reply names only the picked indexers and their prices. To show why those indexers were picked, the service writes 1 record for every selection it answers. The record holds the request, and every candidate with the total it was ranked on, the 4 factors and the parts behind them, its operator and location, whether it says it has synced the deployment and what selection made of that claim, the pool it stood in, whether it was picked and, if it wasn't, why. It also lists the indexers the price checks left out before scoring with the check each one failed, each change made to the group in the order it happened, and the final group with whether it is spread over 2 operators and 2 locations. Every number is read from the table selection ranked the candidates on, not worked out again afterwards, and a picked indexer's numbers are the ones it was picked on, so the record can't disagree with the pick. Writing it changes nothing in the reply.
+
+Each record is logged as 1 JSON line starting `selection_record`, and that log line is the copy that lasts. The most recent records are also kept in memory and served by `GET /selections?deployment=<deployment ID>`, newest first, behind the same token check as the other routes that only read: at most 20 for a deployment and 500 in all, the oldest dropped first. They are lost when the service restarts. They are also only complete while 1 process answers both the selections and the reads, which is how the service runs, as 1 replica with 1 worker; with more, each process would hold only the selections it answered itself. A record over 256 KB, which takes several hundred candidates or a request naming thousands of indexers, is logged and kept without its lists, with a warning. A selection that gets no answer, because the request was refused or the selection failed, leaves no record. The service's `/openapi.json` describes every field of a record and the values each can take.
+
+To read the records out of the service's log:
+
+```bash
+kubectl logs deployment/iisa | grep -F 'selection_record {' | sed 's/^[^{]*//' | jq .
+```
+
 ## Repository layout
 
 | Path | What lives there |
