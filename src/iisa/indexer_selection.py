@@ -9,7 +9,7 @@ import logging
 import time
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any, Callable, NewType, Optional, Union, cast
+from typing import Any, Callable, NamedTuple, NewType, Optional, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -20,6 +20,8 @@ from .share_score import shaped_share
 
 __all__ = [
     "IndexerSelector",
+    "Pick",
+    "Step",
     "read_metric",
     "DeploymentId",
     "IndexerId",
@@ -83,6 +85,38 @@ BLEND_FULL_WEIGHT_QUERIES = 10_000
 SCORE_FACTORS = ("uptime", "freshness", "quality", "value")
 
 
+class Pick(NamedTuple):
+    """How 1 search for an indexer to add or swap in ended, noted as it happened so the record
+    of a selection holds what the search saw, not a later reading of it.
+
+    ``pool`` is the pool the indexer stood in and ``row`` its scored row at that moment, which
+    a later scoring of everyone leaves as it was. ``kept_spread`` is False when no candidate
+    kept the group spread, so the best total was taken regardless. ``passed_over`` lists the
+    candidates ranked ahead that were skipped because they would not have kept it spread, and
+    ``pools`` pairs every candidate in the search with its pool.
+    """
+
+    indexer: IndexerId
+    pool: str
+    row: pd.Series
+    kept_spread: bool
+    passed_over: list[IndexerId]
+    pools: list[tuple[IndexerId, str]]
+
+
+class Step(NamedTuple):
+    """1 change a selection made to the group, noted as it happened: ``indexer`` was "added",
+    "removed", or swapped in for the member ``replaced``. ``pick`` is the search that found an
+    indexer added or swapped in, and ``score`` the total a removal was decided on.
+    """
+
+    action: str
+    indexer: IndexerId
+    replaced: Optional[IndexerId] = None
+    pick: Optional[Pick] = None
+    score: Optional[float] = None
+
+
 class IndexerSelector:
     """Score and pick the best indexers for one subgraph deployment, honouring the denylist and
     decentralisation floor. Built for a single add-or-replace, then discarded: whether it adds
@@ -129,6 +163,11 @@ class IndexerSelector:
         # Every candidate that could, at some pick, have been chosen ahead of the rest because
         # it says it has synced.
         self._preferred_on_a_claim: set[IndexerId] = set()
+        # Each change to the group in order, the search that ended last, and the search behind
+        # each swap still being weighed, all for the selection's record.
+        self.steps: list[Step] = []
+        self._last_pick: Optional[Pick] = None
+        self._swap_picks: dict[IndexerId, Optional[Pick]] = {}
 
         self._process_data()
 
@@ -339,6 +378,7 @@ class IndexerSelector:
             # Add the best indexer to the group
             if next_indexer:
                 self.current_group.append(next_indexer)
+                self.steps.append(Step("added", next_indexer, pick=self._pick_of(next_indexer)))
                 logger.info(
                     "deployment=%s added indexer %s to group (%d/%d)",
                     self.deployment_id,
@@ -451,6 +491,7 @@ class IndexerSelector:
 
                 if self._meets_decentralization_requirements_indexer_removal(temp_group):
                     self.current_group.remove(indexer)
+                    self.steps.append(Step("removed", indexer, score=score))
                     logger.info(
                         "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)",
                         self.deployment_id,
@@ -499,6 +540,9 @@ class IndexerSelector:
                 self.current_group.remove(old_indexer)
                 self.current_group.append(new_indexer)
                 added_this_call.add(new_indexer)
+                pick = self._swap_picks.get(old_indexer)
+                found = pick if pick is not None and pick.indexer == new_indexer else None
+                self.steps.append(Step("replaced", new_indexer, old_indexer, found))
                 logger.info(
                     "deployment=%s replaced indexer %s with %s (improvement=%.4f)",
                     self.deployment_id,
@@ -585,21 +629,64 @@ class IndexerSelector:
             # Only replace if candidate is significantly better
             margin = REPLACEMENT_MARGIN * best
             if candidate_score is not None and candidate_score > current_score + margin:
+                self._swap_picks[existing_indexer] = self._last_pick
                 return existing_indexer, candidate, candidate_score - current_score
         return None
 
-    def _unpickable_indexers(self, for_a_fill_in: bool = False) -> set[IndexerId]:
-        """Indexers this request can't pick: already in the group, on the denylist, with a
-        pending (unaccepted) agreement on any subgraph, that declined this subgraph, or marked
-        stale, unless the pick is to fill a place no other candidate can.
+    def _unpickable_lists(self, for_a_fill_in: bool = False) -> dict[str, list[IndexerId]]:
+        """The indexers this request can't pick, listed under why: already in the group, on the
+        denylist, with a pending (unaccepted) agreement on any subgraph, that declined this
+        subgraph, or marked stale, unless the pick is to fill a place no other candidate can.
         """
-        return set(
-            self.current_group
-            + self.indexer_denylist
-            + [indexer for pending in self.pending_agreements.values() for indexer in pending]
-            + self.declined_indexers.get(self.deployment_id, [])
-            + ([] if for_a_fill_in else self.stale_indexers)
-        )
+        return {
+            "in_group": self.current_group,
+            "blocklisted": self.indexer_denylist,
+            "pending_agreement": [
+                indexer for pending in self.pending_agreements.values() for indexer in pending
+            ],
+            "declined": self.declined_indexers.get(self.deployment_id, []),
+            "stale": [] if for_a_fill_in else self.stale_indexers,
+        }
+
+    def _unpickable_indexers(self, for_a_fill_in: bool = False) -> set[IndexerId]:
+        """Indexers this request can't pick (see _unpickable_lists for why each is one)."""
+        lists = self._unpickable_lists(for_a_fill_in)
+        return {indexer for listed in lists.values() for indexer in listed}
+
+    def left_out_reasons(self) -> dict[str, list[str]]:
+        """Why each indexer outside the group could not be picked as the selection ended, as
+        every reason that applies: "blocklisted", "pending_agreement", "declined" and "stale".
+        A stale indexer is left out of this once the stale candidates could fill places. Read
+        from the lists _unpickable_indexers is built from, so the 2 can't disagree.
+        """
+        lists = self._unpickable_lists(for_a_fill_in=self._filling_with_stale)
+        group = set(lists.pop("in_group"))
+        reasons: dict[str, list[str]] = {}
+        for reason, listed in lists.items():
+            for indexer in dict.fromkeys(listed):
+                if indexer not in group:
+                    reasons.setdefault(indexer, []).append(reason)
+        return reasons
+
+    @property
+    def filled_with_stale(self) -> bool:
+        """Whether no fresh candidate was left, so the stale ones could fill places."""
+        return self._filling_with_stale
+
+    def group_is_spread(self) -> Optional[bool]:
+        """Whether the group as it stands holds at least 2 operators and 2 locations, counted as
+        every pick's check counts them. None for a group of fewer than 2, which has no such
+        floor to meet.
+        """
+        if len(self.current_group) < 2:
+            return None
+        locations, orgs = self._count_locations_and_orgs(self.current_group)
+        return locations >= 2 and orgs >= 2
+
+    def _pick_of(self, indexer: IndexerId) -> Optional[Pick]:
+        """The search that ended last, if it is the one that found ``indexer``."""
+        pick = self._last_pick
+        return pick if pick is not None and pick.indexer == indexer else None
 
     def preferred_on_a_claim(self) -> list[IndexerId]:
         """Every candidate that this selection could have picked ahead of the rest because it
@@ -645,6 +732,7 @@ class IndexerSelector:
         None if none qualify. Unpickable indexers are skipped (see _unpickable_indexers).
         prefer_synced, when False, ranks candidates on score alone, as if none were synced.
         """
+        self._last_pick = None
         # A stale candidate can fill an empty place once no other is left, but never replace.
         fill_in = self._filling_with_stale and replacing_indexer is None
         unpickable_indexers = self._unpickable_indexers(for_a_fill_in=fill_in)
@@ -677,6 +765,8 @@ class IndexerSelector:
             if prefer_synced
             else [("all", candidates)]
         )
+        pool_of = [(indexer, name) for name, pool_df in pools for indexer in pool_df["indexer"]]
+        passed_over: list[IndexerId] = []
         for pool_name, pool_df in pools:
             for indexer in pool_df["indexer"]:
                 if self._meets_decentralization_requirements(
@@ -690,13 +780,18 @@ class IndexerSelector:
                         indexer[:10],
                         score,
                     )
+                    row = pool_df[pool_df["indexer"] == indexer].iloc[0]
+                    self._last_pick = Pick(indexer, pool_name, row, True, passed_over, pool_of)
                     return cast(EthAddressStr, indexer)
+                passed_over.append(indexer)
 
         # Fallback: best scorer regardless of decentralisation or
         # sync status. Decentralisation is best-effort.
         if not candidates.empty:
             fallback = candidates["indexer"].iloc[0]
             fallback_score = candidates["weighted_score"].iloc[0]
+            pool = next((name for indexer, name in pool_of if indexer == fallback), "all")
+            self._last_pick = Pick(fallback, pool, candidates.iloc[0], False, [], pool_of)
             logger.debug(
                 "deployment=%s no candidate meets decentralization, "
                 "falling back to best scorer %s (score=%.4f)",
