@@ -1946,15 +1946,26 @@ def _keep_within_entity_budget(
     return df, ""
 
 
+def _dropped_by(check: str, before: pd.DataFrame, after: pd.DataFrame) -> dict[str, str]:
+    """Each indexer with a row in ``before`` and none in ``after``, paired with ``check``."""
+    kept = {indexer for indexer in after["indexer"] if isinstance(indexer, str)}
+    return {
+        indexer: check
+        for indexer in before["indexer"]
+        if isinstance(indexer, str) and indexer not in kept
+    }
+
+
 def _filter_by_price(
     history: pd.DataFrame,
     chain_id: str,
     max_grt_per_30_days: Optional[float],
     max_grt_per_billion_entities_per_30_days: Optional[float] = None,
+    left_out: Optional[dict[str, str]] = None,
 ) -> tuple[pd.DataFrame, str]:
     """Drop indexers that lack DIP info, don't support the chain, lack a chain price, exceed
     max_grt_per_30_days for the chain, set an invalid per-entity price, or exceed the
-    per-entity ceiling.
+    per-entity ceiling, noting each in ``left_out``, when given, with the check that dropped it.
 
     Returns (filtered_df, reason). ``reason`` says why if no candidates are left, else is empty.
     """
@@ -1964,19 +1975,30 @@ def _filter_by_price(
     if "dips_info_available" not in df.columns:
         return df, ""
 
-    steps: tuple[Callable[[pd.DataFrame], tuple[pd.DataFrame, str]], ...] = (
-        _keep_with_dips_info,
-        partial(_keep_supporting_chain, chain_id=chain_id),
-        partial(_keep_with_chain_price, chain_id=chain_id),
-        partial(_keep_within_budget, chain_id=chain_id, max_grt_per_30_days=max_grt_per_30_days),
-        _keep_with_valid_entity_price,
-        partial(
-            _keep_within_entity_budget,
-            max_grt_per_billion_entities_per_30_days=max_grt_per_billion_entities_per_30_days,
+    steps: tuple[tuple[str, Callable[[pd.DataFrame], tuple[pd.DataFrame, str]]], ...] = (
+        ("no_dips_info", _keep_with_dips_info),
+        ("chain_not_supported", partial(_keep_supporting_chain, chain_id=chain_id)),
+        ("no_price_for_chain", partial(_keep_with_chain_price, chain_id=chain_id)),
+        (
+            "over_budget",
+            partial(
+                _keep_within_budget, chain_id=chain_id, max_grt_per_30_days=max_grt_per_30_days
+            ),
+        ),
+        ("invalid_entity_price", _keep_with_valid_entity_price),
+        (
+            "over_entity_budget",
+            partial(
+                _keep_within_entity_budget,
+                max_grt_per_billion_entities_per_30_days=max_grt_per_billion_entities_per_30_days,
+            ),
         ),
     )
-    for step in steps:
-        df, reason = step(df)
+    for check, step in steps:
+        kept, reason = step(df)
+        if left_out is not None:
+            left_out.update(_dropped_by(check, df, kept))
+        df = kept
         if df.empty:
             return df, reason
     return df, ""
@@ -2180,9 +2202,10 @@ def _build_selected_indexers(
 
 
 def _price_filtered_candidates(
-    history: pd.DataFrame, request: SelectionRequest
+    history: pd.DataFrame, request: SelectionRequest, left_out: Optional[dict[str, str]] = None
 ) -> Optional[pd.DataFrame]:
-    """Apply the request's price constraints to ``history`` before scoring.
+    """Apply the request's price constraints to ``history`` before scoring, filling
+    ``left_out``, when given, with each indexer dropped and the check that dropped it.
 
     Returns None, after logging why, when no candidate survives the filter.
     """
@@ -2191,6 +2214,7 @@ def _price_filtered_candidates(
         request.chain_id,
         request.max_grt_per_30_days,
         request.max_grt_per_billion_entities_per_30_days,
+        left_out,
     )
 
     if filtered_history.empty:
