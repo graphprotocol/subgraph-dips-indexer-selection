@@ -1,17 +1,23 @@
-"""The record of 1 selection.
+"""The record of 1 selection, and the most recent records kept in memory.
 
 A selection's reply carries only the picked indexers and their prices. Its record holds the
 reasoning: the request, every candidate with the score it was judged on, who was left out and
-why, each change made to the group, and the final group. Each record is logged as 1 JSON line.
+why, each change made to the group, and the final group. Each record is logged as 1 JSON line,
+the durable copy, and the most recent are kept here for GET /selections. They are kept in this
+process's memory only, so they are lost when the service restarts, and they are only complete
+while 1 process answers both the selections and the reads, as the service runs today.
 """
 
 import logging
+import threading
 from typing import Literal, Optional, get_args
 
 from pydantic import BaseModel, Field
 
 __all__ = [
     "LOG_PREFIX",
+    "MAX_RECORDS",
+    "MAX_RECORDS_PER_DEPLOYMENT",
     "MAX_RECORD_BYTES",
     "PRICE_CHECKS",
     "RecordedCandidate",
@@ -21,14 +27,18 @@ __all__ = [
     "RecordedStep",
     "RecordedSyncCheck",
     "SelectionRecord",
+    "SelectionRecordStore",
     "record_json",
 ]
 
 logger = logging.getLogger(__name__)
 
+# How many records are kept: the most recent of each deployment, and the most recent in all.
+MAX_RECORDS_PER_DEPLOYMENT = 20
+MAX_RECORDS = 500
 # The largest a record may be as JSON, room for a few hundred candidates at about 600 bytes
-# each. /select-indexers takes no token and a request can name thousands of indexers, so
-# without a limit 1 request could write megabytes to the log.
+# each. /select-indexers takes no token and a request can name thousands of indexers, so this
+# is what keeps the records held to MAX_RECORDS times it, 128 MB, whatever is sent.
 MAX_RECORD_BYTES = 256 * 1024
 # What each record's log line starts with, so the lines can be found and the JSON cut out.
 LOG_PREFIX = "selection_record "
@@ -281,10 +291,42 @@ def record_json(record: SelectionRecord) -> str:
         return text
     logger.warning(
         "The record of selection %s for deployment %s is %s bytes, over the limit of %s, so it "
-        "is logged without its lists of indexers",
+        "is logged and kept without its lists of indexers",
         record.selection_id,
         record.request.deployment_id,
         f"{size:,}",
         f"{MAX_RECORD_BYTES:,}",
     )
     return record.header().model_dump_json()
+
+
+class SelectionRecordStore:
+    """The most recent selection records, as JSON: at most ``per_deployment`` for any 1
+    deployment and ``total`` in all, the oldest dropped first. It has a lock of its own, since
+    selections add records on the event loop while reads run on worker threads.
+    """
+
+    def __init__(
+        self, per_deployment: int = MAX_RECORDS_PER_DEPLOYMENT, total: int = MAX_RECORDS
+    ) -> None:
+        self._per_deployment = per_deployment
+        self._total = total
+        self._lock = threading.Lock()
+        # (deployment id, record), oldest first.
+        self._records: list[tuple[str, str]] = []
+
+    def add(self, deployment_id: str, record: str) -> None:
+        """Keep ``record``, dropping the deployment's oldest record if it already holds its
+        share, and then the oldest record of all if the store is over its total.
+        """
+        with self._lock:
+            held = [entry for entry in self._records if entry[0] == deployment_id]
+            if len(held) >= self._per_deployment:
+                self._records.remove(held[0])
+            self._records.append((deployment_id, record))
+            del self._records[: max(0, len(self._records) - self._total)]
+
+    def for_deployment(self, deployment_id: str) -> list[str]:
+        """The deployment's records, newest first."""
+        with self._lock:
+            return [record for held, record in reversed(self._records) if held == deployment_id]

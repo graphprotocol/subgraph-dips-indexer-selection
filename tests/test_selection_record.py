@@ -3,7 +3,8 @@
 The reply to dipper carries only the picked indexers and their prices. The record holds the
 rest: the request, every candidate with the score it was judged on and the parts of that score,
 who was left out and why, each change made to the group, and the final group. It is logged as 1
-JSON line. Nothing here may change the reply itself.
+JSON line and the most recent ones are served by GET /selections. Nothing here may change the
+reply itself.
 """
 
 import json
@@ -20,7 +21,13 @@ from iisa import score_loader
 from iisa.freshness import Check, minute_index
 from iisa.iisa_http_endpoints import IISAState, Settings, app
 from iisa.indexer_selection import IndexerSelector
-from iisa.selection_record import LOG_PREFIX, MAX_RECORD_BYTES
+from iisa.selection_record import (
+    LOG_PREFIX,
+    MAX_RECORD_BYTES,
+    MAX_RECORDS,
+    MAX_RECORDS_PER_DEPLOYMENT,
+    SelectionRecordStore,
+)
 
 CHAIN = "arbitrum-one"
 DEPLOYMENT = "QmSelectionRecord"
@@ -150,6 +157,13 @@ def select(logged) -> Callable[..., dict[str, Any]]:
         return record
 
     return select
+
+
+def _kept(deployment: str = DEPLOYMENT) -> list[dict[str, Any]]:
+    """The records GET /selections answers with for the deployment."""
+    answer = TestClient(app).get("/selections", params={"deployment": deployment})
+    assert answer.status_code == 200, answer.text
+    return answer.json()["records"]
 
 
 def _candidate(record: dict[str, Any], indexer: str) -> dict[str, Any]:
@@ -682,3 +696,123 @@ def test_a_record_over_the_size_limit_is_cut_down_to_its_header(load, logged, ca
     assert len(json.dumps(record)) < 2_000
     (warning,) = [r.getMessage() for r in caplog.records if r.name == "iisa.selection_record"]
     assert DEPLOYMENT in warning and f"{MAX_RECORD_BYTES:,}" in warning
+
+
+# --- The bound on the records kept -------------------------------------------------------------
+
+
+class TestTheBound:
+    def test_a_deployment_keeps_only_its_most_recent_records(self):
+        store = SelectionRecordStore()
+
+        for number in range(MAX_RECORDS_PER_DEPLOYMENT + 5):
+            store.add(DEPLOYMENT, f"record {number}")
+        store.add(OTHER_DEPLOYMENT, "another deployment's record")
+
+        kept = store.for_deployment(DEPLOYMENT)
+        assert MAX_RECORDS_PER_DEPLOYMENT == 20 and len(kept) == 20
+        assert kept[0] == "record 24" and kept[-1] == "record 5"
+        assert store.for_deployment(OTHER_DEPLOYMENT) == ["another deployment's record"]
+
+    def test_the_store_keeps_only_the_most_recent_records_in_all(self):
+        store = SelectionRecordStore()
+
+        for number in range(MAX_RECORDS + 10):
+            store.add(f"Qm{number}", f"record {number}")
+
+        kept = [store.for_deployment(f"Qm{number}") for number in range(MAX_RECORDS + 10)]
+        assert MAX_RECORDS == 500 and sum(len(records) for records in kept) == 500
+        assert store.for_deployment("Qm9") == []
+        assert store.for_deployment("Qm10") == ["record 10"]
+        assert store.for_deployment(f"Qm{MAX_RECORDS + 9}") == [f"record {MAX_RECORDS + 9}"]
+
+    def test_a_full_deployment_gives_up_its_own_oldest_record_not_another_deployments(self):
+        store = SelectionRecordStore(per_deployment=2, total=3)
+
+        store.add(OTHER_DEPLOYMENT, "the oldest record of all")
+        for number in range(4):
+            store.add(DEPLOYMENT, f"record {number}")
+
+        assert store.for_deployment(OTHER_DEPLOYMENT) == ["the oldest record of all"]
+        assert store.for_deployment(DEPLOYMENT) == ["record 3", "record 2"]
+
+    def test_the_service_keeps_20_selections_of_a_deployment(self, load):
+        load(*RANKED)
+
+        for size in range(1, MAX_RECORDS_PER_DEPLOYMENT + 3):
+            assert _post(num_candidates=size % 4).status_code == 200
+
+        kept = _kept()
+        assert len(kept) == MAX_RECORDS_PER_DEPLOYMENT
+        asked_for = [record["request"]["num_candidates"] for record in kept]
+        assert asked_for == [size % 4 for size in range(22, 2, -1)]
+
+
+# --- The route ---------------------------------------------------------------------------------
+#
+# test_read_token.py covers its token check with the other routes that only read.
+
+
+class TestTheRoute:
+    def test_it_answers_with_one_deployments_records_newest_first(self, load, select):
+        """The records it answers with are the ones logged, number for number."""
+        load(*RANKED)
+        first = select(num_candidates=1)
+        elsewhere = select(deployment_id=OTHER_DEPLOYMENT)
+        second = select(num_candidates=2, blocklist=[C])
+
+        answer = TestClient(app).get("/selections", params={"deployment": DEPLOYMENT})
+
+        assert answer.status_code == 200
+        assert answer.json() == {
+            "deployment_id": DEPLOYMENT,
+            "count": 2,
+            "records": [second, first],
+        }
+        assert _kept(OTHER_DEPLOYMENT) == [elsewhere]
+
+    def test_a_record_cut_down_to_its_header_is_kept_cut_down(self, load, logged):
+        load(*RANKED)
+
+        _post(blocklist=["0x" + f"{number:0126x}" for number in range(3_000)])
+
+        assert _kept() == logged and logged[0]["truncated"] is True
+
+    def test_a_deployment_with_no_selections_gets_an_empty_list(self, load):
+        load(*RANKED)
+
+        answer = TestClient(app).get("/selections", params={"deployment": "QmNeverSelected"})
+
+        assert answer.status_code == 200
+        assert answer.json() == {"deployment_id": "QmNeverSelected", "count": 0, "records": []}
+
+    @pytest.mark.parametrize("query", ["", "?deployment=", "?deployment=" + "Q" * 129])
+    def test_it_needs_a_deployment_to_filter_by(self, load, query):
+        load(*RANKED)
+
+        assert TestClient(app).get(f"/selections{query}").status_code == 422
+
+    def test_its_description_says_the_records_are_lost_on_a_restart(self):
+        description = " ".join(app.openapi()["paths"]["/selections"]["get"]["description"].split())
+
+        assert "restart" in description and "logged" in description
+        assert f"at most {MAX_RECORDS_PER_DEPLOYMENT} for a deployment" in description
+        assert f"{MAX_RECORDS} in all" in description
+
+    def test_a_restart_starts_with_no_records(self, load, select):
+        load(*RANKED)
+        select()
+
+        load(*RANKED)
+
+        assert _kept() == []
+
+    def test_a_record_that_cannot_be_built_is_not_kept(self, load, monkeypatch):
+        load(*RANKED)
+
+        def broken(*_args: Any) -> None:
+            raise RuntimeError("a fault nobody planned for")
+
+        monkeypatch.setattr(endpoints, "_selection_record", broken)
+
+        assert _post().status_code == 200 and _kept() == []

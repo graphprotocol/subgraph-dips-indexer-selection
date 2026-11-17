@@ -27,6 +27,7 @@ from iisa import DataManager, sync_check
 from iisa import iisa_http_endpoints as endpoints
 from iisa.freshness import FreshnessStore
 from iisa.iisa_http_endpoints import SelectionRequest, Settings, _select_checking_sync_claims
+from iisa.selection_record import SelectionRecordStore
 from iisa.sync_check import GatewayReply, SyncClaimChecker, post_once
 
 CHAIN = "arbitrum-one"
@@ -377,6 +378,7 @@ def _state(
         sync_checker=checker,
         is_ready=True,
         freshness=FreshnessStore(),
+        selection_records=SelectionRecordStore(),
     )
 
 

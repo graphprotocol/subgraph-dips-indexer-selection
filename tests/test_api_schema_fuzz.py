@@ -2,12 +2,13 @@
 
 Schemathesis reads the schema FastAPI publishes, generates requests that fit it and requests
 that break it, and sends them to the app in process. A test fails on any 5xx response and on
-any answer the schema does not list. Each request meets freshly seeded scores, sync status and
-freshness, and carries the push token, or in one test any bearer token, so the endpoints do
-real work. Since each request starts afresh, a last test pushes unusual scores and then reads
-them back.
+any answer the schema does not list. Each request meets freshly seeded scores, sync status,
+freshness and 1 selection's record, and carries the push token, or in one test any bearer
+token, so the endpoints do real work. Since each request starts afresh, a last test pushes
+unusual scores and then reads them back.
 """
 
+import asyncio
 import copy
 import json
 from collections.abc import Iterator
@@ -129,14 +130,27 @@ def _freshness_push(minute: int) -> FreshnessPush:
     )
 
 
+# A selection over the seeded data: a member, both price ceilings and expected DIPs fees.
+SELECTION: dict[str, Any] = {
+    "deployment_id": DEPLOYMENT,
+    "num_candidates": 3,
+    "chain_id": CHAIN,
+    "existing_indexers": [SCORE_RECORDS[0]["indexer"]],
+    "max_grt_per_30_days": 5_000.0,
+    "max_grt_per_billion_entities_per_30_days": 1_000.0,
+    "optimistic_dips_fees": {SCORE_RECORDS[1]["indexer"]: 50.0},
+}
+
 # The state _seed_state last made, and the scores, sync status and freshness it held then.
 _seeded: dict[str, Any] = {}
+# The record of SELECTION, made by the first seeding and handed to each later one.
+_seeded_record: list[str] = []
 
 
 def _seed_state() -> None:
     """Replace the app's state with a fresh one holding the seeded scores, sync status and
-    5 minutes of freshness, enough to judge each indexer checked. The last minute is a few
-    minutes ago, so a later minute can still be pushed.
+    5 minutes of freshness, enough to judge each indexer checked, and the record of 1
+    selection. The last minute is a few minutes ago, so a later minute can still be pushed.
     """
     state = IISAState()
     state.initialize(Settings())
@@ -146,6 +160,11 @@ def _seed_state() -> None:
     for minute in range(freshness_minute - 4, freshness_minute + 1):
         state.apply_freshness(_freshness_push(minute))
     iisa_http_endpoints._state = state
+    if not _seeded_record:
+        asyncio.run(iisa_http_endpoints.select_indexers(SelectionRequest(**SELECTION)))
+        _seeded_record.extend(state.selection_records.for_deployment(DEPLOYMENT))
+    else:
+        state.selection_records.add(DEPLOYMENT, _seeded_record[0])
     _seeded.update(
         state=state,
         history=state.history,
@@ -237,6 +256,8 @@ def _use_seeded_data(case: schemathesis.Case) -> None:
         ]
     if case.query and isinstance(case.query.get("chain"), str):
         case.query = {**case.query, "chain": CHAIN}
+    if case.query and isinstance(case.query.get("deployment"), str):
+        case.query = {**case.query, "deployment": DEPLOYMENT}
     if case.path == "/freshness" and isinstance(case.body, dict) and "minute" in case.body:
         case.body = {**case.body, "minute": minute_text(_seeded["freshness_minute"] + 1)}
 
@@ -344,19 +365,8 @@ ABSENT = "absent"
 # The reads that use pushed scores, sent once a push is accepted. /get-score and /dips-indexers
 # run the same scoring and price filters as these, so they are left out to save time.
 SCORE_READS: list[tuple[str, str, Optional[dict[str, Any]]]] = [
-    (
-        "POST",
-        "/select-indexers",
-        {
-            "deployment_id": DEPLOYMENT,
-            "num_candidates": 3,
-            "chain_id": CHAIN,
-            "existing_indexers": [SCORE_RECORDS[0]["indexer"]],
-            "max_grt_per_30_days": 5_000.0,
-            "max_grt_per_billion_entities_per_30_days": 1_000.0,
-            "optimistic_dips_fees": {SCORE_RECORDS[1]["indexer"]: 50.0},
-        },
-    ),
+    ("POST", "/select-indexers", SELECTION),
+    ("GET", f"/selections?deployment={DEPLOYMENT}", None),
     ("GET", "/scores", None),
     ("GET", "/scores/weighted", None),
 ]

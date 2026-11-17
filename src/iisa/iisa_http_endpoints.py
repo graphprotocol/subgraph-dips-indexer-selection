@@ -14,6 +14,7 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - POST /get-score - Return 1 indexer's total score, factors and components on each chain it has
   priced (read token)
 - POST /select-indexers - Select optimal indexers for a deployment
+- GET /selections - The record of each recent selection for a required ?deployment (read token)
 """
 
 import hmac
@@ -90,6 +91,7 @@ from .selection_record import (
     RecordedStep,
     RecordedSyncCheck,
     SelectionRecord,
+    SelectionRecordStore,
     record_json,
 )
 from .share_score import SHARE_EXPONENT
@@ -690,6 +692,14 @@ class FreshnessResponse(BaseModel):
     chains: dict[str, FreshnessChain] = {}
 
 
+class SelectionRecordsResponse(BaseModel):
+    """Response for GET /selections: 1 deployment's most recent selections, newest first."""
+
+    deployment_id: str
+    count: int
+    records: list[SelectionRecord]
+
+
 class ErrorResponse(BaseModel):
     """Body of each error answer other than a 422: what went wrong, in words."""
 
@@ -740,6 +750,8 @@ class IISAState:
         self.sync_checker: Optional[SyncClaimChecker] = None
         self.freshness = FreshnessStore()
         self.lapse_warnings = LogLimit(LAPSE_WARNING_INTERVAL_MINUTES)
+        # In memory only, so a restart starts with none; each record's log line is what lasts.
+        self.selection_records = SelectionRecordStore()
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -1781,6 +1793,23 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     except Exception as e:
         logger.exception("Selection failed for deployment %s", request.deployment_id)
         raise HTTPException(status_code=500, detail=f"Selection failed: {e}")
+
+
+@app.get("/selections", response_model=SelectionRecordsResponse, responses=_documented_errors(401))
+def selection_records(
+    deployment: str = Query(min_length=1, max_length=_MAX_ID_CHARS),
+    authorization: Optional[str] = Header(None),
+) -> SelectionRecordsResponse:
+    """The most recent selections for ``deployment`` (a 422 if omitted), newest first, each
+    with every candidate's score and its parts, sync status, pool, whether it was picked and
+    why not, each change to the group, and the final group. Kept in memory only, at most 20
+    for a deployment and 500 in all, the oldest dropped first, so a restart loses them all;
+    each is also logged as 1 JSON line starting ``selection_record``, the copy that lasts.
+    """
+    _require_read_token(authorization)
+    kept = _state.selection_records.for_deployment(deployment)
+    records = [SelectionRecord.model_validate_json(record) for record in kept]
+    return SelectionRecordsResponse(deployment_id=deployment, count=len(records), records=records)
 
 
 def _extract_chain_price(dips_min_grt_json: str, chain_id: str) -> Optional[float]:
@@ -2977,7 +3006,7 @@ def _selection_record(request: SelectionRequest, run: _SelectionRun) -> Selectio
 
 
 def _record_selection(request: SelectionRequest, run: _SelectionRun) -> None:
-    """Log the selection's record as 1 JSON line.
+    """Log the selection's record as 1 JSON line and keep it for GET /selections.
 
     The answer is already settled when this runs, so a record that can't be written is logged
     as an error and left out, and the selection it was for still answers.
@@ -2985,6 +3014,7 @@ def _record_selection(request: SelectionRequest, run: _SelectionRun) -> None:
     try:
         record = record_json(_selection_record(request, run))
         logger.info("%s%s", LOG_PREFIX, record)
+        _state.selection_records.add(request.deployment_id, record)
     except Exception:
         logger.exception(
             "Could not write the record of the selection for deployment %s; its answer is "
