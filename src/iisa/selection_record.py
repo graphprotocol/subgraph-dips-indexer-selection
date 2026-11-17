@@ -10,16 +10,18 @@ while 1 process answers both the selections and the reads, as the service runs t
 
 import logging
 import threading
+from collections import OrderedDict
 from typing import Literal, Optional, get_args
 
 from pydantic import BaseModel, Field
 
 __all__ = [
     "LOG_PREFIX",
-    "MAX_RECORDS",
     "MAX_RECORDS_PER_DEPLOYMENT",
     "MAX_RECORD_BYTES",
+    "MAX_STORE_BYTES",
     "PRICE_CHECKS",
+    "RECORD_OVERHEAD_BYTES",
     "RecordedCandidate",
     "RecordedDecentralisation",
     "RecordedFilteredOut",
@@ -33,12 +35,16 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# How many records are kept: the most recent of each deployment, and the most recent in all.
+# How many records are kept for any 1 deployment, and how many bytes of records in all.
 MAX_RECORDS_PER_DEPLOYMENT = 20
-MAX_RECORDS = 500
+MAX_STORE_BYTES = 128 * 1024 * 1024
+# What a record counts for towards MAX_STORE_BYTES on top of its own bytes. The store spends
+# up to about 1 KB on holding a record, most of it a deployment ID of 128 characters at 4
+# bytes each, so with twice that counted the memory held stays within the limit.
+RECORD_OVERHEAD_BYTES = 2 * 1024
 # The largest a record may be as JSON, room for a few hundred candidates at about 600 bytes
-# each. /select-indexers takes no token and a request can name thousands of indexers, so this
-# is what keeps the records held to MAX_RECORDS times it, 128 MB, whatever is sent.
+# each. /select-indexers takes no token and a request can name thousands of indexers, so
+# without this 1 request could write megabytes to the log and push out hundreds of records.
 MAX_RECORD_BYTES = 256 * 1024
 # What each record's log line starts with, so the lines can be found and the JSON cut out.
 LOG_PREFIX = "selection_record "
@@ -310,32 +316,51 @@ def record_json(record: SelectionRecord) -> bytes:
 
 class SelectionRecordStore:
     """The most recent selection records, as the bytes record_json measured: at most
-    ``per_deployment`` for any 1 deployment and ``total`` in all, the oldest dropped first. It
-    has a lock of its own, since selections add records on the event loop while reads run on
-    worker threads.
+    ``per_deployment`` for any 1 deployment and ``budget`` bytes in all, each record counted
+    with RECORD_OVERHEAD_BYTES, the oldest dropped first. Adding and reading cost the same
+    however many deployments are held. It has a lock of its own, since selections add records
+    on the event loop while reads run on worker threads.
     """
 
     def __init__(
-        self, per_deployment: int = MAX_RECORDS_PER_DEPLOYMENT, total: int = MAX_RECORDS
+        self, per_deployment: int = MAX_RECORDS_PER_DEPLOYMENT, budget: int = MAX_STORE_BYTES
     ) -> None:
         self._per_deployment = per_deployment
-        self._total = total
+        self._budget = budget
         self._lock = threading.Lock()
-        # (deployment id, record), oldest first.
-        self._records: list[tuple[str, bytes]] = []
+        # Every record with its deployment, oldest first, keyed by how many had been added.
+        self._records: OrderedDict[int, tuple[str, bytes]] = OrderedDict()
+        # Each deployment's records, oldest first, as their keys in _records.
+        self._by_deployment: dict[str, list[int]] = {}
+        self._added = 0
+        self._counted_bytes = 0
 
     def add(self, deployment_id: str, record: bytes) -> None:
         """Keep ``record``, dropping the deployment's oldest record if it already holds its
-        share, and then the oldest record of all if the store is over its total.
+        share, and then the oldest records of all for as long as the store is over its budget.
         """
         with self._lock:
-            held = [entry for entry in self._records if entry[0] == deployment_id]
+            held = self._by_deployment.get(deployment_id, [])
             if len(held) >= self._per_deployment:
-                self._records.remove(held[0])
-            self._records.append((deployment_id, record))
-            del self._records[: max(0, len(self._records) - self._total)]
+                self._drop(held[0])
+            self._added += 1
+            self._records[self._added] = (deployment_id, record)
+            self._by_deployment.setdefault(deployment_id, []).append(self._added)
+            self._counted_bytes += len(record) + RECORD_OVERHEAD_BYTES
+            while self._counted_bytes > self._budget:
+                self._drop(next(iter(self._records)))
+
+    def _drop(self, key: int) -> None:
+        """Forget the record under ``key``, which is the oldest its deployment holds."""
+        deployment_id, record = self._records.pop(key)
+        held = self._by_deployment[deployment_id]
+        held.remove(key)
+        if not held:
+            del self._by_deployment[deployment_id]
+        self._counted_bytes -= len(record) + RECORD_OVERHEAD_BYTES
 
     def for_deployment(self, deployment_id: str) -> list[bytes]:
         """The deployment's records, newest first."""
         with self._lock:
-            return [record for held, record in reversed(self._records) if held == deployment_id]
+            held = self._by_deployment.get(deployment_id, [])
+            return [self._records[key][1] for key in reversed(held)]

@@ -1803,7 +1803,7 @@ def selection_records(
     """The most recent selections for ``deployment`` (a 422 if omitted), newest first, each
     with every candidate's score and its parts, sync status, pool, whether it was picked and
     why not, each change to the group, and the final group. Kept in memory only, at most 20
-    for a deployment and 500 in all, the oldest dropped first, so a restart loses them all;
+    for a deployment and 128 MB in all, the oldest dropped first, so a restart loses them all;
     each is also logged as 1 JSON line starting ``selection_record``, the copy that lasts.
     """
     _require_read_token(authorization)

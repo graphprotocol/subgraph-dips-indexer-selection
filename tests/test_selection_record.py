@@ -10,6 +10,8 @@ reply itself.
 import json
 import logging
 import sys
+import threading
+import tracemalloc
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from typing import Any
@@ -25,8 +27,9 @@ from iisa.indexer_selection import IndexerSelector
 from iisa.selection_record import (
     LOG_PREFIX,
     MAX_RECORD_BYTES,
-    MAX_RECORDS,
     MAX_RECORDS_PER_DEPLOYMENT,
+    MAX_STORE_BYTES,
+    RECORD_OVERHEAD_BYTES,
     SelectionRecord,
     SelectionRecordStore,
     record_json,
@@ -765,20 +768,37 @@ class TestTheBound:
         assert kept[0] == b"record 24" and kept[-1] == b"record 5"
         assert store.for_deployment(OTHER_DEPLOYMENT) == [b"another deployment's record"]
 
-    def test_the_store_keeps_only_the_most_recent_records_in_all(self):
+    def test_small_records_of_many_deployments_do_not_push_each_other_out(self):
         store = SelectionRecordStore()
 
-        for number in range(MAX_RECORDS + 10):
+        for number in range(5_000):
             store.add(f"Qm{number}", b"record %d" % number)
 
-        kept = [store.for_deployment(f"Qm{number}") for number in range(MAX_RECORDS + 10)]
-        assert MAX_RECORDS == 500 and sum(len(records) for records in kept) == 500
-        assert store.for_deployment("Qm9") == []
-        assert store.for_deployment("Qm10") == [b"record 10"]
-        assert store.for_deployment(f"Qm{MAX_RECORDS + 9}") == [b"record %d" % (MAX_RECORDS + 9)]
+        kept = [store.for_deployment(f"Qm{number}") for number in range(5_000)]
+        assert kept == [[b"record %d" % number] for number in range(5_000)]
+
+    def test_over_its_budget_the_store_drops_the_oldest_records_of_all(self):
+        """A record counts for its own bytes and RECORD_OVERHEAD_BYTES, so a large one pushes
+        out as many old ones as it takes to fit.
+        """
+        small = RECORD_OVERHEAD_BYTES + 1_000
+        store = SelectionRecordStore(budget=10 * small)
+
+        for number in range(12):
+            store.add(f"Qm{number}", b"%03d" % number + b"x" * 997)
+        still_held = [number for number in range(12) if store.for_deployment(f"Qm{number}")]
+        assert still_held == list(range(2, 12))
+
+        store.add("QmLarge", b"x" * (3 * small))
+        still_held = [number for number in range(12) if store.for_deployment(f"Qm{number}")]
+        assert still_held == list(range(6, 12))
+        assert store.for_deployment("QmLarge") == [b"x" * (3 * small)]
 
     def test_a_full_deployment_gives_up_its_own_oldest_record_not_another_deployments(self):
-        store = SelectionRecordStore(per_deployment=2, total=3)
+        """The budget has room for 3 records, and the 2 that DEPLOYMENT gives up for being
+        full no longer count towards it.
+        """
+        store = SelectionRecordStore(per_deployment=2, budget=3 * (RECORD_OVERHEAD_BYTES + 100))
 
         store.add(OTHER_DEPLOYMENT, b"the oldest record of all")
         for number in range(4):
@@ -786,6 +806,75 @@ class TestTheBound:
 
         assert store.for_deployment(OTHER_DEPLOYMENT) == [b"the oldest record of all"]
         assert store.for_deployment(DEPLOYMENT) == [b"record 3", b"record 2"]
+
+    def test_what_the_store_holds_fits_its_budget_whatever_is_sent(self):
+        """The most the store can spend on bookkeeping: 1 tiny record for each of thousands of
+        deployments, each named in 128 characters that Python holds at 4 bytes apiece.
+        """
+        budget = 4 * 1024 * 1024
+        already_tracing = tracemalloc.is_tracing()
+        tracemalloc.start()
+        before, _ = tracemalloc.get_traced_memory()
+
+        store = SelectionRecordStore(budget=budget)
+        for number in range(6_000):
+            store.add("\U0001f600" + f"{number:0127d}", b"%d" % number)
+
+        held, _ = tracemalloc.get_traced_memory()
+        if not already_tracing:
+            tracemalloc.stop()
+        assert held - before <= budget
+        assert store.for_deployment("\U0001f600" + f"{5_999:0127d}") == [b"5999"]
+        assert store.for_deployment("\U0001f600" + f"{0:0127d}") == []
+
+    def test_the_default_budget_is_128_megabytes(self):
+        assert MAX_STORE_BYTES == 128 * 1024 * 1024
+
+    def test_records_added_and_read_at_once_stay_within_both_limits(self):
+        """Selections add records on the event loop while reads run on worker threads. Threads
+        are made to take turns as often as Python allows, so an add or a read that could be cut
+        into by another would be.
+        """
+        store = SelectionRecordStore(per_deployment=5, budget=60 * (RECORD_OVERHEAD_BYTES + 8))
+        deployments = [f"Qm{number}" for number in range(40)]
+        faults: list[str] = []
+        done = threading.Event()
+
+        def add(worker: int) -> None:
+            try:
+                for number in range(3_000):
+                    store.add(deployments[(worker + number) % 40], b"%08d" % number)
+            except Exception as fault:
+                faults.append(repr(fault))
+
+        def read() -> None:
+            try:
+                while not done.is_set():
+                    held = max(len(store.for_deployment(deployment)) for deployment in deployments)
+                    if held > 5:
+                        faults.append(f"a deployment held {held} records")
+            except Exception as fault:
+                faults.append(repr(fault))
+
+        writers = [threading.Thread(target=add, args=(worker,)) for worker in range(8)]
+        readers = [threading.Thread(target=read) for _ in range(4)]
+        usual_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            for thread in writers + readers:
+                thread.start()
+            for thread in writers:
+                thread.join()
+            done.set()
+            for thread in readers:
+                thread.join()
+        finally:
+            sys.setswitchinterval(usual_interval)
+
+        kept = [store.for_deployment(deployment) for deployment in deployments]
+        assert faults == []
+        assert max(len(records) for records in kept) <= 5
+        assert sum(len(records) for records in kept) == 60
 
     def test_the_service_keeps_20_selections_of_a_deployment(self, load):
         load(*RANKED)
@@ -848,7 +937,7 @@ class TestTheRoute:
 
         assert "restart" in description and "logged" in description
         assert f"at most {MAX_RECORDS_PER_DEPLOYMENT} for a deployment" in description
-        assert f"{MAX_RECORDS} in all" in description
+        assert "128 MB in all" in description
 
     def test_a_restart_starts_with_no_records(self, load, select):
         load(*RANKED)
