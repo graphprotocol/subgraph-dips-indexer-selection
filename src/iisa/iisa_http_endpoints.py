@@ -3013,7 +3013,7 @@ def _record_selection(request: SelectionRequest, run: _SelectionRun) -> None:
     """
     try:
         record = record_json(_selection_record(request, run))
-        logger.info("%s%s", LOG_PREFIX, record)
+        logger.info("%s%s", LOG_PREFIX, record.decode())
         _state.selection_records.add(request.deployment_id, record)
     except Exception:
         logger.exception(

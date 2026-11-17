@@ -284,17 +284,18 @@ class SelectionRecord(BaseModel):
         )
 
 
-def record_json(record: SelectionRecord) -> str:
-    """The record as 1 line of JSON. One over MAX_RECORD_BYTES is cut down, with a warning: to
-    who was picked and how or, if that is still over the limit, to its header.
+def record_json(record: SelectionRecord) -> bytes:
+    """The record as 1 line of JSON in UTF-8, the bytes its size is counted in. One over
+    MAX_RECORD_BYTES is cut down, with a warning: to who was picked and how or, if that is
+    still over the limit, to its header.
     """
-    text = record.model_dump_json()
-    size = len(text.encode())
+    kept = record.model_dump_json().encode()
+    size = len(kept)
     if size <= MAX_RECORD_BYTES:
-        return text
-    text, left_out = record.without_long_lists().model_dump_json(), "its long lists"
-    if len(text.encode()) > MAX_RECORD_BYTES:
-        text, left_out = record.header().model_dump_json(), "any of its lists"
+        return kept
+    kept, left_out = record.without_long_lists().model_dump_json().encode(), "its long lists"
+    if len(kept) > MAX_RECORD_BYTES:
+        kept, left_out = record.header().model_dump_json().encode(), "any of its lists"
     logger.warning(
         "The record of selection %s for deployment %s is %s bytes, over the limit of %s, so it "
         "is logged and kept without %s",
@@ -304,13 +305,14 @@ def record_json(record: SelectionRecord) -> str:
         f"{MAX_RECORD_BYTES:,}",
         left_out,
     )
-    return text
+    return kept
 
 
 class SelectionRecordStore:
-    """The most recent selection records, as JSON: at most ``per_deployment`` for any 1
-    deployment and ``total`` in all, the oldest dropped first. It has a lock of its own, since
-    selections add records on the event loop while reads run on worker threads.
+    """The most recent selection records, as the bytes record_json measured: at most
+    ``per_deployment`` for any 1 deployment and ``total`` in all, the oldest dropped first. It
+    has a lock of its own, since selections add records on the event loop while reads run on
+    worker threads.
     """
 
     def __init__(
@@ -320,9 +322,9 @@ class SelectionRecordStore:
         self._total = total
         self._lock = threading.Lock()
         # (deployment id, record), oldest first.
-        self._records: list[tuple[str, str]] = []
+        self._records: list[tuple[str, bytes]] = []
 
-    def add(self, deployment_id: str, record: str) -> None:
+    def add(self, deployment_id: str, record: bytes) -> None:
         """Keep ``record``, dropping the deployment's oldest record if it already holds its
         share, and then the oldest record of all if the store is over its total.
         """
@@ -333,7 +335,7 @@ class SelectionRecordStore:
             self._records.append((deployment_id, record))
             del self._records[: max(0, len(self._records) - self._total)]
 
-    def for_deployment(self, deployment_id: str) -> list[str]:
+    def for_deployment(self, deployment_id: str) -> list[bytes]:
         """The deployment's records, newest first."""
         with self._lock:
             return [record for held, record in reversed(self._records) if held == deployment_id]

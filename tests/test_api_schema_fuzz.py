@@ -144,7 +144,7 @@ SELECTION: dict[str, Any] = {
 # The state _seed_state last made, and the scores, sync status and freshness it held then.
 _seeded: dict[str, Any] = {}
 # The record of SELECTION, made by the first seeding and handed to each later one.
-_seeded_record: list[str] = []
+_seeded_record: list[bytes] = []
 
 
 def _seed_state() -> None:

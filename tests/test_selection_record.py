@@ -9,6 +9,7 @@ reply itself.
 
 import json
 import logging
+import sys
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from typing import Any
@@ -732,6 +733,22 @@ def test_a_record_still_over_the_limit_without_its_long_lists_keeps_only_its_hea
     assert len(json.dumps(kept)) < 2_000
 
 
+def test_a_record_is_held_at_the_size_the_limit_measured_it_at(load):
+    """Python holds text at 4 bytes a character once any 1 character is outside its basic
+    plane, so a record held as text could take 4 times the bytes the limit let through.
+    """
+    load(*RANKED)
+    wide = ["\U0001f600" + f"{number:0127x}" for number in range(1_900)]
+
+    assert _post(blocklist=wide).status_code == 200
+
+    (held,) = endpoints._state.selection_records.for_deployment(DEPLOYMENT)
+    record = json.loads(held)
+    assert record["truncated"] is False and record["request"]["blocklist"] == wide
+    # 64 bytes is room for the held object's own header.
+    assert sys.getsizeof(held) <= MAX_RECORD_BYTES + 64
+
+
 # --- The bound on the records kept -------------------------------------------------------------
 
 
@@ -740,35 +757,35 @@ class TestTheBound:
         store = SelectionRecordStore()
 
         for number in range(MAX_RECORDS_PER_DEPLOYMENT + 5):
-            store.add(DEPLOYMENT, f"record {number}")
-        store.add(OTHER_DEPLOYMENT, "another deployment's record")
+            store.add(DEPLOYMENT, b"record %d" % number)
+        store.add(OTHER_DEPLOYMENT, b"another deployment's record")
 
         kept = store.for_deployment(DEPLOYMENT)
         assert MAX_RECORDS_PER_DEPLOYMENT == 20 and len(kept) == 20
-        assert kept[0] == "record 24" and kept[-1] == "record 5"
-        assert store.for_deployment(OTHER_DEPLOYMENT) == ["another deployment's record"]
+        assert kept[0] == b"record 24" and kept[-1] == b"record 5"
+        assert store.for_deployment(OTHER_DEPLOYMENT) == [b"another deployment's record"]
 
     def test_the_store_keeps_only_the_most_recent_records_in_all(self):
         store = SelectionRecordStore()
 
         for number in range(MAX_RECORDS + 10):
-            store.add(f"Qm{number}", f"record {number}")
+            store.add(f"Qm{number}", b"record %d" % number)
 
         kept = [store.for_deployment(f"Qm{number}") for number in range(MAX_RECORDS + 10)]
         assert MAX_RECORDS == 500 and sum(len(records) for records in kept) == 500
         assert store.for_deployment("Qm9") == []
-        assert store.for_deployment("Qm10") == ["record 10"]
-        assert store.for_deployment(f"Qm{MAX_RECORDS + 9}") == [f"record {MAX_RECORDS + 9}"]
+        assert store.for_deployment("Qm10") == [b"record 10"]
+        assert store.for_deployment(f"Qm{MAX_RECORDS + 9}") == [b"record %d" % (MAX_RECORDS + 9)]
 
     def test_a_full_deployment_gives_up_its_own_oldest_record_not_another_deployments(self):
         store = SelectionRecordStore(per_deployment=2, total=3)
 
-        store.add(OTHER_DEPLOYMENT, "the oldest record of all")
+        store.add(OTHER_DEPLOYMENT, b"the oldest record of all")
         for number in range(4):
-            store.add(DEPLOYMENT, f"record {number}")
+            store.add(DEPLOYMENT, b"record %d" % number)
 
-        assert store.for_deployment(OTHER_DEPLOYMENT) == ["the oldest record of all"]
-        assert store.for_deployment(DEPLOYMENT) == ["record 3", "record 2"]
+        assert store.for_deployment(OTHER_DEPLOYMENT) == [b"the oldest record of all"]
+        assert store.for_deployment(DEPLOYMENT) == [b"record 3", b"record 2"]
 
     def test_the_service_keeps_20_selections_of_a_deployment(self, load):
         load(*RANKED)
