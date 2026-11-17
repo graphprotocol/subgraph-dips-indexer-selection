@@ -26,7 +26,9 @@ from iisa.selection_record import (
     MAX_RECORD_BYTES,
     MAX_RECORDS,
     MAX_RECORDS_PER_DEPLOYMENT,
+    SelectionRecord,
     SelectionRecordStore,
+    record_json,
 )
 
 CHAIN = "arbitrum-one"
@@ -678,24 +680,56 @@ class TestTheReplyIsUntouched:
 # --- The size limit --------------------------------------------------------------------------
 
 
-def test_a_record_over_the_size_limit_is_cut_down_to_its_header(load, logged, caplog):
-    """/select-indexers takes no token, so a huge request must not become a huge record."""
-    load(*RANKED)
-    blocklist = ["0x" + f"{number:0126x}" for number in range(3_000)]
-    assert len(json.dumps(blocklist)) > MAX_RECORD_BYTES
+# Ids of the longest kind a request may carry, enough of them to put a record over the limit.
+LONG_LIST = ["0x" + f"{number:0126x}" for number in range(3_000)]
+
+
+def test_a_record_over_the_size_limit_still_says_who_was_picked_and_how(load, logged, caplog):
+    """/select-indexers takes no token, so a huge request must not become a huge record. Only
+    the long lists go: the request's own, the candidates and the indexers priced out.
+    """
+    state = load(*RANKED, FAILING)
+    _claims_synced(state, A)
+    state.sync_checker = FakeChecker()
+    assert len(json.dumps(LONG_LIST)) > MAX_RECORD_BYTES
 
     with caplog.at_level(logging.WARNING, logger="iisa.selection_record"):
-        reply = _post(num_candidates=2, blocklist=blocklist)
+        reply = _post(num_candidates=2, max_grt_per_30_days=4_500.0, blocklist=LONG_LIST)
 
-    assert [indexer["id"] for indexer in reply.json()["indexers"]] == [D, C]
+    assert [indexer["id"] for indexer in reply.json()["indexers"]] == [A, D]
     (record,) = logged
-    assert record["truncated"] is True and record["final_group"] == []
+    assert record["truncated"] is True
+    assert record["final_group"] == [A, D]
+    assert [(step["action"], step["indexer"]) for step in record["steps"]] == [
+        ("added", A),
+        ("added", D),
+    ]
+    assert record["sync_check"]["asked"] == [A]
+    assert record["decentralisation"] == {"met": True, "fell_back": False}
     assert record["request"]["deployment_id"] == DEPLOYMENT
     assert record["request"]["num_candidates"] == 2
-    assert record["request"]["blocklist"] == [] and record["candidates"] == []
+    assert record["request"]["blocklist"] == []
+    assert record["candidates"] == [] and record["filtered_out"] == []
     assert len(json.dumps(record)) < 2_000
     (warning,) = [r.getMessage() for r in caplog.records if r.name == "iisa.selection_record"]
     assert DEPLOYMENT in warning and f"{MAX_RECORD_BYTES:,}" in warning
+
+
+def test_a_record_still_over_the_limit_without_its_long_lists_keeps_only_its_header(load, select):
+    """Thousands of members can make the final group and the steps long too, and the limit
+    holds whatever is sent.
+    """
+    load(*RANKED)
+    whole = select(num_candidates=2)
+    record = SelectionRecord.model_validate({**whole, "final_group": LONG_LIST})
+
+    kept = json.loads(record_json(record))
+
+    assert kept["truncated"] is True
+    assert kept["final_group"] == [] and kept["steps"] == [] and kept["candidates"] == []
+    assert kept["selection_id"] == whole["selection_id"]
+    assert kept["request"]["num_candidates"] == 2 and kept["outcome"] == "selected"
+    assert len(json.dumps(kept)) < 2_000
 
 
 # --- The bound on the records kept -------------------------------------------------------------
@@ -771,10 +805,10 @@ class TestTheRoute:
         }
         assert _kept(OTHER_DEPLOYMENT) == [elsewhere]
 
-    def test_a_record_cut_down_to_its_header_is_kept_cut_down(self, load, logged):
+    def test_a_record_cut_down_for_its_size_is_kept_cut_down(self, load, logged):
         load(*RANKED)
 
-        _post(blocklist=["0x" + f"{number:0126x}" for number in range(3_000)])
+        _post(blocklist=LONG_LIST)
 
         assert _kept() == logged and logged[0]["truncated"] is True
 

@@ -253,12 +253,17 @@ class SelectionRecord(BaseModel):
     )
     truncated: bool = Field(
         default=False,
-        description="True when the full record was over the size limit, and every list in it "
-        "was then left out.",
+        description="True when the full record was over the size limit. Its long lists were "
+        "then left out: the candidates, the indexers the price checks left out and the "
+        "request's own lists. If what remained was still over the limit, which takes a request "
+        "naming thousands of members, the steps, the sync check and the final group were left "
+        "out as well.",
     )
 
-    def header(self) -> "SelectionRecord":
-        """The record without its lists: what was asked, when, and how it ended."""
+    def without_long_lists(self) -> "SelectionRecord":
+        """The record without the lists that grow with the request and the loaded scores. It
+        still says who was picked and how.
+        """
         request = self.request.model_copy(
             update={
                 "existing_indexers": [],
@@ -269,35 +274,37 @@ class SelectionRecord(BaseModel):
             }
         )
         return self.model_copy(
-            update={
-                "request": request,
-                "candidates": [],
-                "filtered_out": [],
-                "steps": [],
-                "sync_check": None,
-                "final_group": [],
-                "truncated": True,
-            }
+            update={"request": request, "candidates": [], "filtered_out": [], "truncated": True}
+        )
+
+    def header(self) -> "SelectionRecord":
+        """The record without any of its lists: what was asked, when, and how it ended."""
+        return self.without_long_lists().model_copy(
+            update={"steps": [], "sync_check": None, "final_group": []}
         )
 
 
 def record_json(record: SelectionRecord) -> str:
-    """The record as 1 line of JSON, cut down to its header, with a warning, when the full
-    record is over MAX_RECORD_BYTES.
+    """The record as 1 line of JSON. One over MAX_RECORD_BYTES is cut down, with a warning: to
+    who was picked and how or, if that is still over the limit, to its header.
     """
     text = record.model_dump_json()
     size = len(text.encode())
     if size <= MAX_RECORD_BYTES:
         return text
+    text, left_out = record.without_long_lists().model_dump_json(), "its long lists"
+    if len(text.encode()) > MAX_RECORD_BYTES:
+        text, left_out = record.header().model_dump_json(), "any of its lists"
     logger.warning(
         "The record of selection %s for deployment %s is %s bytes, over the limit of %s, so it "
-        "is logged and kept without its lists of indexers",
+        "is logged and kept without %s",
         record.selection_id,
         record.request.deployment_id,
         f"{size:,}",
         f"{MAX_RECORD_BYTES:,}",
+        left_out,
     )
-    return record.header().model_dump_json()
+    return text
 
 
 class SelectionRecordStore:
