@@ -23,11 +23,12 @@ import logging
 import math
 import numbers
 import os
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, partial
-from typing import Annotated, Any, Literal, NamedTuple, Optional, Self, TypeGuard, Union, cast
+from typing import Annotated, Any, Literal, NamedTuple, Optional, Self, TypeGuard, cast
 
 import pandas as pd
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
@@ -69,6 +70,8 @@ from .indexer_selection import (
     EthAddressStr,
     IndexerSelector,
     IpfsHashStr,
+    Pick,
+    Step,
 )
 from .log_limit import LogLimit
 from .score_loader import (
@@ -76,6 +79,18 @@ from .score_loader import (
     DataManager,
     FileScoreLoader,
     ScoresPayloadError,
+)
+from .selection_record import (
+    LOG_PREFIX,
+    PRICE_CHECKS,
+    RecordedCandidate,
+    RecordedDecentralisation,
+    RecordedFilteredOut,
+    RecordedRequest,
+    RecordedStep,
+    RecordedSyncCheck,
+    SelectionRecord,
+    record_json,
 )
 from .share_score import SHARE_EXPONENT
 from .sync_check import MAX_CHECKS_PER_SELECTION, SyncClaimChecker
@@ -1731,7 +1746,9 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
         raise HTTPException(status_code=503, detail="IISA data not loaded")
 
     if request.num_candidates <= 0:
-        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+        nobody = SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+        _record_selection(request, _SelectionRun(nobody, "nothing_asked_for"))
+        return nobody
 
     logger.info(
         "select-indexers request: deployment=%s chain=%s num_candidates=%d "
@@ -1750,7 +1767,8 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     )
 
     try:
-        response = await _select_checking_sync_claims(request)
+        run = await _run_selection(request)
+        response = run.response
         indexer_ids = [i.id for i in response.indexers]
         logger.info(
             "Selected %d indexers for deployment %s: %s",
@@ -1758,6 +1776,7 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
             request.deployment_id,
             indexer_ids,
         )
+        _record_selection(request, run)
         return response
     except Exception as e:
         logger.exception("Selection failed for deployment %s", request.deployment_id)
@@ -2300,30 +2319,42 @@ _BREAKDOWN_COMPONENTS = (
 )
 
 
-def _score_breakdown(
+def _score_parts(
     row: pd.Series,
 ) -> tuple[Optional[float], dict[str, float], dict[str, float]]:
-    """Return (total, factors, components) for one scored indexer row, rounded for logging.
-    Factors and components the row lacks are left out; total is None when it has none.
+    """Return (total, factors, components) for one scored indexer row, in full, as selection
+    ranked it. Factors and components the row lacks are left out; total is None when it has none.
     """
     from .indexer_selection import SCORE_FACTORS
 
     factors = {
-        name: round(float(row[f"factor_{name}"]), 3)
+        name: float(row[f"factor_{name}"])
         for name in SCORE_FACTORS
         if f"factor_{name}" in row.index and pd.notna(row[f"factor_{name}"])
     }
     components = {
-        label: round(float(row[col]), 3)
+        label: float(row[col])
         for col, label in _BREAKDOWN_COMPONENTS
         if col in row.index and pd.notna(row[col])
     }
     total = (
-        round(float(row["weighted_score"]), 4)
+        float(row["weighted_score"])
         if "weighted_score" in row.index and pd.notna(row["weighted_score"])
         else None
     )
     return total, factors, components
+
+
+def _score_breakdown(
+    row: pd.Series,
+) -> tuple[Optional[float], dict[str, float], dict[str, float]]:
+    """_score_parts for one scored indexer row, rounded for logging."""
+    total, factors, components = _score_parts(row)
+    return (
+        None if total is None else round(total, 4),
+        {name: round(factor, 3) for name, factor in factors.items()},
+        {label: round(component, 3) for label, component in components.items()},
+    )
 
 
 def _log_selection_reasoning(processor: IndexerSelector, deployment_id: str) -> None:
@@ -2344,6 +2375,9 @@ def _log_selection_reasoning(processor: IndexerSelector, deployment_id: str) -> 
         )
 
 
+_BLOCKLISTED = "blocklisted"
+
+
 def _members_to_drop(history: pd.DataFrame, request: SelectionRequest) -> dict[str, str]:
     """Group members that must leave, each with the reason: the request blocklists it, or its
     own DIPs info fails a price check. A member with no score row or no DIPs info stays, since
@@ -2352,7 +2386,7 @@ def _members_to_drop(history: pd.DataFrame, request: SelectionRequest) -> dict[s
     """
     members = request.existing_indexers or []
     blocked = set(request.blocklist or [])
-    reasons = {member: "blocklisted" for member in members if member in blocked}
+    reasons = {member: _BLOCKLISTED for member in members if member in blocked}
     if "dips_info_available" not in history.columns:
         return reasons
     rows = history[history["indexer"].isin(members) & ~history["indexer"].isin(list(reasons))]
@@ -2368,17 +2402,21 @@ def _members_to_drop(history: pd.DataFrame, request: SelectionRequest) -> dict[s
     return reasons
 
 
-def _without_failing_members(history: pd.DataFrame, request: SelectionRequest) -> SelectionRequest:
-    """The request with any group member that must leave taken out of existing_indexers."""
+def _without_failing_members(
+    history: pd.DataFrame, request: SelectionRequest
+) -> tuple[SelectionRequest, dict[str, str]]:
+    """The request with any group member that must leave taken out of existing_indexers, and
+    those members with why each leaves.
+    """
     dropped = _members_to_drop(history, request)
     if not dropped:
-        return request
+        return request, dropped
     for member, reason in sorted(dropped.items()):
         logger.info(
             "deployment=%s dropping group member %s: %s", request.deployment_id, member, reason
         )
     kept = [member for member in request.existing_indexers or [] if member not in dropped]
-    return request.model_copy(update={"existing_indexers": kept})
+    return request.model_copy(update={"existing_indexers": kept}), dropped
 
 
 def _current_minute() -> int:
@@ -2461,38 +2499,54 @@ class _Selection(NamedTuple):
     """A selection ready to score: the request without its failing members, the candidates'
     history with this chain's prices, the indexers that say they have synced the deployment,
     and the candidates marked stale, which can only fill places no fresh candidate can.
+
+    For the selection's record it also holds the members taken out, each with why, and the
+    indexers the price checks left out, each with the check. With nothing to score, ``answer``
+    is the answer itself and ``outcome`` says why: no scores loaded, or no candidate within
+    the price limits.
     """
 
     request: SelectionRequest
     history: pd.DataFrame
     synced: set[str]
     stale: list[str]
+    dropped: dict[str, str]
+    filtered_out: dict[str, str]
+    answer: Optional[SelectionResponse] = None
+    outcome: str = "selected"
 
 
-def _prepare_selection(request: SelectionRequest) -> Union[_Selection, SelectionResponse]:
-    """Everything a selection needs before scoring, or the answer itself when there is nothing
-    to score: no scores loaded, or no candidate within the price limits.
+def _prepare_selection(request: SelectionRequest) -> _Selection:
+    """Everything a selection needs before scoring, or its answer when there is nothing to
+    score: no scores loaded, or no candidate within the price limits.
     """
     if _state.history is None:
-        return SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+        nobody = SelectionResponse(deployment_id=request.deployment_id, indexers=[])
+        return _Selection(request, pd.DataFrame(), set(), [], {}, {}, nobody, "no_scores")
 
-    request = _without_failing_members(_state.history, request)
+    request, dropped = _without_failing_members(_state.history, request)
 
     # Filter by price constraints before scoring. With no candidate left, the members that
     # may stay are the answer, since an empty one makes dipper cancel every agreement.
-    filtered_history = _price_filtered_candidates(_state.history, request)
+    filtered_out: dict[str, str] = {}
+    filtered_history = _price_filtered_candidates(_state.history, request, filtered_out)
     if filtered_history is None:
-        return SelectionResponse(
+        members = SelectionResponse(
             deployment_id=request.deployment_id,
             indexers=_build_selected_indexers(
                 list(request.existing_indexers or []), _state.history, request.chain_id
             ),
         )
+        empty = pd.DataFrame()
+        return _Selection(
+            request, empty, set(), [], dropped, filtered_out, members, "no_candidates"
+        )
 
     # Enrich with the chain's prices, freshness, uptime and success rate for normalization
     enriched_history = _enrich_for_chain(filtered_history, request.chain_id)
     stale = _stale_candidates(request, enriched_history)
-    return _Selection(request, enriched_history, _synced_indexers_for(request.deployment_id), stale)
+    synced = _synced_indexers_for(request.deployment_id)
+    return _Selection(request, enriched_history, synced, stale, dropped, filtered_out)
 
 
 def _selection_response(selection: _Selection, processor: IndexerSelector) -> SelectionResponse:
@@ -2535,8 +2589,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
     the rest.
     """
     selection = _prepare_selection(request)
-    if isinstance(selection, SelectionResponse):
-        return selection
+    if selection.answer is not None:
+        return selection.answer
     processor = _build_selector(
         selection.request, selection.history, selection.synced, selection.stale
     )
@@ -2547,20 +2601,52 @@ async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionRe
     """_select_with_processor, with the synced claims that could win a candidate a place
     checked through the gateway first, when the check is switched on.
     """
+    return (await _run_selection(request)).response
+
+
+class _ClaimChecks(NamedTuple):
+    """How 1 selection's gateway checks of synced claims went: the claims asked about, those
+    not confirmed with the reason for each, and those left unasked beyond the limit.
+    """
+
+    asked: list[str]
+    unconfirmed: dict[str, str]
+    not_asked: list[str]
+
+
+class _SelectionRun(NamedTuple):
+    """A selection's answer, with what it took to reach it for the selection's record: how it
+    ended, what was prepared, the selector that settled the group and the claim checks made.
+    The last 3 are None when the selection never got that far.
+    """
+
+    response: SelectionResponse
+    outcome: str
+    selection: Optional[_Selection] = None
+    processor: Optional[IndexerSelector] = None
+    checks: Optional[_ClaimChecks] = None
+
+
+async def _run_selection(request: SelectionRequest) -> _SelectionRun:
+    """Select for the request, checking the synced claims that could win a candidate a place
+    through the gateway first, when the check is switched on.
+    """
     selection = _prepare_selection(request)
-    if isinstance(selection, SelectionResponse):
-        return selection
+    if selection.answer is not None:
+        return _SelectionRun(selection.answer, selection.outcome, selection)
     processor = _build_selector(
         selection.request, selection.history, selection.synced, selection.stale
     )
+    checks = None
     if _state.sync_checker is not None:
-        processor = await _with_claims_checked(selection, processor, _state.sync_checker)
-    return _selection_response(selection, processor)
+        processor, checks = await _with_claims_checked(selection, processor, _state.sync_checker)
+    response = _selection_response(selection, processor)
+    return _SelectionRun(response, selection.outcome, selection, processor, checks)
 
 
 async def _with_claims_checked(
     selection: _Selection, processor: IndexerSelector, checker: SyncClaimChecker
-) -> IndexerSelector:
+) -> tuple[IndexerSelector, Optional[_ClaimChecks]]:
     """Check, through the gateway and all at once, the claim of every candidate the selection
     could have picked ahead of the rest because it says it has synced, and select again if any
     of those claims was not confirmed or was left unasked.
@@ -2579,17 +2665,19 @@ async def _with_claims_checked(
     asked = claimants[:MAX_CHECKS_PER_SELECTION]
     not_asked = claimants[MAX_CHECKS_PER_SELECTION:]
     if not asked:
-        return processor
+        return processor, None
     unconfirmed = await checker.unconfirmed(request.deployment_id, asked)
     _log_claim_checks(request.deployment_id, asked, unconfirmed, not_asked)
+    checks = _ClaimChecks(asked, unconfirmed, not_asked)
     if not unconfirmed and not not_asked:
-        return processor
+        return processor, checks
     members = {indexer.lower() for indexer in processor.initial_group}
     claims = {indexer.lower() for indexer in selection.synced}
     confirmed = set(asked) - unconfirmed.keys()
-    return _build_selector(
+    again = _build_selector(
         request, selection.history, (claims & members) | confirmed, selection.stale
     )
+    return again, checks
 
 
 def _log_claim_checks(
@@ -2617,6 +2705,291 @@ def _log_claim_checks(
             deployment_id,
             len(not_asked),
             MAX_CHECKS_PER_SELECTION,
+        )
+
+
+# =============================================================================
+# The record of a selection
+# =============================================================================
+
+
+class _RecordFacts(NamedTuple):
+    """What a selection found and did, gathered once so each indexer's entry in the record can
+    be read off it.
+
+    ``rows`` is the scored row to read each indexer's numbers from: the one it was picked on if
+    this selection picked it, else its row as the selection ended. ``left`` gives why a member
+    left the group during the selection, ``passed_over`` the candidates skipped to keep the
+    group spread, and ``pools`` each candidate's pool in the search that picked it or, for one
+    not picked, in the search for the last indexer picked.
+    """
+
+    members: frozenset[str]
+    final_group: frozenset[str]
+    dropped: Mapping[str, str]
+    filtered_out: Mapping[str, str]
+    claimed: frozenset[str]
+    counted: Optional[frozenset[str]]
+    checks: Optional[_ClaimChecks]
+    stale: frozenset[str]
+    unpickable: Mapping[str, list[str]]
+    rows: Mapping[str, pd.Series]
+    left: Mapping[str, str]
+    passed_over: frozenset[str]
+    pools: Mapping[str, str]
+
+
+def _steps_as_facts(
+    steps: Sequence[Step],
+) -> tuple[dict[str, Pick], dict[str, str], set[str], dict[str, str]]:
+    """Read a selection's steps into the search that put each indexer in the group, why each
+    member left it, who was passed over to keep it spread, and each candidate's pool, which
+    for one not picked is its pool in the search for the last indexer picked.
+    """
+    picks: dict[str, Pick] = {}
+    left: dict[str, str] = {}
+    passed_over: set[str] = set()
+    pools: dict[str, str] = {}
+    for step in steps:
+        gone = step.indexer if step.action == "removed" else step.replaced
+        if gone is not None:
+            left[gone] = "over_target" if step.action == "removed" else "replaced"
+            picks.pop(gone, None)
+        if step.action != "removed":
+            left.pop(step.indexer, None)
+        if step.pick is not None:
+            picks[step.indexer] = step.pick
+            passed_over.update(step.pick.passed_over)
+            pools = dict(step.pick.pools)
+    pools.update({indexer: pick.pool for indexer, pick in picks.items()})
+    return picks, left, passed_over, pools
+
+
+def _scored_rows(
+    processor: Optional[IndexerSelector], picks: Mapping[str, Pick]
+) -> dict[str, pd.Series]:
+    """Each scored indexer's row: the one it was picked on, else its first as selection ended."""
+    rows: dict[str, pd.Series] = {}
+    if processor is None or "indexer" not in processor.data.columns:
+        return rows
+    for _, row in processor.data.iterrows():
+        indexer = row["indexer"]
+        if isinstance(indexer, str) and indexer not in rows:
+            rows[indexer] = picks[indexer].row if indexer in picks else row
+    return rows
+
+
+def _record_facts(request: SelectionRequest, run: _SelectionRun) -> _RecordFacts:
+    selection, processor = run.selection, run.processor
+    picks, left, passed_over, pools = _steps_as_facts(processor.steps if processor else [])
+    return _RecordFacts(
+        members=frozenset(request.existing_indexers or []),
+        final_group=frozenset(indexer.id for indexer in run.response.indexers),
+        dropped=selection.dropped if selection else {},
+        filtered_out=selection.filtered_out if selection else {},
+        claimed=frozenset(indexer.lower() for indexer in (selection.synced if selection else ())),
+        counted=frozenset(processor.synced_indexers) if processor else None,
+        checks=run.checks,
+        stale=frozenset(selection.stale if selection else ()),
+        unpickable=processor.left_out_reasons() if processor else {},
+        rows=_scored_rows(processor, picks),
+        left=left,
+        passed_over=frozenset(passed_over),
+        pools=pools,
+    )
+
+
+def _sync_status(indexer: str, facts: _RecordFacts) -> Optional[str]:
+    """What the selection made of the indexer's claim to have synced the deployment, as
+    RecordedCandidate.sync_status sets out; None when no selection ran.
+    """
+    if facts.counted is None:
+        return None
+    claimant = indexer.lower()
+    if claimant not in facts.claimed:
+        return "not_synced"
+    checks = facts.checks
+    if checks is not None and claimant in checks.unconfirmed:
+        return "unconfirmed"
+    if checks is not None and claimant in checks.asked:
+        return "confirmed"
+    return "synced" if claimant in facts.counted else "set_aside"
+
+
+def _left_out_reasons(indexer: str, facts: _RecordFacts) -> list[str]:
+    """Why the indexer is not in the final group, as RecordedCandidate.reasons sets out."""
+    if indexer in facts.final_group:
+        return []
+    if indexer in facts.left:
+        return [facts.left[indexer]]
+    reasons: list[str] = []
+    if facts.dropped.get(indexer) == _BLOCKLISTED:
+        reasons.append(_BLOCKLISTED)
+    elif indexer in facts.dropped and indexer in facts.filtered_out:
+        reasons.append(facts.filtered_out[indexer])
+    reasons += [reason for reason in facts.unpickable.get(indexer, []) if reason not in reasons]
+    if reasons or indexer not in facts.rows:
+        return reasons
+    return ["decentralisation"] if indexer in facts.passed_over else ["group_full"]
+
+
+def _text_or_none(value: Any) -> Optional[str]:
+    return None if _is_missing(value) else str(value)
+
+
+def _finite_or_none(value: Any) -> Optional[float]:
+    number = None if _is_missing(value) else float(value)
+    return number if number is not None and math.isfinite(number) else None
+
+
+def _finite(parts: Mapping[str, float]) -> dict[str, float]:
+    """The parts that are finite numbers, since JSON can't hold any other."""
+    return {name: part for name, part in parts.items() if math.isfinite(part)}
+
+
+def _recorded_candidate(indexer: str, facts: _RecordFacts) -> RecordedCandidate:
+    row = facts.rows.get(indexer)
+    total, factors, components = (None, {}, {}) if row is None else _score_parts(row)
+    return RecordedCandidate.model_validate(
+        {
+            "indexer": indexer,
+            "member": indexer in facts.members,
+            "picked": indexer in facts.final_group,
+            "weighted_score": _finite_or_none(total),
+            "factors": _finite(factors),
+            "components": _finite(components),
+            "org": None if row is None else _text_or_none(row.get("org")),
+            "location": None if row is None else _text_or_none(row.get("destination_loc")),
+            "sync_status": _sync_status(indexer, facts),
+            "stale": indexer in facts.stale,
+            "pool": facts.pools.get(indexer),
+            "reasons": _left_out_reasons(indexer, facts),
+            "unscored_reason": None
+            if row is not None
+            else facts.filtered_out.get(indexer, "no_score_row"),
+        }
+    )
+
+
+def _recorded_candidates(request: SelectionRequest, facts: _RecordFacts) -> list[RecordedCandidate]:
+    """Every scored indexer, best total first, then each member sent that has no score."""
+    scored = [_recorded_candidate(indexer, facts) for indexer in facts.rows]
+    scored.sort(key=lambda entry: (entry.weighted_score is None, -(entry.weighted_score or 0.0)))
+    unscored = [
+        _recorded_candidate(member, facts)
+        for member in dict.fromkeys(request.existing_indexers or [])
+        if member not in facts.rows
+    ]
+    return scored + unscored
+
+
+def _recorded_filtered_out(facts: _RecordFacts) -> list[RecordedFilteredOut]:
+    """Every loaded indexer the price checks left out, other than the members listed among the
+    candidates, in the order the checks run and then by address.
+    """
+    left_out = [
+        (PRICE_CHECKS.index(check), indexer, check)
+        for indexer, check in facts.filtered_out.items()
+        if indexer not in facts.members
+    ]
+    return [
+        RecordedFilteredOut.model_validate({"indexer": indexer, "reason": check})
+        for _, indexer, check in sorted(left_out)
+    ]
+
+
+def _recorded_step(step: Step) -> RecordedStep:
+    pick = step.pick
+    spread = None if pick is None else ("met" if pick.kept_spread else "fallback")
+    score = step.score if pick is None else pick.row.get("weighted_score")
+    return RecordedStep.model_validate(
+        {
+            "action": step.action,
+            "indexer": step.indexer,
+            "replaced": step.replaced,
+            "pool": None if pick is None else pick.pool,
+            "weighted_score": _finite_or_none(score),
+            "decentralisation": spread,
+            "passed_over": [] if pick is None else list(pick.passed_over),
+        }
+    )
+
+
+def _recorded_request(request: SelectionRequest) -> RecordedRequest:
+    pending = (request.pending_agreements or {}).values()
+    return RecordedRequest(
+        deployment_id=request.deployment_id,
+        chain_id=request.chain_id,
+        num_candidates=request.num_candidates,
+        max_grt_per_30_days=request.max_grt_per_30_days,
+        max_grt_per_billion_entities_per_30_days=request.max_grt_per_billion_entities_per_30_days,
+        existing_indexers=list(request.existing_indexers or []),
+        blocklist=list(request.blocklist or []),
+        pending_indexers=sorted({indexer for indexers in pending for indexer in indexers}),
+        declined_indexers=list((request.declined_indexers or {}).get(request.deployment_id, [])),
+        optimistic_dips_fees=dict(request.optimistic_dips_fees or {}),
+    )
+
+
+def _recorded_sync_check(checks: Optional[_ClaimChecks]) -> Optional[RecordedSyncCheck]:
+    if checks is None:
+        return None
+    return RecordedSyncCheck(
+        asked=checks.asked,
+        unconfirmed=checks.unconfirmed,
+        not_asked=checks.not_asked,
+        decided_again=bool(checks.unconfirmed or checks.not_asked),
+    )
+
+
+def _recorded_decentralisation(
+    processor: Optional[IndexerSelector],
+) -> Optional[RecordedDecentralisation]:
+    if processor is None:
+        return None
+    fallbacks = [step for step in processor.steps if step.pick and not step.pick.kept_spread]
+    return RecordedDecentralisation(met=processor.group_is_spread(), fell_back=bool(fallbacks))
+
+
+def _selection_record(request: SelectionRequest, run: _SelectionRun) -> SelectionRecord:
+    """The record of 1 selection, read from what the selection itself found and did. ``request``
+    is the request as the caller sent it, with every member still in its group.
+    """
+    facts = _record_facts(request, run)
+    processor = run.processor
+    # Only these 2 outcomes read the loaded scores, so only they have anyone to list.
+    read_scores = run.outcome in ("selected", "no_candidates")
+    return SelectionRecord.model_validate(
+        {
+            "selection_id": uuid.uuid4().hex,
+            "selected_at": datetime.now(timezone.utc).isoformat(),
+            "outcome": run.outcome,
+            "request": _recorded_request(request),
+            "candidates": _recorded_candidates(request, facts) if read_scores else [],
+            "filtered_out": _recorded_filtered_out(facts),
+            "steps": [_recorded_step(step) for step in (processor.steps if processor else [])],
+            "sync_check": _recorded_sync_check(run.checks),
+            "stale_fill": processor.filled_with_stale if processor else False,
+            "final_group": [indexer.id for indexer in run.response.indexers],
+            "decentralisation": _recorded_decentralisation(processor),
+        }
+    )
+
+
+def _record_selection(request: SelectionRequest, run: _SelectionRun) -> None:
+    """Log the selection's record as 1 JSON line.
+
+    The answer is already settled when this runs, so a record that can't be written is logged
+    as an error and left out, and the selection it was for still answers.
+    """
+    try:
+        record = record_json(_selection_record(request, run))
+        logger.info("%s%s", LOG_PREFIX, record)
+    except Exception:
+        logger.exception(
+            "Could not write the record of the selection for deployment %s; its answer is "
+            "not affected",
+            request.deployment_id,
         )
 
 
