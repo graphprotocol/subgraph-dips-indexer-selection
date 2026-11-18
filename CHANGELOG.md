@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.16.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.15.0...v2.16.0) (2026-11-18)
+
+
+### Added
+
+* **api:** record why each selection picked its indexers ([#466](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/466)) ([dd4ec36](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/dd4ec36dd48bc69ea9cccf7183aa44a316e9c757))
+
 ## [2.15.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.14.0...v2.15.0) (2026-11-16)
 
 
