@@ -474,6 +474,15 @@ class IndexerSelector:
         spread, so a target of 1 keeps the best scorer. A member with no score counts as 0.
         """
         totals = {member: self._score_of(member) or 0.0 for member in self.current_group}
+        if len(self.current_group) > self.target_size and any(map(pd.isna, totals.values())):
+            logger.error(
+                "deployment=%s kept a group of %d above its target of %d: its totals are "
+                "missing, as when scoring failed, so trimming would cancel members at random",
+                self.deployment_id,
+                len(self.current_group),
+                self.target_size,
+            )
+            return
         ranked = sorted(self.current_group, key=totals.__getitem__)
         spread_possible = self.target_size >= 2
         while len(self.current_group) > self.target_size:

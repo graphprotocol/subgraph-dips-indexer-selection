@@ -157,6 +157,16 @@ class TestLeaving:
         assert selector.current_group == ["B"]
         assert selector.steps == [Step("removed", "A", score=0.5)]
 
+    def test_a_group_whose_totals_failed_is_left_as_it_is(self):
+        """With scoring failed every total is NaN, so trimming would cancel members at random."""
+        nan = float("nan")
+        selector = _selector({"A": nan, "B": nan, "C": nan}, group=("A", "B", "C"), target=1)
+
+        selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["A", "B", "C"]
+        assert selector.steps == []
+
     def test_trimming_to_a_target_of_1_keeps_the_best_scorer(self):
         """Only taking out H keeps the 3 spread, but a group of 1 needs no spread, so H stays."""
         selector = _selector({"H": 0.9, "X": 0.5, "Y": 0.1}, group=("H", "X", "Y"), target=1)
