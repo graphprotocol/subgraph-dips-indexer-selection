@@ -195,9 +195,9 @@ class RecordedStep(BaseModel):
         "decided on, which is 0 for a member with no score."
     )
     decentralisation: Optional[Literal["met", "fallback"]] = Field(
-        description="met: the pick left the group spread over 2 operators and 2 locations, or "
-        "the group is too small to need it. fallback: no candidate could, so the best total "
-        "was taken regardless. Null for a removal."
+        description="met: the pick or removal left the group spread over 2 operators and 2 "
+        "locations, or the group is too small to need it. fallback: no candidate or removal "
+        "could, so the best total was taken, or the lowest removed, regardless."
     )
     passed_over: list[str] = Field(
         description="Candidates ranked ahead of the pick that were skipped because they would "
@@ -229,7 +229,7 @@ class RecordedDecentralisation(BaseModel):
         description="Whether it holds at least 2 operators and 2 locations; null for a group "
         "of fewer than 2, which has no such rule to meet."
     )
-    fell_back: bool = Field(description="True when at least 1 pick was a fallback.")
+    fell_back: bool = Field(description="True when at least 1 pick or removal was a fallback.")
 
 
 class SelectionRecord(BaseModel):

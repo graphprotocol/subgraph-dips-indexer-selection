@@ -123,7 +123,7 @@ class TestLeaving:
         selector._assign_indexers_to_subgraph()
 
         assert selector.current_group == ["B", "C"]
-        assert selector.steps == [Step("removed", "A", score=0.5)]
+        assert selector.steps == [Step("removed", "A", score=0.5, kept_spread=True)]
 
     def test_a_removal_that_keeps_the_group_spread_is_preferred_over_a_lower_total(self):
         """Taking out A, the lowest, would leave B and C in 1 operator, so C goes instead."""
@@ -135,7 +135,7 @@ class TestLeaving:
         selector._assign_indexers_to_subgraph()
 
         assert selector.current_group == ["A", "B"]
-        assert selector.steps == [Step("removed", "C", score=0.7)]
+        assert selector.steps == [Step("removed", "C", score=0.7, kept_spread=True)]
 
     def test_the_lowest_total_is_removed_when_no_removal_keeps_the_group_spread(self):
         orgs = dict.fromkeys("ABC", "shared")
@@ -146,7 +146,7 @@ class TestLeaving:
         selector._assign_indexers_to_subgraph()
 
         assert selector.current_group == ["B", "C"]
-        assert selector.steps == [Step("removed", "A", score=0.5)]
+        assert selector.steps == [Step("removed", "A", score=0.5, kept_spread=False)]
 
     def test_a_group_shrinks_to_a_target_of_1(self):
         """A group of 1 can't be spread, so the spread can't decide which member stays."""
@@ -155,7 +155,7 @@ class TestLeaving:
         selector._assign_indexers_to_subgraph()
 
         assert selector.current_group == ["B"]
-        assert selector.steps == [Step("removed", "A", score=0.5)]
+        assert selector.steps == [Step("removed", "A", score=0.5, kept_spread=True)]
 
     def test_a_group_whose_totals_failed_is_left_as_it_is(self):
         """With scoring failed every total is NaN, so trimming would cancel members at random."""
@@ -200,7 +200,7 @@ class TestLeaving:
 
         selector._assign_indexers_to_subgraph()
 
-        assert selector.steps == [Step("removed", "X", score=0.0)]
+        assert selector.steps == [Step("removed", "X", score=0.0, kept_spread=True)]
 
     def test_a_failing_member_swapped_out_is_a_step_naming_both(self):
         scores = {"A": 0.05, "B": 0.9, "C": 0.7, "D": 0.8}

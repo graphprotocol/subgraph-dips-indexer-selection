@@ -107,7 +107,8 @@ class Pick(NamedTuple):
 class Step(NamedTuple):
     """1 change a selection made to the group, noted as it happened: ``indexer`` was "added",
     "removed", or swapped in for the member ``replaced``. ``pick`` is the search that found an
-    indexer added or swapped in, and ``score`` the total a removal was decided on.
+    indexer added or swapped in. For a removal, ``score`` is the total it was decided on, and
+    ``kept_spread`` is False when no removal could keep the group spread.
     """
 
     action: str
@@ -115,6 +116,7 @@ class Step(NamedTuple):
     replaced: Optional[IndexerId] = None
     pick: Optional[Pick] = None
     score: Optional[float] = None
+    kept_spread: Optional[bool] = None
 
 
 class IndexerSelector:
@@ -484,7 +486,8 @@ class IndexerSelector:
             )
             return
         ranked = sorted(self.current_group, key=totals.__getitem__)
-        spread_possible = self.target_size >= 2
+        spread_needed = self.target_size >= 2
+        spread_possible = spread_needed
         while len(self.current_group) > self.target_size:
             member = ranked[0]
             if spread_possible:
@@ -495,23 +498,25 @@ class IndexerSelector:
                 if keeper is not None:
                     member = keeper
             ranked.remove(member)
-            self._remove_member(member, totals[member])
+            kept_spread = spread_possible or not spread_needed
+            self._remove_member(member, totals[member], kept_spread=kept_spread)
 
     def _keeps_spread_without(self, member: IndexerId) -> bool:
         rest = self.current_group.copy()
         rest.remove(member)
         return bool(self._meets_decentralization_requirements_indexer_removal(rest))
 
-    def _remove_member(self, indexer: IndexerId, score: float) -> None:
+    def _remove_member(self, indexer: IndexerId, score: float, kept_spread: bool) -> None:
         self.current_group.remove(indexer)
-        self.steps.append(Step("removed", indexer, score=score))
+        self.steps.append(Step("removed", indexer, score=score, kept_spread=kept_spread))
         logger.info(
-            "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)",
+            "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)%s",
             self.deployment_id,
             indexer[:10],
             score,
             len(self.current_group),
             self.target_size,
+            "" if kept_spread else ", without keeping the group spread, since no removal could",
         )
 
     def _meets_decentralization_requirements_indexer_removal(self, group):

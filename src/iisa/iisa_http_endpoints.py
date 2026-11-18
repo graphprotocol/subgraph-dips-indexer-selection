@@ -2928,7 +2928,8 @@ def _recorded_filtered_out(facts: _RecordFacts) -> list[RecordedFilteredOut]:
 
 def _recorded_step(step: Step) -> RecordedStep:
     pick = step.pick
-    spread = None if pick is None else ("met" if pick.kept_spread else "fallback")
+    kept_spread = step.kept_spread if pick is None else pick.kept_spread
+    spread = None if kept_spread is None else ("met" if kept_spread else "fallback")
     score = step.score if pick is None else pick.row.get("weighted_score")
     return RecordedStep.model_validate(
         {
@@ -2975,7 +2976,11 @@ def _recorded_decentralisation(
 ) -> Optional[RecordedDecentralisation]:
     if processor is None:
         return None
-    fallbacks = [step for step in processor.steps if step.pick and not step.pick.kept_spread]
+    fallbacks = [
+        step
+        for step in processor.steps
+        if (step.pick and not step.pick.kept_spread) or step.kept_spread is False
+    ]
     return RecordedDecentralisation(met=processor.group_is_spread(), fell_back=bool(fallbacks))
 
 
