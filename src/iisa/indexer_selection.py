@@ -468,8 +468,10 @@ class IndexerSelector:
         )
 
     def _remove_indexers_from_group(self):
-        """
-        Remove worst indexers until group has target_size indexers.
+        """Remove the lowest-scoring member whose removal keeps the group spread over 2 operators
+        and 2 locations, until the group is down to target_size. When no removal keeps it spread,
+        as for a target of 1 or members that all share an operator or a location, the lowest
+        scorer goes anyway, so the group never stays above its target.
         """
         while len(self.current_group) > self.target_size:
             indexer_scores = []
@@ -485,24 +487,28 @@ class IndexerSelector:
             # Sort by score, worst (lowest) first
             indexer_scores.sort(key=lambda x: x[1])
 
-            for indexer, score in indexer_scores:
-                temp_group = self.current_group.copy()
-                temp_group.remove(indexer)
+            def without(member: IndexerId) -> list[IndexerId]:
+                rest = self.current_group.copy()
+                rest.remove(member)
+                return rest
 
-                if self._meets_decentralization_requirements_indexer_removal(temp_group):
-                    self.current_group.remove(indexer)
-                    self.steps.append(Step("removed", indexer, score=score))
-                    logger.info(
-                        "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)",
-                        self.deployment_id,
-                        indexer[:10],
-                        score,
-                        len(self.current_group),
-                        self.target_size,
-                    )
-                    break
-            else:
-                break
+            keeps_spread = (
+                (indexer, score)
+                for indexer, score in indexer_scores
+                if self._meets_decentralization_requirements_indexer_removal(without(indexer))
+            )
+            indexer, score = next(keeps_spread, indexer_scores[0])
+
+            self.current_group.remove(indexer)
+            self.steps.append(Step("removed", indexer, score=score))
+            logger.info(
+                "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)",
+                self.deployment_id,
+                indexer[:10],
+                score,
+                len(self.current_group),
+                self.target_size,
+            )
 
     def _meets_decentralization_requirements_indexer_removal(self, group):
         """
