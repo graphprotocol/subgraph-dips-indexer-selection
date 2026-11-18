@@ -469,14 +469,13 @@ class IndexerSelector:
 
     def _remove_indexers_from_group(self):
         """Remove the lowest-scoring member whose removal keeps the group spread over 2 operators
-        and 2 locations, until the group is down to target_size. When no removal keeps it spread,
-        as for a target of 1 or members that all share an operator or a location, the lowest
-        scorer goes anyway, so the group never stays above its target. A member with no score
-        counts as 0.
+        and 2 locations, until the group is down to target_size. When none does, as when members
+        share an operator or a location, the lowest scorer goes anyway. A group of 1 needs no
+        spread, so a target of 1 keeps the best scorer. A member with no score counts as 0.
         """
         totals = {member: self._score_of(member) or 0.0 for member in self.current_group}
         ranked = sorted(self.current_group, key=totals.__getitem__)
-        spread_possible = True
+        spread_possible = self.target_size >= 2
         while len(self.current_group) > self.target_size:
             member = ranked[0]
             if spread_possible:
