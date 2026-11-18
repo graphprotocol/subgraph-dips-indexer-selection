@@ -471,42 +471,28 @@ class IndexerSelector:
         """Remove the lowest-scoring member whose removal keeps the group spread over 2 operators
         and 2 locations, until the group is down to target_size. When no removal keeps it spread,
         as for a target of 1 or members that all share an operator or a location, the lowest
-        scorer goes anyway, so the group never stays above its target.
+        scorer goes anyway, so the group never stays above its target. A member with no score
+        counts as 0.
         """
+        totals = {member: self._score_of(member) or 0.0 for member in self.current_group}
+        ranked = sorted(self.current_group, key=totals.__getitem__)
+        spread_possible = True
         while len(self.current_group) > self.target_size:
-            indexer_scores = []
-            for indexer in self.current_group:
-                row = self.data[self.data["indexer"] == indexer]
-                score = (
-                    row["weighted_score"].iloc[0]
-                    if not row.empty and "weighted_score" in row.columns
-                    else 0.0
-                )
-                indexer_scores.append((indexer, score))
+            member = ranked[0]
+            if spread_possible:
+                keeper = next((m for m in ranked if self._keeps_spread_without(m)), None)
+                # Removing members only narrows the group, so once no removal keeps it spread
+                # none ever will, and the rest go lowest first without checking again.
+                spread_possible = keeper is not None
+                if keeper is not None:
+                    member = keeper
+            ranked.remove(member)
+            self._remove_member(member, totals[member])
 
-            # Sort by score, worst (lowest) first
-            indexer_scores.sort(key=lambda x: x[1])
-
-            def without(member: IndexerId) -> list[IndexerId]:
-                rest = self.current_group.copy()
-                rest.remove(member)
-                return rest
-
-            keeps_spread = next(
-                (
-                    (indexer, score)
-                    for indexer, score in indexer_scores
-                    if self._meets_decentralization_requirements_indexer_removal(without(indexer))
-                ),
-                None,
-            )
-            if keeps_spread is not None:
-                self._remove_member(*keeps_spread)
-                continue
-            # Removing members only narrows the group, so no later removal can keep it spread
-            # either, and the lowest scorers go down to the target without checking again.
-            for indexer, score in indexer_scores[: len(self.current_group) - self.target_size]:
-                self._remove_member(indexer, score)
+    def _keeps_spread_without(self, member: IndexerId) -> bool:
+        rest = self.current_group.copy()
+        rest.remove(member)
+        return bool(self._meets_decentralization_requirements_indexer_removal(rest))
 
     def _remove_member(self, indexer: IndexerId, score: float) -> None:
         self.current_group.remove(indexer)
