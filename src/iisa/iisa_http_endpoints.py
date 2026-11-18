@@ -256,7 +256,10 @@ MAX_SELECTION_BODY_BYTES = 4 * 1024 * 1024
 # fail_fast stops checking a list or map at its first bad entry. Without it each bad entry is
 # its own error, so a body of thousands of them builds thousands of errors in memory.
 _IdText = Annotated[str, Field(max_length=_MAX_ID_CHARS)]
-_IndexerList = Annotated[list[_IdText], Field(max_length=_MAX_INDEXERS, fail_fast=True)]
+# The score job pushes indexer addresses in lowercase, so a request's are read the same way.
+# Deployment ids stay as sent, since case matters in an IPFS hash.
+_IndexerIdText = Annotated[_IdText, AfterValidator(str.lower)]
+_IndexerList = Annotated[list[_IndexerIdText], Field(max_length=_MAX_INDEXERS, fail_fast=True)]
 _IndexersByDeployment = Annotated[
     dict[_IdText, _IndexerList], Field(max_length=_MAX_DEPLOYMENTS, fail_fast=True)
 ]
@@ -298,7 +301,7 @@ class SelectionRequest(BaseModel):
     # one would be silently treated as 0, so each is a 422.
     optimistic_dips_fees: Optional[
         Annotated[
-            dict[_IdText, Annotated[float, Field(ge=0, allow_inf_nan=False)]],
+            dict[_IndexerIdText, Annotated[float, Field(ge=0, allow_inf_nan=False)]],
             Field(max_length=_MAX_INDEXERS, fail_fast=True),
         ]
     ] = None

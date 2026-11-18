@@ -14,7 +14,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from iisa import iisa_http_endpoints, score_loader
-from iisa.iisa_http_endpoints import MAX_SELECTION_BODY_BYTES, _SelectionBodyLimit, app
+from iisa.iisa_http_endpoints import (
+    MAX_SELECTION_BODY_BYTES,
+    SelectionRequest,
+    _SelectionBodyLimit,
+    app,
+)
 
 CHAIN = "arbitrum-one"
 INDEXERS = ["0x" + "a1" * 20, "0x" + "b2" * 20, "0x" + "c3" * 20]
@@ -116,6 +121,59 @@ def test_the_published_schema_says_unknown_fields_are_refused():
     schema = app.openapi()["components"]["schemas"]["SelectionRequest"]
 
     assert schema["additionalProperties"] is False
+
+
+# --- Address case ---------------------------------------------------------------------------
+
+
+def _capitals(indexer: str) -> str:
+    """The address with its hex in capitals, as a checksummed address partly is."""
+    return "0x" + indexer[2:].upper()
+
+
+def _picked(response) -> list[str]:
+    assert response.status_code == 200, response.text
+    return [indexer["id"] for indexer in response.json()["indexers"]]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"blocklist": [_capitals(INDEXERS[0])]},
+        {"declined_indexers": {"QmDeployment": [_capitals(INDEXERS[0])]}},
+        {"pending_agreements": {"QmOther": [_capitals(INDEXERS[0])]}},
+    ],
+    ids=["blocklist", "declined", "pending"],
+)
+def test_an_indexer_left_out_in_capitals_is_still_left_out(fields):
+    assert INDEXERS[0] not in _picked(_post(_request(num_candidates=3, **fields)))
+
+
+def test_a_member_named_in_capitals_is_kept_once_in_lowercase():
+    picked = _picked(_post(_request(num_candidates=3, existing_indexers=[_capitals(INDEXERS[0])])))
+
+    assert sorted(picked) == sorted(INDEXERS)
+
+
+def test_expected_dips_fees_named_in_capitals_reach_their_indexer():
+    request = SelectionRequest(**_request(optimistic_dips_fees={_capitals(INDEXERS[0]): 50.0}))
+
+    assert request.optimistic_dips_fees == {INDEXERS[0]: 50.0}
+
+
+def test_deployment_ids_keep_their_case():
+    """A deployment id is an IPFS hash, in which case matters."""
+    request = SelectionRequest(
+        **_request(
+            deployment_id="QmDeployment",
+            pending_agreements={"QmOther": [INDEXERS[0]]},
+            declined_indexers={"QmDeployment": [INDEXERS[1]]},
+        )
+    )
+
+    assert request.deployment_id == "QmDeployment"
+    assert list(request.pending_agreements or {}) == ["QmOther"]
+    assert list(request.declined_indexers or {}) == ["QmDeployment"]
 
 
 # --- Sizes ----------------------------------------------------------------------------------
