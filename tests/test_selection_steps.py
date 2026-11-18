@@ -157,6 +157,23 @@ class TestLeaving:
         assert selector.current_group == ["B"]
         assert selector.steps == [Step("removed", "A", score=0.5)]
 
+    def test_once_no_removal_keeps_the_group_spread_the_rest_go_without_checking_again(self):
+        """Removing members only narrows a group, so once 1 pass finds no removal that keeps it
+        spread, none can, and a group of thousands isn't checked again for every member shed."""
+        orgs = dict.fromkeys("ABCDE", "shared")
+        scores = {"A": 0.1, "B": 0.5, "C": 0.3, "D": 0.9, "E": 0.7}
+        selector = _selector(scores, group=tuple("ABCDE"), target=1, orgs=orgs)
+        check = selector._meets_decentralization_requirements_indexer_removal
+
+        with patch.object(
+            selector, "_meets_decentralization_requirements_indexer_removal", wraps=check
+        ) as spread_check:
+            selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["D"]
+        assert [step.indexer for step in selector.steps] == ["A", "C", "B", "E"]
+        assert spread_check.call_count == 5
+
     def test_a_member_with_no_score_is_removed_on_a_total_of_0(self):
         selector = _selector({"B": 0.9, "C": 0.7}, group=("X", "B", "C"), target=2)
 

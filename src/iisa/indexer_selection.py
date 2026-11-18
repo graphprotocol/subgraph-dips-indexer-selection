@@ -492,23 +492,33 @@ class IndexerSelector:
                 rest.remove(member)
                 return rest
 
-            keeps_spread = (
-                (indexer, score)
-                for indexer, score in indexer_scores
-                if self._meets_decentralization_requirements_indexer_removal(without(indexer))
+            keeps_spread = next(
+                (
+                    (indexer, score)
+                    for indexer, score in indexer_scores
+                    if self._meets_decentralization_requirements_indexer_removal(without(indexer))
+                ),
+                None,
             )
-            indexer, score = next(keeps_spread, indexer_scores[0])
+            if keeps_spread is not None:
+                self._remove_member(*keeps_spread)
+                continue
+            # Removing members only narrows the group, so no later removal can keep it spread
+            # either, and the lowest scorers go down to the target without checking again.
+            for indexer, score in indexer_scores[: len(self.current_group) - self.target_size]:
+                self._remove_member(indexer, score)
 
-            self.current_group.remove(indexer)
-            self.steps.append(Step("removed", indexer, score=score))
-            logger.info(
-                "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)",
-                self.deployment_id,
-                indexer[:10],
-                score,
-                len(self.current_group),
-                self.target_size,
-            )
+    def _remove_member(self, indexer: IndexerId, score: float) -> None:
+        self.current_group.remove(indexer)
+        self.steps.append(Step("removed", indexer, score=score))
+        logger.info(
+            "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)",
+            self.deployment_id,
+            indexer[:10],
+            score,
+            len(self.current_group),
+            self.target_size,
+        )
 
     def _meets_decentralization_requirements_indexer_removal(self, group):
         """
