@@ -405,6 +405,7 @@ class TestOpenApiErrorResponses:
             ("get", "/freshness", {"401"}),
             ("post", "/get-score", {"400", "401", "503"}),
             ("post", "/select-indexers", {"400", "413", "503"}),
+            ("get", "/selections", {"401"}),
         ],
     )
     def test_lists_each_error_answer(self, method, path, codes):
@@ -2665,6 +2666,74 @@ class TestFilterByPrice:
         result, reason = _filter_by_price(self._make_history([row]), "arb", 1.0)
         assert list(result["indexer"]) == ["0xA"]
         assert reason == ""
+
+    def test_names_the_check_that_dropped_each_indexer_when_asked(self):
+        """Each check drops 1 indexer here, in the order the checks run, and the rest pass."""
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        entity = "dips_min_grt_per_billion_entities_per_30_days"
+        df = self._make_history(
+            [
+                {**self._priced("0xKept", ["arb"], {"arb": 100}), entity: 200},
+                self._priced("0xNoInfo", ["arb"], {"arb": 100}, dips_info=False),
+                self._priced("0xOtherChain", ["mainnet"], {"arb": 100}),
+                self._priced("0xUnpriced", ["arb"], {"mainnet": 100}),
+                self._priced("0xDear", ["arb"], {"arb": 9000}),
+                {**self._priced("0xBadEntity", ["arb"], {"arb": 100}), entity: "abc"},
+                {**self._priced("0xDearEntity", ["arb"], {"arb": 100}), entity: 900},
+            ]
+        )
+        left_out: dict[str, str] = {}
+
+        kept, _ = _filter_by_price(df, "arb", 5000.0, 500.0, left_out)
+
+        assert list(kept["indexer"]) == ["0xKept"]
+        assert list(left_out.items()) == [
+            ("0xNoInfo", "no_dips_info"),
+            ("0xOtherChain", "chain_not_supported"),
+            ("0xUnpriced", "no_price_for_chain"),
+            ("0xDear", "over_budget"),
+            ("0xBadEntity", "invalid_entity_price"),
+            ("0xDearEntity", "over_entity_budget"),
+        ]
+
+    def test_names_the_check_that_emptied_the_list(self):
+        """The filter stops at the check that leaves nobody, and still names it for each."""
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                self._priced("0xNoInfo", ["arb"], {"arb": 100}, dips_info=False),
+                self._priced("0xDear", ["arb"], {"arb": 9000}),
+                self._priced("0xDearer", ["arb"], {"arb": 9500}),
+            ]
+        )
+        left_out: dict[str, str] = {}
+
+        kept, reason = _filter_by_price(df, "arb", 5000.0, left_out=left_out)
+
+        assert kept.empty and "exceed payment ceiling" in reason
+        assert left_out == {
+            "0xNoInfo": "no_dips_info",
+            "0xDear": "over_budget",
+            "0xDearer": "over_budget",
+        }
+
+    def test_an_indexer_with_a_row_that_passes_is_not_named_as_dropped(self):
+        """An indexer is left out only when none of its rows passes."""
+        from iisa.iisa_http_endpoints import _filter_by_price
+
+        df = self._make_history(
+            [
+                self._priced("0xTwice", ["arb"], {"arb": 9000}),
+                self._priced("0xTwice", ["arb"], {"arb": 100}),
+            ]
+        )
+        left_out: dict[str, str] = {}
+
+        kept, _ = _filter_by_price(df, "arb", 5000.0, left_out=left_out)
+
+        assert len(kept) == 1 and left_out == {}
 
     def test_does_not_modify_the_input_frame(self):
         from iisa.iisa_http_endpoints import _filter_by_price

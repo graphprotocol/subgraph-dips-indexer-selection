@@ -69,6 +69,7 @@ READS = [
     pytest.param("GET", f"/dips-indexers?chain={CHAIN}", None, id="dips-indexers"),
     pytest.param("POST", "/get-score", {"indexer_id": INDEXER}, id="get-score"),
     pytest.param("GET", "/freshness", None, id="freshness"),
+    pytest.param("GET", "/selections?deployment=QmOne", None, id="selections"),
 ]
 WRITES = [
     pytest.param("POST", "/scores", [_score_record(INDEXER)], id="push-scores"),
