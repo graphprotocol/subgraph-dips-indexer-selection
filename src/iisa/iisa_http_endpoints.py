@@ -17,6 +17,7 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - GET /selections - The record of each recent selection for a required ?deployment (read token)
 """
 
+import contextlib
 import hmac
 import itertools
 import json
@@ -24,6 +25,7 @@ import logging
 import math
 import numbers
 import os
+import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -751,6 +753,8 @@ class IISAState:
         self.lapse_warnings = LogLimit(LAPSE_WARNING_INTERVAL_MINUTES)
         # In memory only, so a restart starts with none; each record's log line is what lasts.
         self.selection_records = SelectionRecordStore()
+        # A threading lock, since the sync push handler runs on FastAPI's threadpool.
+        self._scores_push_lock = threading.Lock()
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -839,12 +843,14 @@ class IISAState:
 
         # Transform succeeded — the payload is known to be loadable.
         # Safe to write to disk; a restart will now reload successfully.
-        _atomic_write_json(scores_path, records)
+        # The lock keeps an overlapping push from landing between the write and the commit.
+        with self._scores_push_lock:
+            _atomic_write_json(scores_path, records)
 
-        # Commit the already-validated transformed frame to in-memory state.
-        self.data_manager.commit_scores(transformed, computed_at)
-        self._history = self.data_manager.get_data()
-        return len(self._history) if self._history is not None else 0
+            # Commit the already-validated transformed frame to in-memory state.
+            self.data_manager.commit_scores(transformed, computed_at)
+            self._history = self.data_manager.get_data()
+            return len(self._history) if self._history is not None else 0
 
     def refresh_sync_status(self) -> bool:
         """Load sync status from the cache file. Returns True on success."""
@@ -911,19 +917,41 @@ class IISAState:
 
 
 def _atomic_write_json(path: str, payload: Any) -> None:
-    """Write JSON to `path` atomically via tmp + os.replace.
+    """Write JSON to `path` atomically via a temp file + os.replace.
 
-    The temporary file lives in the same directory so the rename is within
-    a single filesystem. Callers must hold no other reference to `path`
-    during the replace.
+    The temp file sits in the same directory, so the rename stays on 1 filesystem, and has its
+    own name, so overlapping writes never share one. It reaches the disk before the rename and is
+    removed on failure. Callers must hold no other reference to `path` during the replace.
     """
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(payload, f, default=str)
-    os.replace(tmp_path, path)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp_path, "x") as f:
+            json.dump(payload, f, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp_path)
+        raise
+    _fsync_directory(parent)
+
+
+def _fsync_directory(path: str) -> None:
+    """Flush a directory's entries to disk, so a rename into it survives a power cut."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        # The new file is already in place; raising now would fail a push that has landed.
+        logger.warning("Could not flush directory %s to disk after a write: %s", path, e)
 
 
 def _extract_computed_at(scores_df: pd.DataFrame) -> Optional[datetime]:

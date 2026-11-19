@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -1032,6 +1034,115 @@ class TestPushScoresEndpoint:
         assert response.status_code == 200
         assert response.json()["rows"] == 1
         assert scores_path.exists()
+
+    def test_overlapping_pushes_leave_disk_and_memory_agreeing(self, tmp_path, monkeypatch):
+        """Pushes of 2 different payloads at once, as when an operator re-runs the score job
+        while the scheduled run is pushing, all succeed and leave a whole cache file holding
+        the payload being served, so a restart serves the same scores rather than none.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        # Large enough that the writes overlap; the 2 payloads differ in size and computed_at.
+        payloads = [
+            [
+                {**self._sample_payload()[0], "indexer": f"0x{hour}{i:06d}", "computed_at": at}
+                for i in range(rows)
+            ]
+            for hour, rows in ((9, 1500), (10, 1501))
+            for at in [f"2026-04-14T{hour:02d}:00:00+00:00"]
+        ] * 2
+
+        for _ in range(5):
+            barrier = threading.Barrier(len(payloads))
+
+            def push(payload):
+                barrier.wait()
+                return client.post("/scores", json=payload).status_code
+
+            with ThreadPoolExecutor(len(payloads)) as pool:
+                codes = list(pool.map(push, payloads))
+
+            assert codes == [200] * len(payloads)
+            on_disk = json.loads(scores_path.read_text())
+            served = iisa_http_endpoints._state.data_manager.snapshot
+            assert len(on_disk) == len(served.data)
+            assert datetime.fromisoformat(on_disk[0]["computed_at"]) == served.computed_at
+            assert os.listdir(tmp_path) == ["scores.json"]
+
+    def test_push_arriving_mid_commit_waits_for_it(self, tmp_path, monkeypatch):
+        """A push arriving while another is between writing the cache file and serving its
+        scores waits for it, so the payload written last is also the one served.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        state = iisa_http_endpoints._state
+        state.initialize(Settings())
+        commit = state.data_manager.commit_scores
+        first_committing, first_may_finish = threading.Event(), threading.Event()
+
+        def slow_first_commit(transformed, computed_at):
+            if not first_committing.is_set():
+                first_committing.set()
+                first_may_finish.wait(timeout=5)
+            commit(transformed, computed_at)
+
+        monkeypatch.setattr(state.data_manager, "commit_scores", slow_first_commit)
+        pushes = [
+            threading.Thread(
+                target=state.load_scores_from_records,
+                args=([{**self._sample_payload()[0], "computed_at": at}],),
+            )
+            for at in ("2026-04-14T09:00:00+00:00", "2026-04-14T10:00:00+00:00")
+        ]
+        pushes[0].start()
+        assert first_committing.wait(timeout=5)
+        pushes[1].start()
+        pushes[1].join(timeout=0.5)
+        first_may_finish.set()
+        for push in pushes:
+            push.join()
+
+        on_disk = json.loads(scores_path.read_text())
+        served = state.data_manager.snapshot
+        assert datetime.fromisoformat(on_disk[0]["computed_at"]) == served.computed_at
+
+    def test_failed_cache_write_keeps_the_previous_cache(self, tmp_path, monkeypatch):
+        """A write that fails partway, such as on a full disk, answers 500 and leaves the
+        previous cache file and the served scores as they were, with no partial file behind.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        assert client.post("/scores", json=self._sample_payload()).status_code == 200
+        before = scores_path.read_text()
+        served = iisa_http_endpoints._state.data_manager.snapshot
+
+        def half_written(payload, f, **kwargs):
+            f.write("[{")
+            raise OSError(28, "No space left on device")
+
+        later = [{**self._sample_payload()[0], "computed_at": "2026-04-15T09:00:00+00:00"}]
+        with patch("iisa.iisa_http_endpoints.json.dump", side_effect=half_written):
+            response = client.post("/scores", json=later)
+
+        assert response.status_code == 500
+        assert scores_path.read_text() == before
+        assert iisa_http_endpoints._state.data_manager.snapshot is served
+        assert os.listdir(tmp_path) == ["scores.json"]
 
 
 class TestScoresStatusEndpoint:
