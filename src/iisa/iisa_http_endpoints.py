@@ -1253,10 +1253,10 @@ MAX_SCORES_BODY_BYTES = 32 * 1024 * 1024
 # The sync-status fetcher's push: about 50 bytes for each deployment an indexer claims and holds
 # an active allocation on, so 16 MiB holds about 330,000.
 MAX_SYNC_STATUS_BODY_BYTES = 16 * 1024 * 1024
-# The freshness prober's push: up to MAX_FRESHNESS_OUTCOMES outcomes, and requests escapes text
-# to up to 12 bytes a character, so the longest outcome FreshnessOutcome accepts takes 5,668
-# bytes. This holds that many of the longest, so no push its rules allow is refused and lost.
-MAX_FRESHNESS_BODY_BYTES = MAX_FRESHNESS_OUTCOMES * 5_700 + 1024
+# The freshness prober's push: its cap on outcomes applies only once the whole body is parsed, so
+# this keeps the worst parse within half the pod's memory. 50,000 outcomes with 300-character
+# details take about 26.5 MB. A bigger minute, from long escaped details, gets a 413 and is lost.
+MAX_FRESHNESS_BODY_BYTES = 32 * 1024 * 1024
 # A score request names 1 indexer in about 60 bytes.
 MAX_GET_SCORE_BODY_BYTES = 64 * 1024
 

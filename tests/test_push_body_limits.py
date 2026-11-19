@@ -7,7 +7,10 @@ what its real sender pushes.
 
 import json
 import random
+import re
+import tracemalloc
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.routing import APIRoute
@@ -18,17 +21,16 @@ from iisa.iisa_http_endpoints import (
     _BODY_ROUTES,
     DEFAULT_BODY_LIMIT,
     MAX_FRESHNESS_BODY_BYTES,
-    MAX_FRESHNESS_OUTCOMES,
     MAX_GET_SCORE_BODY_BYTES,
     MAX_SCORES_BODY_BYTES,
     MAX_SYNC_STATUS_BODY_BYTES,
-    FreshnessOutcome,
     IISAState,
     Settings,
     _BodyLimit,
     app,
 )
 
+REPO = Path(__file__).resolve().parents[1]
 TOKEN = "push-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 AUTH_HEADER = [(b"authorization", f"Bearer {TOKEN}".encode())]
@@ -399,23 +401,29 @@ def test_a_full_minute_of_outcomes_with_long_details_is_accepted():
     assert response.json()["pairs"] == 50_000
 
 
-def test_the_longest_freshness_push_the_rules_allow_fits():
-    # Every text field at its length limit in characters that JSON escapes to 12 bytes each, and
-    # the longest age the rules accept: an integer just under the largest float.
-    longest = {
-        "indexer": "0x" + "a" * 40,
-        "chain": "\U0001f600" * 64,
-        "outcome": "no_evidence",
-        "reason": "r" * 64,
-        "detail": "\U0001f600" * 300,
-        "deployment": "\U0001f600" * 64,
-        "age_seconds": int(1.7976931348623157e308),
-    }
-    FreshnessOutcome.model_validate(longest)
-    one = len(json.dumps({"minute": "2026-01-01T00:00:00Z", "outcomes": [longest]}))
-    each_more = len(json.dumps(longest)) + len(", ")
+def _pod_memory_limit() -> int:
+    """The service pod's memory limit in bytes, as k8s/deployment.yaml sets it."""
+    manifest = (REPO / "k8s" / "deployment.yaml").read_text()
+    [(amount, unit)] = re.findall(r"limits:\n(?:\s+\S.*\n)*?\s+memory: (\d+)(Mi|Gi)\n", manifest)
+    return int(amount) * {"Mi": 1024**2, "Gi": 1024**3}[unit]
 
-    assert one + (MAX_FRESHNESS_OUTCOMES - 1) * each_more <= MAX_FRESHNESS_BODY_BYTES
+
+def test_parsing_the_largest_freshness_body_takes_at_most_half_the_pods_memory():
+    # FastAPI parses a whole body before the cap on outcomes applies, so only the byte limit
+    # bounds what a push takes. Empty objects take the most for their size: each 3 bytes become a
+    # dict of 64 bytes and its place in a list. The other half of the pod holds the service.
+    count = 1024 * 1024 // 3
+    body = b'{"minute": "2026-01-01T00:00:00Z", "outcomes": [' + b"{}," * count + b"{}]}"
+    tracemalloc.start()
+    try:
+        response = _post("/freshness", body, AUTH)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert response.status_code == 422, response.text
+    at_the_limit = peak * MAX_FRESHNESS_BODY_BYTES // len(body)
+    assert at_the_limit <= _pod_memory_limit() // 2, f"{at_the_limit:,} bytes at the limit"
 
 
 def test_a_real_score_request_is_answered():
