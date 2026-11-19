@@ -7,17 +7,18 @@ the window, so the replay now leaves the value out, counts it and logs the count
 import logging
 import math
 import sys
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from sklearn.preprocessing import StandardScaler
 
 jobs_path = Path(__file__).parents[2] / "cronjobs" / "compute_scores"
 sys.path.insert(0, str(jobs_path))
 
 from gateway_queries_pb2 import ClientQueryProtobuf  # noqa: E402
+from processing import _fit_latency_rankings  # noqa: E402
 from redpanda import (  # noqa: E402
     _build_dataframe,
     _count_partition_worker,
@@ -30,25 +31,39 @@ INT64_MAX = 2**63 - 1
 UNUSABLE_FEES = [math.nan, math.inf, -math.inf, -0.002]
 
 
-def _message(query_id: str, fee: float, blocks_behind: int = 0) -> MagicMock:
-    query = ClientQueryProtobuf()
-    query.query_id = query_id
+def _add_attempt(
+    query: ClientQueryProtobuf,
+    indexer: bytes,
+    deployment: bytes,
+    fee: float,
+    response_time_ms: int = 100,
+    blocks_behind: int = 0,
+) -> None:
     attempt = query.indexer_queries.add()
-    attempt.indexer = INDEXER
-    attempt.deployment = DEPLOYMENT
+    attempt.indexer = indexer
+    attempt.deployment = deployment
     attempt.url = "https://indexer.example.com/"
     attempt.indexed_chain = "mainnet"
     attempt.fee_grt = fee
-    attempt.response_time_ms = 100
+    attempt.response_time_ms = response_time_ms
     attempt.blocks_behind = blocks_behind
     attempt.result = "success"
 
+
+def _kafka_message(query: ClientQueryProtobuf) -> MagicMock:
     msg = MagicMock()
     msg.error.return_value = None
     msg.timestamp.return_value = (1, 1_000)
     msg.value.return_value = query.SerializeToString()
     msg.offset.return_value = 0
     return msg
+
+
+def _message(query_id: str, fee: float, blocks_behind: int = 0) -> MagicMock:
+    query = ClientQueryProtobuf()
+    query.query_id = query_id
+    _add_attempt(query, INDEXER, DEPLOYMENT, fee, blocks_behind=blocks_behind)
+    return _kafka_message(query)
 
 
 def _count(messages: list) -> tuple:
@@ -99,9 +114,6 @@ def test_sample_pass_keeps_the_attempt_with_its_fee_missing(bad_fee, caplog):
     assert sorted(df.index) == ["q1", "q2", "q3"]
     assert math.isnan(df.loc["q2", "fee"])
     assert df.loc["q3", "fee"] == pytest.approx(0.003)
-    # The latency regression drops rows with a missing fee before its scaler, which an
-    # infinite fee would make raise.
-    StandardScaler().fit(df[["fee"]].dropna())
     assert _warnings(caplog) == [
         "sample p3: read 1 attempt(s) with a fee that is negative or not a finite number; any "
         "the sample keeps have the fee missing, which leaves them out of the latency regression"
@@ -137,6 +149,35 @@ def test_sample_pass_warnings_count_attempts_read_not_attempts_kept(caplog):
         "sample p3: read 3 attempt(s) with a fee that is negative or not a finite number",
         f"sample p3: read 3 attempt(s) with blocks_behind above {INT64_MAX:,}",
     ]
+
+
+def test_latency_regression_runs_on_a_replay_with_an_infinite_fee():
+    # 2 deployments each queried 150 times across the same 3 indexers clears the regression's
+    # minimums of 2 indexers per deployment and 250 queries per indexer and per deployment.
+    rng = np.random.default_rng(7)
+    indexers = [bytes([i + 1]) * 20 for i in range(3)]
+    messages = []
+    for d in range(2):
+        for q in range(150):
+            query = ClientQueryProtobuf()
+            query.query_id = f"q-{d}-{q:03d}-JFK"
+            for i, indexer in enumerate(indexers):
+                fee = math.inf if (d, q, i) == (0, 0, 0) else float(rng.uniform(1e-6, 1e-2))
+                latency = int(50 + 40 * i + rng.integers(0, 30))
+                _add_attempt(query, indexer, bytes([d + 10]) * 32, fee, latency)
+            messages.append(_kafka_message(query))
+    reservoirs, _counts, _filtered = _sample(messages, rows_to_use=1_000)
+    df = _build_dataframe(reservoirs)
+    df["indexer_network"] = "arbitrum"
+    for column, values in [("dst_lat", [40.7, 51.5, 35.7]), ("dst_lon", [-74.0, -0.1, 139.7])]:
+        df[column] = df["indexer"].map(dict(zip(sorted(df["indexer"].unique()), values)))
+    df["src_lat"] = rng.uniform(-60, 60, len(df))
+    df["src_lon"] = rng.uniform(-180, 180, len(df))
+
+    rankings, query_counts = _fit_latency_rankings(df, 450, date(2026, 11, 1), seed=1)
+
+    assert sorted(rankings["indexer"]) == sorted(df["indexer"].unique())
+    assert query_counts["query_count"].sum() == 3 * 300 - 1
 
 
 def test_usable_values_log_no_warning(caplog):
