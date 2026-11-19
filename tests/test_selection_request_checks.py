@@ -534,3 +534,36 @@ async def test_health_answers_while_a_slow_selection_runs(monkeypatch, step):
     assert health.status_code == 200
     late = answered_at - began_at[0]
     assert late < 0.5, f"/health answered {late:.2f} s into the selection"
+
+
+async def test_selections_take_turns_at_their_work(monkeypatch):
+    lock = threading.Lock()
+    running = [0]
+    most = [0]
+
+    def taking_a_turn(original):
+        def step(*args):
+            with lock:
+                running[0] += 1
+                most[0] = max(most[0], running[0])
+            time.sleep(0.05)
+            with lock:
+                running[0] -= 1
+            return original(*args)
+
+        return step
+
+    for name in ("_prepare_selection", "_build_selector", "_selection_response"):
+        monkeypatch.setattr(
+            iisa_http_endpoints, name, taking_a_turn(getattr(iisa_http_endpoints, name))
+        )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://iisa") as client:
+        first, second = await asyncio.gather(
+            client.post("/select-indexers", json=_request()),
+            client.post("/select-indexers", json=_request(deployment_id="QmOther")),
+        )
+
+    assert (first.status_code, second.status_code) == (200, 200)
+    assert most[0] == 1, f"{most[0]} selections worked at once"
