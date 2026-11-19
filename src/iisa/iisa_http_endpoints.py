@@ -256,7 +256,10 @@ MAX_SELECTION_BODY_BYTES = 4 * 1024 * 1024
 # fail_fast stops checking a list or map at its first bad entry. Without it each bad entry is
 # its own error, so a body of thousands of them builds thousands of errors in memory.
 _IdText = Annotated[str, Field(max_length=_MAX_ID_CHARS)]
-_IndexerList = Annotated[list[_IdText], Field(max_length=_MAX_INDEXERS, fail_fast=True)]
+# The score job pushes indexer addresses in lowercase, so a request's are read the same way.
+# Deployment ids stay as sent, since case matters in an IPFS hash.
+_IndexerIdText = Annotated[_IdText, AfterValidator(str.lower)]
+_IndexerList = Annotated[list[_IndexerIdText], Field(max_length=_MAX_INDEXERS, fail_fast=True)]
 _IndexersByDeployment = Annotated[
     dict[_IdText, _IndexerList], Field(max_length=_MAX_DEPLOYMENTS, fail_fast=True)
 ]
@@ -315,6 +318,25 @@ class SelectionRequest(BaseModel):
         if isinstance(data, dict) and len(data) > most:
             raise ValueError(f"has {len(data):,} fields, more than the {most} a request may have")
         return data
+
+    @field_validator("existing_indexers")
+    @classmethod
+    def _each_member_once(cls, members: Optional[list[str]]) -> Optional[list[str]]:
+        """A member named twice, as once in capitals, counts once, or it would fill 2 places."""
+        return None if members is None else list(dict.fromkeys(members))
+
+    @field_validator("optimistic_dips_fees")
+    @classmethod
+    def _fees_by_lowercase_address(
+        cls, fees: Optional[dict[str, float]]
+    ) -> Optional[dict[str, float]]:
+        """Lowercase each address, adding together fees named for 1 indexer in different case."""
+        if fees is None:
+            return None
+        merged: dict[str, float] = {}
+        for indexer, fee in fees.items():
+            merged[indexer.lower()] = merged.get(indexer.lower(), 0.0) + fee
+        return merged
 
 
 class SelectedIndexer(BaseModel):

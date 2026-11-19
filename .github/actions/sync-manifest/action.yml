@@ -65,9 +65,9 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ steps.check.outputs.latest_version }}
+        OLD_VERSION: ${{ steps.check.outputs.manifest_version }}
       run: |
-        VERSION="${{ steps.check.outputs.latest_version }}"
-        OLD_VERSION="${{ steps.check.outputs.manifest_version }}"
         BRANCH="chore/sync-manifest-to-${VERSION}"
 
         # Check if PR already exists for this sync

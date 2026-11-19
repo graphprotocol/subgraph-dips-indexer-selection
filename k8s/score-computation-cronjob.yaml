@@ -20,6 +20,9 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
+      # Caps the whole run, retry included. Why and how it is sized: "Score job time limits" in
+      # k8s/README.md.
+      activeDeadlineSeconds: 28800
       backoffLimit: 1
       template:
         metadata:
@@ -101,4 +104,7 @@ spec:
               capabilities:
                 drop:
                   - ALL
+          # Caps each attempt, so a hung one leaves time for its retry. Why and how it is sized:
+          # "Score job time limits" in k8s/README.md.
+          activeDeadlineSeconds: 14400
           restartPolicy: Never
