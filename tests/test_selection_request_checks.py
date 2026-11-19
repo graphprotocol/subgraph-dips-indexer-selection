@@ -575,3 +575,34 @@ async def test_selections_take_turns_at_their_work(monkeypatch):
 
     assert (first.status_code, second.status_code) == (200, 200)
     assert most[0] == 1, f"{most[0]} selections worked at once"
+
+
+async def test_a_request_for_nobody_answers_while_a_selection_holds_the_worker(monkeypatch):
+    began = threading.Event()
+    release = threading.Event()
+    prepare = iisa_http_endpoints._prepare_selection
+
+    def held_prepare(request):
+        began.set()
+        release.wait(2)
+        return prepare(request)
+
+    monkeypatch.setattr(iisa_http_endpoints, "_prepare_selection", held_prepare)
+
+    async def nobody_once_selecting(client):
+        await asyncio.to_thread(began.wait, 5)
+        asked = time.perf_counter()
+        response = await client.post("/select-indexers", json=_request(num_candidates=0))
+        seconds = time.perf_counter() - asked
+        release.set()
+        return response, seconds
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://iisa") as client:
+        selection, (nobody, seconds) = await asyncio.gather(
+            client.post("/select-indexers", json=_request()), nobody_once_selecting(client)
+        )
+
+    assert selection.status_code == 200
+    assert (nobody.status_code, nobody.json()["indexers"]) == (200, [])
+    assert seconds < 0.5, f"asking for nobody took {seconds:.2f} s"

@@ -1962,7 +1962,8 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     if request.num_candidates <= 0:
         nobody = SelectionResponse(deployment_id=request.deployment_id, indexers=[])
         run = _SelectionRun(nobody, "nothing_asked_for")
-        await _on_selection_worker(_record_selection, request, run)
+        # Off the event loop but not on the selection worker, so it never waits behind scoring.
+        await asyncio.to_thread(_record_selection, request, run)
         return nobody
 
     logger.info(
