@@ -1087,33 +1087,34 @@ class TestPushScoresEndpoint:
         state = iisa_http_endpoints._state
         state.initialize(Settings())
         commit = state.data_manager.commit_scores
-        first_committing, first_may_finish = threading.Event(), threading.Event()
+        first_committing, second_committed = threading.Event(), threading.Event()
 
-        def slow_first_commit(transformed, computed_at):
-            if not first_committing.is_set():
-                first_committing.set()
-                first_may_finish.wait(timeout=5)
+        def commit_after_the_second(transformed, computed_at):
+            if first_committing.is_set():
+                commit(transformed, computed_at)
+                second_committed.set()
+                return
+            # Unlocked, the second push commits within this wait; locked, it can't, so the wait
+            # runs out and the first commits before the second gets its turn.
+            first_committing.set()
+            second_committed.wait(timeout=1)
             commit(transformed, computed_at)
 
-        monkeypatch.setattr(state.data_manager, "commit_scores", slow_first_commit)
-        pushes = [
-            threading.Thread(
-                target=state.load_scores_from_records,
-                args=([{**self._sample_payload()[0], "computed_at": at}],),
-            )
-            for at in ("2026-04-14T09:00:00+00:00", "2026-04-14T10:00:00+00:00")
-        ]
-        pushes[0].start()
-        assert first_committing.wait(timeout=5)
-        pushes[1].start()
-        pushes[1].join(timeout=0.5)
-        first_may_finish.set()
-        for push in pushes:
-            push.join()
+        monkeypatch.setattr(state.data_manager, "commit_scores", commit_after_the_second)
+        first, second = (
+            [{**self._sample_payload()[0], "computed_at": f"2026-04-14T{hour}:00:00+00:00"}]
+            for hour in ("09", "10")
+        )
+        with ThreadPoolExecutor(2) as pool:
+            pushed_first = pool.submit(state.load_scores_from_records, first)
+            assert first_committing.wait(timeout=5)
+            pushed_second = pool.submit(state.load_scores_from_records, second)
+            assert [pushed_first.result(), pushed_second.result()] == [1, 1]
 
+        latest = datetime(2026, 4, 14, 10, tzinfo=timezone.utc)
         on_disk = json.loads(scores_path.read_text())
-        served = state.data_manager.snapshot
-        assert datetime.fromisoformat(on_disk[0]["computed_at"]) == served.computed_at
+        assert datetime.fromisoformat(on_disk[0]["computed_at"]) == latest
+        assert state.data_manager.snapshot.computed_at == latest
 
     def test_failed_cache_write_keeps_the_previous_cache(self, tmp_path, monkeypatch):
         """A write that fails partway, such as on a full disk, answers 500 and leaves the
