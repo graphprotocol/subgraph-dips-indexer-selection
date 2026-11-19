@@ -17,6 +17,7 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - GET /selections - The record of each recent selection for a required ?deployment (read token)
 """
 
+import asyncio
 import contextlib
 import hmac
 import itertools
@@ -1896,7 +1897,7 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
             request.deployment_id,
             indexer_ids,
         )
-        _record_selection(request, run)
+        await asyncio.to_thread(_record_selection, request, run)
         return response
     except Exception as e:
         logger.exception("Selection failed for deployment %s", request.deployment_id)
@@ -2769,17 +2770,20 @@ class _SelectionRun(NamedTuple):
 async def _run_selection(request: SelectionRequest) -> _SelectionRun:
     """Select for the request, checking the synced claims that could win a candidate a place
     through the gateway first, when the check is switched on.
+
+    Each step that works through the scores runs on a worker thread. A large group can take
+    seconds, and on the event loop it would hold up every other request, /health included.
     """
-    selection = _prepare_selection(request)
+    selection = await asyncio.to_thread(_prepare_selection, request)
     if selection.answer is not None:
         return _SelectionRun(selection.answer, selection.outcome, selection)
-    processor = _build_selector(
-        selection.request, selection.history, selection.synced, selection.stale
+    processor = await asyncio.to_thread(
+        _build_selector, selection.request, selection.history, selection.synced, selection.stale
     )
     checks = None
     if _state.sync_checker is not None:
         processor, checks = await _with_claims_checked(selection, processor, _state.sync_checker)
-    response = _selection_response(selection, processor)
+    response = await asyncio.to_thread(_selection_response, selection, processor)
     return _SelectionRun(response, selection.outcome, selection, processor, checks)
 
 
@@ -2813,8 +2817,8 @@ async def _with_claims_checked(
     members = {indexer.lower() for indexer in processor.initial_group}
     claims = {indexer.lower() for indexer in selection.synced}
     confirmed = set(asked) - unconfirmed.keys()
-    again = _build_selector(
-        request, selection.history, (claims & members) | confirmed, selection.stale
+    again = await asyncio.to_thread(
+        _build_selector, request, selection.history, (claims & members) | confirmed, selection.stale
     )
     return again, checks
 

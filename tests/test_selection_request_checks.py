@@ -6,10 +6,14 @@ ceiling would select blocked or over-priced indexers. This is also the 1 endpoin
 token, so nothing in a request may be unboundedly large.
 """
 
+import asyncio
 import json
+import threading
+import time
 import tracemalloc
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -491,3 +495,36 @@ def test_scores_pushed_during_a_selection_do_not_reach_it(monkeypatch):
 
     assert selection.answer is None, selection.outcome
     assert sorted(selection.history["indexer"]) == sorted(INDEXERS)
+
+
+@pytest.mark.parametrize(
+    "step", ["_prepare_selection", "_build_selector", "_selection_response", "_record_selection"]
+)
+async def test_health_answers_while_a_slow_selection_runs(monkeypatch, step):
+    began = threading.Event()
+    began_at = []
+    original = getattr(iisa_http_endpoints, step)
+
+    def slow_step(*args):
+        began_at.append(time.perf_counter())
+        began.set()
+        time.sleep(2)
+        return original(*args)
+
+    monkeypatch.setattr(iisa_http_endpoints, step, slow_step)
+
+    async def health_once_selecting(client):
+        await asyncio.to_thread(began.wait, 5)
+        response = await client.get("/health")
+        return response, time.perf_counter()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://iisa") as client:
+        selection, (health, answered_at) = await asyncio.gather(
+            client.post("/select-indexers", json=_request()), health_once_selecting(client)
+        )
+
+    assert selection.status_code == 200
+    assert health.status_code == 200
+    late = answered_at - began_at[0]
+    assert late < 0.5, f"/health answered {late:.2f} s into the selection"
