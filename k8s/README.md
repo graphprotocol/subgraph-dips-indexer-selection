@@ -33,6 +33,12 @@ can be carried over does the run push the fallback scores, which give every inde
 the same quality. The scores record when each indexer's stake was read and its quality
 measured, and the run's log ends with a warning saying what it reused or carried over.
 
+The CronJob never starts a run while the last one is still going, so a run that hung would
+hold off every later run. Each run is therefore stopped and marked failed 8 hours after it
+starts. A normal run takes about 2.5 hours, so that leaves room for a failed attempt and its
+1 retry, and a hung run ends 16 hours before the next one is due. Until a run succeeds, the
+service keeps serving the scores it already holds.
+
 The sync-status fetcher runs all the time, from the CronJob's image. Every hour it reads
 indexer URLs from the Graph Network subgraph, asks each indexer's `/status` which
 deployments it has synced, keeps only the deployments the indexer also holds an active
