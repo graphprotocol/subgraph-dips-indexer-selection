@@ -1,4 +1,4 @@
-"""Tests for attempt values the replay cannot use: fees that are not finite, huge blocks_behind.
+"""Tests for attempt values the replay cannot use: negative or non-finite fees, huge blocks_behind.
 
 1 such value in a replayed message used to break scoring for the 28 days the message stays in
 the window, so the replay now leaves the value out, counts it and logs the count.
@@ -27,7 +27,7 @@ from redpanda import (  # noqa: E402
 INDEXER = b"\x01" * 20
 DEPLOYMENT = b"\x02" * 32
 INT64_MAX = 2**63 - 1
-NON_FINITE_FEES = [math.nan, math.inf, -math.inf]
+UNUSABLE_FEES = [math.nan, math.inf, -math.inf, -0.002]
 
 
 def _message(query_id: str, fee: float, blocks_behind: int = 0) -> MagicMock:
@@ -73,8 +73,8 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list:
     return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
 
 
-@pytest.mark.parametrize("bad_fee", NON_FINITE_FEES)
-def test_count_pass_leaves_a_fee_that_is_not_finite_out_of_the_total(bad_fee, caplog):
+@pytest.mark.parametrize("bad_fee", UNUSABLE_FEES)
+def test_count_pass_leaves_an_unusable_fee_out_of_the_total(bad_fee, caplog):
     messages = [_message("q1", 0.001), _message("q2", bad_fee), _message("q3", 0.003)]
 
     with caplog.at_level(logging.WARNING):
@@ -83,12 +83,12 @@ def test_count_pass_leaves_a_fee_that_is_not_finite_out_of_the_total(bad_fee, ca
     assert fees[INDEXER] == pytest.approx(0.004)
     assert counts[(DEPLOYMENT, INDEXER)] == 3
     assert _warnings(caplog) == [
-        "count p3: left 1 attempt(s) with a fee that is not a finite number out of the "
-        "indexers' fee totals"
+        "count p3: left 1 attempt(s) with a fee that is negative or not a finite number out "
+        "of the indexers' fee totals"
     ]
 
 
-@pytest.mark.parametrize("bad_fee", NON_FINITE_FEES)
+@pytest.mark.parametrize("bad_fee", UNUSABLE_FEES)
 def test_sample_pass_keeps_the_attempt_with_its_fee_missing(bad_fee, caplog):
     messages = [_message("q1", 0.001), _message("q2", bad_fee), _message("q3", 0.003)]
 
@@ -103,8 +103,8 @@ def test_sample_pass_keeps_the_attempt_with_its_fee_missing(bad_fee, caplog):
     # infinite fee would make raise.
     StandardScaler().fit(df[["fee"]].dropna())
     assert _warnings(caplog) == [
-        "sample p3: kept 1 attempt(s) with a fee that is not a finite number with the fee "
-        "missing, which leaves them out of the latency regression"
+        "sample p3: kept 1 attempt(s) with a fee that is negative or not a finite number with "
+        "the fee missing, which leaves them out of the latency regression"
     ]
 
 

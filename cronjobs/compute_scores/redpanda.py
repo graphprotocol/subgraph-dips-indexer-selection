@@ -342,18 +342,18 @@ def _count_partition_worker(args: tuple) -> tuple:
                 dep_bytes = bytes(attempt.deployment)
                 if len(dep_bytes) == 32 and len(idx_bytes) == 20:
                     counts[(dep_bytes, idx_bytes)] += 1
-                    # 1 fee that is not finite swamps the total; a NaN total reads in iisa as
-                    # the best stake-to-fees.
+                    # 1 fee that is not finite swamps the total and negative ones can net it to
+                    # 0 or below; a NaN or 0 total reads in iisa as the best stake-to-fees.
                     fee = attempt.fee_grt
-                    if math.isfinite(fee):
+                    if math.isfinite(fee) and fee >= 0.0:
                         fees[idx_bytes] += fee
                     else:
                         unusable_fees += 1
 
     if unusable_fees:
         logger.warning(
-            "count p%d: left %s attempt(s) with a fee that is not a finite number out of the "
-            "indexers' fee totals",
+            "count p%d: left %s attempt(s) with a fee that is negative or not a finite number out "
+            "of the indexers' fee totals",
             partition,
             f"{unusable_fees:,}",
         )
@@ -391,11 +391,11 @@ class _UnusableValues:
 def _usable_values(fee: float, blocks_behind: int, unusable: _UnusableValues) -> Tuple[float, int]:
     """Return an attempt's fee and blocks_behind as values the scoring frame can hold.
 
-    A fee that is not finite becomes missing: the latency regression drops rows with a missing
-    fee, while an infinite one makes its scaler raise, and uptime and success rates still count
-    the attempt. blocks_behind is clipped to its int64 column. Each change is counted.
+    A negative or non-finite fee becomes missing: the latency regression drops rows with a
+    missing fee, while an infinite one makes its scaler raise, and uptime and success rates
+    still count the attempt. blocks_behind is clipped to its int64 column. Each change is counted.
     """
-    if not math.isfinite(fee):
+    if not (math.isfinite(fee) and fee >= 0.0):
         fee = math.nan
         unusable.fees += 1
     if blocks_behind > _BLOCKS_BEHIND_MAX:
@@ -408,8 +408,8 @@ def _warn_about_unusable_values(partition: int, unusable: _UnusableValues) -> No
     """Log how many values the sample pass replaced in 1 partition, if it replaced any."""
     if unusable.fees:
         logger.warning(
-            "sample p%d: kept %s attempt(s) with a fee that is not a finite number with the fee "
-            "missing, which leaves them out of the latency regression",
+            "sample p%d: kept %s attempt(s) with a fee that is negative or not a finite number "
+            "with the fee missing, which leaves them out of the latency regression",
             partition,
             f"{unusable.fees:,}",
         )
@@ -480,7 +480,7 @@ def _sample_partition_worker(args: tuple) -> tuple:
                 # Checked inline so only an attempt with a value to replace pays for a call.
                 fee = attempt.fee_grt
                 blocks_behind = attempt.blocks_behind
-                if not (math.isfinite(fee) and blocks_behind <= _BLOCKS_BEHIND_MAX):
+                if not (math.isfinite(fee) and fee >= 0.0 and blocks_behind <= _BLOCKS_BEHIND_MAX):
                     fee, blocks_behind = _usable_values(fee, blocks_behind, unusable)
 
                 # query_id is unique per query, so interning it would cost cycles for no saving.
