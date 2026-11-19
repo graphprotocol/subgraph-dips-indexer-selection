@@ -475,11 +475,15 @@ class IndexerSelector:
         share an operator or a location, the lowest scorer goes anyway. A group of 1 needs no
         spread, so a target of 1 keeps the best scorer. A member with no score counts as 0.
         """
-        totals = {member: self._score_of(member) or 0.0 for member in self.current_group}
-        if len(self.current_group) > self.target_size and any(map(pd.isna, totals.values())):
+        scored = {member: self._score_of(member) for member in self.current_group}
+        totals = {member: total or 0.0 for member, total in scored.items()}
+        unrankable = all(total is None for total in scored.values()) or any(
+            map(pd.isna, totals.values())
+        )
+        if len(self.current_group) > self.target_size and unrankable:
             logger.error(
-                "deployment=%s kept a group of %d above its target of %d: its totals are "
-                "missing, as when scoring failed, so trimming would cancel members at random",
+                "deployment=%s kept a group of %d above its target of %d: no member has a usable "
+                "total, as when scoring failed, so trimming would cancel members at random",
                 self.deployment_id,
                 len(self.current_group),
                 self.target_size,

@@ -167,6 +167,15 @@ class TestLeaving:
         assert selector.current_group == ["A", "B", "C"]
         assert selector.steps == []
 
+    def test_a_group_with_no_scored_member_is_left_as_it_is(self):
+        """None of X, Y and Z has a score row, so there is nothing to rank them by."""
+        selector = _selector({"A": 0.5}, group=("X", "Y", "Z"), target=1)
+
+        selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["X", "Y", "Z"]
+        assert selector.steps == []
+
     def test_trimming_to_a_target_of_1_keeps_the_best_scorer(self):
         """Only taking out H keeps the 3 spread, but a group of 1 needs no spread, so H stays."""
         selector = _selector({"H": 0.9, "X": 0.5, "Y": 0.1}, group=("H", "X", "Y"), target=1)
