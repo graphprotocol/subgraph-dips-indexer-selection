@@ -242,10 +242,7 @@ class IndexerSelector:
                     len(self.data),
                 )
             else:
-                logger.info(
-                    "deployment=%s left optimistic DIPs fees out: the scores hold no stake",
-                    self.deployment_id,
-                )
+                _note_fees_left_out(self.deployment_id)
 
         # Get the current group of indexers for the subgraph using '_get_current_group'
         self.current_group = self._get_current_group()
@@ -877,6 +874,11 @@ LATENCY_FLOOR_SCORE = 0.001
 LATENCY_FALLBACK_WARNING_MINUTES = 10
 _LATENCY_FALLBACK_WARNINGS = LogLimit(LATENCY_FALLBACK_WARNING_MINUTES)
 
+# Selection on scores that hold no stake leaves dipper's expected fees out, and notes it at most
+# once in this many minutes, since every selection on a degraded day would otherwise repeat it.
+NO_STAKE_NOTE_MINUTES = 10
+_NO_STAKE_NOTES = LogLimit(NO_STAKE_NOTE_MINUTES)
+
 # Norm columns left missing rather than scored 0 when there is nothing to score, so the total
 # leaves them out: freshness, on a chain whose checks don't yet cover 7 days, counts as 1.
 _LEFT_OUT_WHEN_MISSING = frozenset({"norm_freshness"})
@@ -979,6 +981,21 @@ def _latency_metric(
 def _current_minute() -> int:
     """The wall clock as a minute counted from the Unix epoch."""
     return int(time.time() // 60)
+
+
+def _note_fees_left_out(deployment_id: DeploymentId) -> None:
+    """Log that a selection left dipper's expected fees out, as the scores hold no stake, at most
+    once every NO_STAKE_NOTE_MINUTES.
+    """
+    held = _NO_STAKE_NOTES.allow("optimistic_dips_fees", _current_minute())
+    if held is not None:
+        logger.info(
+            "deployment=%s left optimistic DIPs fees out: the scores hold no stake. Logged at "
+            "most once every %d minutes, with %d held back since the last",
+            deployment_id,
+            NO_STAKE_NOTE_MINUTES,
+            held,
+        )
 
 
 def _normalize_column(

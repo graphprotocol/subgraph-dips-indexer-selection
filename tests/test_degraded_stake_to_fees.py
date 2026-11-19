@@ -17,15 +17,25 @@ import pytest
 from fastapi.testclient import TestClient
 
 from iisa import iisa_http_endpoints as endpoints
-from iisa import score_loader
+from iisa import indexer_selection, score_loader
 from iisa.iisa_http_endpoints import IISAState, SelectionRequest, Settings, _select_with_processor
-from iisa.indexer_selection import IndexerSelector
+from iisa.indexer_selection import NO_STAKE_NOTE_MINUTES, IndexerSelector
+from iisa.log_limit import LogLimit
 
 PUSH_TOKEN = "degraded-stake-to-fees-push-token"
 AUTH = {"Authorization": f"Bearer {PUSH_TOKEN}"}
 CHAIN = "arbitrum-one"
 A, B, C, D = ("0x" + pair * 20 for pair in ("a1", "b2", "c3", "d4"))
 INDEXERS = [A, B, C, D]
+
+
+@pytest.fixture(autouse=True)
+def fresh_no_stake_notes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts at a fixed minute with its own limit on the note that the expected DIPs
+    fees were left out, as the limit is shared by the whole process.
+    """
+    monkeypatch.setattr(indexer_selection, "_NO_STAKE_NOTES", LogLimit(NO_STAKE_NOTE_MINUTES))
+    monkeypatch.setattr(indexer_selection, "_current_minute", lambda: 1_000)
 
 
 def _fallback_record(indexer: str, unread: Optional[float]) -> dict[str, Any]:
@@ -125,3 +135,16 @@ def test_every_indexer_keeps_the_neutral_stake_to_fees_score(service, restart, f
 
     assert scored["norm_stake_to_fees"].tolist() == [0.5] * len(INDEXERS)
     assert scored["weighted_score"].nunique() == 1
+
+
+def test_the_note_that_dips_fees_were_left_out_is_logged_at_most_once_every_10_minutes(
+    service, monkeypatch, caplog
+):
+    with caplog.at_level("INFO", logger="iisa.indexer_selection"):
+        for minute in (1_000, 1_000, 1_009, 1_010):
+            monkeypatch.setattr(indexer_selection, "_current_minute", lambda m=minute: m)
+            _scored({A: 90.0})
+
+    notes = [r.getMessage() for r in caplog.records if "fees out" in r.getMessage()]
+    assert len(notes) == 2
+    assert "0 held back" in notes[0] and "2 held back" in notes[1]
