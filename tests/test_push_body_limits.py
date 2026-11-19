@@ -1,8 +1,8 @@
-"""How much body POST /scores, /sync-status, /freshness and /get-score read before refusing it.
+"""What POST /scores, /sync-status, /freshness and /get-score check before parsing a body.
 
-FastAPI reads and parses a whole body before a route checks its token, so without a limit a caller
-with no token could make the service hold a body of any size. Each route has its own limit, sized
-from what its real sender pushes.
+FastAPI reads and parses a whole body before a route runs, so the token of a route that takes 1
+is checked first, before any of the body is read, and each route's body has a limit sized from
+what its real sender pushes.
 """
 
 import json
@@ -28,6 +28,7 @@ from iisa.iisa_http_endpoints import (
 
 TOKEN = "push-token"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
+AUTH_HEADER = [(b"authorization", f"Bearer {TOKEN}".encode())]
 JSON = {"Content-Type": "application/json"}
 
 LIMITS = {
@@ -36,14 +37,7 @@ LIMITS = {
     "/freshness": MAX_FRESHNESS_BODY_BYTES,
     "/get-score": MAX_GET_SCORE_BODY_BYTES,
 }
-
-# Around each route's padding, a body the route accepts as far as its token check.
-_SHAPES = {
-    "/scores": (b'[{"padding": "', b'"}]'),
-    "/sync-status": (b'{"padding": "', b'"}'),
-    "/freshness": (b'{"minute": "2026-01-01T00:00:00Z", "outcomes": ["', b'"]}'),
-    "/get-score": (b'{"indexer_id": "', b'"}'),
-}
+PUSH_ROUTES = ["/scores", "/sync-status", "/freshness"]
 
 
 @pytest.fixture(autouse=True)
@@ -69,10 +63,9 @@ def _post(path, content, headers=None):
     )
 
 
-def _body(path, size):
-    """A body of exactly ``size`` bytes that the route reads as far as its token check."""
-    before, after = _SHAPES[path]
-    return before + b"x" * (size - len(before) - len(after)) + after
+def _padded(size):
+    """A JSON body of exactly ``size`` bytes."""
+    return b'{"padding": "' + b"x" * (size - 15) + b'"}'
 
 
 def _in_pieces(body, piece=64 * 1024):
@@ -81,53 +74,24 @@ def _in_pieces(body, piece=64 * 1024):
         yield body[start : start + piece]
 
 
-# --- Over the limit ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("path", LIMITS)
-def test_a_body_declared_over_the_limit_is_refused_before_the_token_check(path):
-    response = _post(path, _body(path, LIMITS[path] + 1))
-
-    assert response.status_code == 413
-    assert f"{LIMITS[path]:,} byte limit" in response.json()["detail"]
-
-
-@pytest.mark.parametrize("path", LIMITS)
-def test_a_body_with_no_declared_length_is_refused_once_over_the_limit(path):
-    response = _post(path, _in_pieces(_body(path, LIMITS[path] + 1)))
-
-    assert response.status_code == 413
-    assert f"{LIMITS[path]:,} byte limit" in response.json()["detail"]
-
-
-@pytest.mark.parametrize("stream", [False, True], ids=["declared-length", "no-declared-length"])
-@pytest.mark.parametrize("path", LIMITS)
-def test_a_body_at_the_limit_reaches_the_route(path, stream):
-    body = _body(path, LIMITS[path])
-
-    response = _post(path, _in_pieces(body) if stream else body)
-
-    # Refused by the route's own token check, so the limit let the whole body through.
-    assert response.status_code == 401, response.text
-
-
-# --- What the limit applies to ------------------------------------------------------------------
-
-
 async def _through_the_limit(method, path, body, headers=(), root_path=""):
     """Send ``body`` in 2 pieces through the limit to a stand-in route.
 
-    Returns the answer's status and the body the route read, None if it never ran.
+    Returns the answer's status, the body the route read (None if it never ran), and how many
+    times the limit or the route asked the server for more of the body.
     """
     half = len(body) // 2
     messages = [
         {"type": "http.request", "body": body[:half], "more_body": True},
         {"type": "http.request", "body": body[half:], "more_body": False},
     ]
+    asked = 0
     sent = []
     read_by_route = []
 
     async def receive():
+        nonlocal asked
+        asked += 1
         return messages.pop(0) if messages else {"type": "http.disconnect"}
 
     async def send(message):
@@ -152,7 +116,104 @@ async def _through_the_limit(method, path, body, headers=(), root_path=""):
         "headers": list(headers),
     }
     await _BodyLimit(route)(scope, receive, send)
-    return sent[0]["status"], (read_by_route[0] if read_by_route else None)
+    return sent[0]["status"], (read_by_route[0] if read_by_route else None), asked
+
+
+# --- The token, checked before the body -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [None, "Bearer wrong", f"Basic {TOKEN}", TOKEN],
+    ids=["none", "wrong-token", "not-bearer", "no-scheme"],
+)
+@pytest.mark.parametrize("path", LIMITS)
+async def test_a_request_without_the_token_is_refused_before_any_body_is_read(path, authorization):
+    headers = [] if authorization is None else [(b"authorization", authorization.encode())]
+
+    status, read, asked = await _through_the_limit("POST", path, _padded(1_000), headers)
+
+    assert status == 401
+    assert (read, asked) == (None, 0)
+
+
+@pytest.mark.parametrize("authorization", [None, "Bearer wrong"], ids=["none", "wrong-token"])
+@pytest.mark.parametrize("path", LIMITS)
+def test_the_refusal_is_the_one_the_routes_give(path, authorization):
+    headers = {} if authorization is None else {"Authorization": authorization}
+    client = TestClient(app, raise_server_exceptions=False)
+
+    early = client.post(path, content=_padded(1_000), headers={**JSON, **headers})
+    # GET /scores has no body, so its token is checked by the route itself.
+    by_route = client.get("/scores", headers=headers)
+
+    assert early.status_code == by_route.status_code == 401
+    assert early.content == by_route.content
+    assert early.headers["content-type"] == by_route.headers["content-type"]
+
+
+async def test_the_read_token_is_let_through_to_get_score_but_to_no_push(monkeypatch):
+    monkeypatch.setenv("IISA_READ_TOKEN", "read-token")
+    iisa_http_endpoints.get_settings.cache_clear()
+    headers = [(b"authorization", b"Bearer read-token")]
+
+    to_get_score = await _through_the_limit("POST", "/get-score", _padded(100), headers)
+    to_pushes = [await _through_the_limit("POST", p, _padded(100), headers) for p in PUSH_ROUTES]
+
+    assert to_get_score[0] == 200
+    assert [status for status, _, _ in to_pushes] == [401] * len(PUSH_ROUTES)
+
+
+@pytest.mark.parametrize("path", LIMITS)
+async def test_the_push_token_with_bearer_in_any_letter_case_is_let_through(path):
+    headers = [(b"authorization", f"bEaReR {TOKEN}".encode())]
+
+    status, read, _ = await _through_the_limit("POST", path, _padded(100), headers)
+
+    assert (status, read) == (200, _padded(100))
+
+
+@pytest.mark.parametrize("path", LIMITS)
+async def test_with_no_token_set_a_request_without_one_is_let_through(monkeypatch, path):
+    monkeypatch.delenv("IISA_PUSH_TOKEN")
+    iisa_http_endpoints.get_settings.cache_clear()
+
+    status, read, _ = await _through_the_limit("POST", path, _padded(100))
+
+    assert (status, read) == (200, _padded(100))
+
+
+# --- Over the limit ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path", LIMITS)
+def test_a_body_declared_over_the_limit_is_refused(path):
+    response = _post(path, _padded(LIMITS[path] + 1), AUTH)
+
+    assert response.status_code == 413
+    assert f"{LIMITS[path]:,} byte limit" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("path", LIMITS)
+def test_a_body_with_no_declared_length_is_refused_once_over_the_limit(path):
+    response = _post(path, _in_pieces(_padded(LIMITS[path] + 1)), AUTH)
+
+    assert response.status_code == 413
+    assert f"{LIMITS[path]:,} byte limit" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("declare", [False, True], ids=["no-declared-length", "declared-length"])
+@pytest.mark.parametrize("path", LIMITS)
+async def test_a_body_at_the_limit_reaches_the_route_whole(path, declare):
+    body = _padded(LIMITS[path])
+    length = [(b"content-length", str(len(body)).encode())] if declare else []
+
+    status, read, _ = await _through_the_limit("POST", path, body, AUTH_HEADER + length)
+
+    assert (status, read) == (200, body)
+
+
+# --- What the limit applies to ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS"])
@@ -160,7 +221,7 @@ async def _through_the_limit(method, path, body, headers=(), root_path=""):
 async def test_a_method_that_carries_no_body_passes_through_unread(method, path):
     body = b"x" * (LIMITS[path] + 1)
 
-    status, read = await _through_the_limit(method, path, body)
+    status, read, _ = await _through_the_limit(method, path, body)
 
     assert status == 200
     assert read == body
@@ -170,23 +231,27 @@ async def test_a_method_that_carries_no_body_passes_through_unread(method, path)
     "method, path", [("POST", "/no-such-route"), ("PUT", "/scores"), ("POST", "/scores/")]
 )
 async def test_a_route_with_no_limit_of_its_own_is_held_to_the_default(method, path):
-    status, _ = await _through_the_limit(method, path, b"x" * (DEFAULT_BODY_LIMIT + 1))
-    status_at_limit, _ = await _through_the_limit(method, path, b"x" * DEFAULT_BODY_LIMIT)
+    status, _, _ = await _through_the_limit(method, path, b"x" * (DEFAULT_BODY_LIMIT + 1))
+    status_at_limit, _, _ = await _through_the_limit(method, path, b"x" * DEFAULT_BODY_LIMIT)
 
     assert status == 413
     assert status_at_limit == 200
 
 
-async def test_a_route_under_a_root_path_keeps_its_own_limit():
+async def test_a_route_under_a_root_path_keeps_its_own_limit_and_token():
     within, over = b"x" * (DEFAULT_BODY_LIMIT + 1), b"x" * (MAX_SCORES_BODY_BYTES + 1)
 
-    status_within, read = await _through_the_limit(
-        "POST", "/iisa/scores", within, root_path="/iisa"
+    status_within, read, _ = await _through_the_limit(
+        "POST", "/iisa/scores", within, AUTH_HEADER, root_path="/iisa"
     )
-    status_over, _ = await _through_the_limit("POST", "/iisa/scores", over, root_path="/iisa")
+    status_over, _, _ = await _through_the_limit(
+        "POST", "/iisa/scores", over, AUTH_HEADER, root_path="/iisa"
+    )
+    no_token, _, _ = await _through_the_limit("POST", "/iisa/scores", within, root_path="/iisa")
 
     assert (status_within, read) == (200, within)
     assert status_over == 413
+    assert no_token == 401
 
 
 def test_every_route_that_takes_a_body_has_a_limit_of_its_own():

@@ -34,7 +34,7 @@ from iisa.iisa_http_endpoints import (
     IISAState,
     SelectionRequest,
     Settings,
-    _body_limit,
+    _body_route,
 )
 
 PUSH_TOKEN = "schema-fuzz-push-token"
@@ -310,7 +310,7 @@ def _refused_for_its_size(case: schemathesis.Case, response: schemathesis.Respon
     """True when a body over its route's size limit got the 413 the schema lists for it."""
     body = response.request.body or b""
     size = len(body.encode() if isinstance(body, str) else body)
-    return response.status_code == 413 and size > _body_limit(case.method, case.path)
+    return response.status_code == 413 and size > _body_route(case.method, case.path).limit
 
 
 def _known_gaps(case: schemathesis.Case, response: schemathesis.Response) -> list[CheckFunction]:
