@@ -2657,21 +2657,23 @@ def _prepare_selection(request: SelectionRequest) -> _Selection:
     """Everything a selection needs before scoring, or its answer when there is nothing to
     score: no scores loaded, or no candidate within the price limits.
     """
-    if _state.history is None:
+    # Read once, since a push swaps in new scores and 1 selection must not mix 2 sets.
+    history = _state.history
+    if history is None:
         nobody = SelectionResponse(deployment_id=request.deployment_id, indexers=[])
         return _Selection(request, pd.DataFrame(), set(), [], {}, {}, nobody, "no_scores")
 
-    request, dropped = _without_failing_members(_state.history, request)
+    request, dropped = _without_failing_members(history, request)
 
     # Filter by price constraints before scoring. With no candidate left, the members that
     # may stay are the answer, since an empty one makes dipper cancel every agreement.
     filtered_out: dict[str, str] = {}
-    filtered_history = _price_filtered_candidates(_state.history, request, filtered_out)
+    filtered_history = _price_filtered_candidates(history, request, filtered_out)
     if filtered_history is None:
         members = SelectionResponse(
             deployment_id=request.deployment_id,
             indexers=_build_selected_indexers(
-                list(request.existing_indexers or []), _state.history, request.chain_id
+                list(request.existing_indexers or []), history, request.chain_id
             ),
         )
         empty = pd.DataFrame()

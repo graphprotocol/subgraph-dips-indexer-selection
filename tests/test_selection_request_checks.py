@@ -470,3 +470,24 @@ def test_the_scores_push_is_not_held_to_the_selection_body_limit():
 
     # Read and checked in full: refused for lacking score columns, not for its size.
     assert response.status_code == 422, response.status_code
+
+
+# --- A selection running beside other requests ----------------------------------------------
+
+
+def test_scores_pushed_during_a_selection_do_not_reach_it(monkeypatch):
+    loaded = iisa_http_endpoints._state.history
+    reads = []
+
+    # Every read after the first sees the scores of a push that has since landed, with nobody.
+    def history(_state):
+        reads.append(None)
+        return loaded if len(reads) == 1 else loaded.iloc[0:0]
+
+    monkeypatch.setattr(iisa_http_endpoints.IISAState, "history", property(history))
+
+    request = iisa_http_endpoints.SelectionRequest(**_request())
+    selection = iisa_http_endpoints._prepare_selection(request)
+
+    assert selection.answer is None, selection.outcome
+    assert sorted(selection.history["indexer"]) == sorted(INDEXERS)
