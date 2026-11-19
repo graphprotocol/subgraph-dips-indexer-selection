@@ -17,9 +17,11 @@ from iisa.iisa_http_endpoints import (
     _BODY_ROUTES,
     DEFAULT_BODY_LIMIT,
     MAX_FRESHNESS_BODY_BYTES,
+    MAX_FRESHNESS_OUTCOMES,
     MAX_GET_SCORE_BODY_BYTES,
     MAX_SCORES_BODY_BYTES,
     MAX_SYNC_STATUS_BODY_BYTES,
+    FreshnessOutcome,
     IISAState,
     Settings,
     _BodyLimit,
@@ -359,6 +361,53 @@ def test_a_real_freshness_push_is_accepted(indexers, chains):
 
     assert response.status_code == 200, response.text
     assert response.json()["pairs"] == indexers * chains
+
+
+def _fault_minute(count: int, detail: str) -> bytes:
+    """A minute of ``count`` void outcomes, each carrying ``detail``, as the prober sends it."""
+    minute = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=2)
+    outcomes = [
+        {
+            "indexer": f"0x{n // 100:040x}",
+            "chain": f"chain-name-{n % 100:03d}",
+            "outcome": "void",
+            "reason": "general_fault",
+            "detail": detail,
+            "deployment": f"Qm{n:044d}",
+            "age_seconds": None,
+        }
+        for n in range(count)
+    ]
+    push = {"minute": minute.isoformat().replace("+00:00", "Z"), "outcomes": outcomes}
+    return json.dumps(push).encode()
+
+
+def test_a_full_minute_of_outcomes_with_long_details_is_accepted():
+    body = _fault_minute(50_000, "indexer_error: " + "x" * 285)
+
+    response = _post("/freshness", body, AUTH)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["pairs"] == 50_000
+
+
+def test_the_longest_freshness_push_the_rules_allow_fits():
+    # Every text field at its length limit in characters that JSON escapes to 12 bytes each, and
+    # the longest age the rules accept: an integer just under the largest float.
+    longest = {
+        "indexer": "0x" + "a" * 40,
+        "chain": "\U0001f600" * 64,
+        "outcome": "no_evidence",
+        "reason": "r" * 64,
+        "detail": "\U0001f600" * 300,
+        "deployment": "\U0001f600" * 64,
+        "age_seconds": int(1.7976931348623157e308),
+    }
+    FreshnessOutcome.model_validate(longest)
+    one = len(json.dumps({"minute": "2026-01-01T00:00:00Z", "outcomes": [longest]}))
+    each_more = len(json.dumps(longest)) + len(", ")
+
+    assert one + (MAX_FRESHNESS_OUTCOMES - 1) * each_more <= MAX_FRESHNESS_BODY_BYTES
 
 
 def test_a_real_score_request_is_answered():

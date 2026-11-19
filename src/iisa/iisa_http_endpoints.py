@@ -597,6 +597,7 @@ def _log_safe(text: str, limit: int = 200) -> str:
 # Outcomes are checked 1 by 1 once the push is read, so any item is accepted here and refused
 # later. The schema says so while still describing the outcome that gets applied.
 _OutcomeItem = Annotated[Any, WithJsonSchema({"anyOf": [FreshnessOutcome.model_json_schema(), {}]})]
+MAX_FRESHNESS_OUTCOMES = 50_000
 
 
 class FreshnessPush(BaseModel):
@@ -608,7 +609,7 @@ class FreshnessPush(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     minute: Annotated[datetime, BeforeValidator(_whole_utc_minute)]
-    outcomes: list[_OutcomeItem] = Field(max_length=50_000)
+    outcomes: list[_OutcomeItem] = Field(max_length=MAX_FRESHNESS_OUTCOMES)
     _accepted: list[FreshnessOutcome] = PrivateAttr(default_factory=list)
     _refused: int = PrivateAttr(default=0)
     _first_refusal: Optional[str] = PrivateAttr(default=None)
@@ -1165,10 +1166,10 @@ MAX_SCORES_BODY_BYTES = 16 * 1024 * 1024
 # The sync-status fetcher's push: about 50 bytes for each deployment an indexer claims and holds
 # an active allocation on, so 16 MiB holds about 330,000.
 MAX_SYNC_STATUS_BODY_BYTES = 16 * 1024 * 1024
-# The freshness prober's push: at most 50,000 outcomes a minute, about 225 bytes a pass and 680
-# with every field full, so 16 MiB holds 50,000 passes or about 24,000 full outcomes. A minute
-# refused for its size is lost, as any minute that doesn't arrive is.
-MAX_FRESHNESS_BODY_BYTES = 16 * 1024 * 1024
+# The freshness prober's push: up to MAX_FRESHNESS_OUTCOMES outcomes, and requests escapes text
+# to up to 12 bytes a character, so the longest outcome FreshnessOutcome accepts takes 5,668
+# bytes. This holds that many of the longest, so no push its rules allow is refused and lost.
+MAX_FRESHNESS_BODY_BYTES = MAX_FRESHNESS_OUTCOMES * 5_700 + 1024
 # A score request names 1 indexer in about 60 bytes.
 MAX_GET_SCORE_BODY_BYTES = 64 * 1024
 
