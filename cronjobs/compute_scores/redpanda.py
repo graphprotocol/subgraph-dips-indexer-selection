@@ -405,20 +405,25 @@ def _usable_values(fee: float, blocks_behind: int, unusable: _UnusableValues) ->
 
 
 def _warn_about_unusable_values(partition: int, unusable: _UnusableValues) -> None:
-    """Log how many values the sample pass replaced in 1 partition, if it replaced any."""
+    """Log how many attempts the sample pass read in 1 partition with a value it had to replace.
+
+    The counts include attempts the reservoir went on to drop.
+    """
     if unusable.fees:
         logger.warning(
-            "sample p%d: kept %s attempt(s) with a fee that is negative or not a finite number "
-            "with the fee missing, which leaves them out of the latency regression",
+            "sample p%d: read %s attempt(s) with a fee that is negative or not a finite number; "
+            "any the sample keeps have the fee missing, which leaves them out of the latency "
+            "regression",
             partition,
             f"{unusable.fees:,}",
         )
     if unusable.blocks_behind:
         logger.warning(
-            "sample p%d: clipped blocks_behind to %s in %s attempt(s) where it was larger",
+            "sample p%d: read %s attempt(s) with blocks_behind above %s; any the sample keeps "
+            "have it clipped to that",
             partition,
-            f"{_BLOCKS_BEHIND_MAX:,}",
             f"{unusable.blocks_behind:,}",
+            f"{_BLOCKS_BEHIND_MAX:,}",
         )
 
 

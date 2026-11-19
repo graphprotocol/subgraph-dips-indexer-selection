@@ -60,12 +60,12 @@ def _count(messages: list) -> tuple:
         )
 
 
-def _sample(messages: list) -> tuple:
+def _sample(messages: list, rows_to_use: int = 100) -> tuple:
     consumer = MagicMock()
     consumer.consume.side_effect = [messages, [], [], []]
     with patch("confluent_kafka.Consumer", return_value=consumer):
         return _sample_partition_worker(
-            ("gateway_queries", 3, 0, 999_999_999_999, {}, None, 100, 20260420, 1_000_000)
+            ("gateway_queries", 3, 0, 999_999_999_999, {}, None, rows_to_use, 20260420, 1_000_000)
         )
 
 
@@ -103,8 +103,8 @@ def test_sample_pass_keeps_the_attempt_with_its_fee_missing(bad_fee, caplog):
     # infinite fee would make raise.
     StandardScaler().fit(df[["fee"]].dropna())
     assert _warnings(caplog) == [
-        "sample p3: kept 1 attempt(s) with a fee that is negative or not a finite number with "
-        "the fee missing, which leaves them out of the latency regression"
+        "sample p3: read 1 attempt(s) with a fee that is negative or not a finite number; any "
+        "the sample keeps have the fee missing, which leaves them out of the latency regression"
     ]
 
 
@@ -121,7 +121,21 @@ def test_sample_pass_clips_blocks_behind_beyond_the_int64_column(blocks_behind, 
     assert df.loc["q2", "blocks_behind"] == INT64_MAX
     assert df.loc["q2", "fee"] == pytest.approx(0.002)
     assert _warnings(caplog) == [
-        f"sample p3: clipped blocks_behind to {INT64_MAX:,} in 1 attempt(s) where it was larger"
+        f"sample p3: read 1 attempt(s) with blocks_behind above {INT64_MAX:,}; any the sample "
+        "keeps have it clipped to that"
+    ]
+
+
+def test_sample_pass_warnings_count_attempts_read_not_attempts_kept(caplog):
+    messages = [_message(f"q{i}", math.inf, blocks_behind=2**64 - 1) for i in range(3)]
+
+    with caplog.at_level(logging.WARNING):
+        reservoirs, _counts, _filtered = _sample(messages, rows_to_use=1)
+
+    assert len(_build_dataframe(reservoirs)) == 1
+    assert [message.split(";")[0] for message in _warnings(caplog)] == [
+        "sample p3: read 3 attempt(s) with a fee that is negative or not a finite number",
+        f"sample p3: read 3 attempt(s) with blocks_behind above {INT64_MAX:,}",
     ]
 
 
