@@ -322,6 +322,7 @@ def _count_partition_worker(args: tuple) -> tuple:
     fees: Dict[bytes, float] = defaultdict(float)
     stats = _PartitionReadStats()
     unusable_fees = 0
+    isfinite = math.isfinite  # a local name is cheaper to call on every attempt
 
     queries = _iter_partition_queries(
         "count",
@@ -345,7 +346,7 @@ def _count_partition_worker(args: tuple) -> tuple:
                     # 1 fee that is not finite swamps the total and negative ones can net it to
                     # 0 or below; a NaN or 0 total reads in iisa as the best stake-to-fees.
                     fee = attempt.fee_grt
-                    if math.isfinite(fee) and fee >= 0.0:
+                    if isfinite(fee) and fee >= 0.0:
                         fees[idx_bytes] += fee
                     else:
                         unusable_fees += 1
@@ -449,6 +450,7 @@ def _sample_partition_worker(args: tuple) -> tuple:
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     stats = _PartitionReadStats()
     unusable = _UnusableValues()
+    isfinite = math.isfinite  # a local name is cheaper to call on every attempt
 
     # Protobuf returns a fresh str per message even for repeated values, so each value is
     # interned once on first sight and every later row is a dict hit (2.76B attempts in
@@ -485,7 +487,7 @@ def _sample_partition_worker(args: tuple) -> tuple:
                 # Checked inline so only an attempt with a value to replace pays for a call.
                 fee = attempt.fee_grt
                 blocks_behind = attempt.blocks_behind
-                if not (math.isfinite(fee) and fee >= 0.0 and blocks_behind <= _BLOCKS_BEHIND_MAX):
+                if not (isfinite(fee) and fee >= 0.0 and blocks_behind <= _BLOCKS_BEHIND_MAX):
                     fee, blocks_behind = _usable_values(fee, blocks_behind, unusable)
 
                 # query_id is unique per query, so interning it would cost cycles for no saving.
