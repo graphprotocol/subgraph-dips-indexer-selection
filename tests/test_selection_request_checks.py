@@ -161,6 +161,31 @@ def test_expected_dips_fees_named_in_capitals_reach_their_indexer():
     assert request.optimistic_dips_fees == {INDEXERS[0]: 50.0}
 
 
+def test_an_indexer_pushed_in_capitals_is_matched_by_a_lowercase_request():
+    rows = [_capitals(INDEXERS[0]), *INDEXERS[1:]]
+    iisa_http_endpoints._state.load_scores_from_records([_score_record(i) for i in rows])
+
+    picked = _picked(_post(_request(num_candidates=3, blocklist=[INDEXERS[0]])))
+
+    assert sorted(picked) == sorted(INDEXERS[1:])
+
+
+def test_members_named_twice_in_different_case_are_kept_once():
+    members = [_capitals(INDEXERS[0]), INDEXERS[0], INDEXERS[1]]
+
+    picked = _picked(_post(_request(num_candidates=3, existing_indexers=members)))
+
+    assert sorted(picked) == sorted(INDEXERS)
+
+
+def test_expected_dips_fees_named_twice_in_different_case_are_added_together():
+    fees = {_capitals(INDEXERS[0]): 10.0, INDEXERS[0]: 20.0}
+
+    request = SelectionRequest(**_request(optimistic_dips_fees=fees))
+
+    assert request.optimistic_dips_fees == {INDEXERS[0]: 30.0}
+
+
 def test_deployment_ids_keep_their_case():
     """A deployment id is an IPFS hash, in which case matters."""
     request = SelectionRequest(

@@ -301,7 +301,7 @@ class SelectionRequest(BaseModel):
     # one would be silently treated as 0, so each is a 422.
     optimistic_dips_fees: Optional[
         Annotated[
-            dict[_IndexerIdText, Annotated[float, Field(ge=0, allow_inf_nan=False)]],
+            dict[_IdText, Annotated[float, Field(ge=0, allow_inf_nan=False)]],
             Field(max_length=_MAX_INDEXERS, fail_fast=True),
         ]
     ] = None
@@ -324,6 +324,19 @@ class SelectionRequest(BaseModel):
     def _each_member_once(cls, members: Optional[list[str]]) -> Optional[list[str]]:
         """A member named twice, as once in capitals, counts once, or it would fill 2 places."""
         return None if members is None else list(dict.fromkeys(members))
+
+    @field_validator("optimistic_dips_fees")
+    @classmethod
+    def _fees_by_lowercase_address(
+        cls, fees: Optional[dict[str, float]]
+    ) -> Optional[dict[str, float]]:
+        """Lowercase each address, adding together fees named for 1 indexer in different case."""
+        if fees is None:
+            return None
+        merged: dict[str, float] = {}
+        for indexer, fee in fees.items():
+            merged[indexer.lower()] = merged.get(indexer.lower(), 0.0) + fee
+        return merged
 
 
 class SelectedIndexer(BaseModel):
