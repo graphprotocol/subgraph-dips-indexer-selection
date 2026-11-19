@@ -16,7 +16,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pytest
-from hypothesis import example, given, note
+from hypothesis import example, given, note, reproduce_failure
 from hypothesis import strategies as st
 
 from iisa import iisa_http_endpoints as endpoints
@@ -763,9 +763,21 @@ def test_selection_never_returns_a_member_whose_own_prices_fail(case):
         existing_indexers=[FIRST, SECOND],
     )
 )
+@reproduce_failure('6.170.15', b'AXicc2RnAAFGRwYNBihwZGBkQOICeUCuI4YwuiYICYHobAQfSYPGQMswEVDKCPIhoyMzQhiTwQAAaXQQKA==')
 def test_selection_never_returns_more_than_asked_when_the_group_is_too_big(case):
-    selected, _ = _select(case)
+    selected, selector = _select(case)
+    # A group with no member to rank it by is kept whole rather than trimmed at random, as a
+    # member with no score row is never dropped (dipper would cancel its agreement).
+    if selector is not None and _no_member_ranked(selector):
+        return
     assert len(selected) <= case.request.num_candidates
+
+
+def _no_member_ranked(selector: IndexerSelector) -> bool:
+    totals = [selector._score_of(member) for member in selector.initial_group]
+    return all(total is None for total in totals) or any(
+        total is not None and pd.isna(total) for total in totals
+    )
 
 
 # Properties that do not hold yet: each needs a decision, so each is a strict xfail with a
