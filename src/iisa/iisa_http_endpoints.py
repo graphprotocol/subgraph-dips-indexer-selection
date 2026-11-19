@@ -283,7 +283,12 @@ class SelectionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     deployment_id: _IdText
-    existing_indexers: Optional[_IndexerList] = None
+    # Trimming a group above its target takes time that grows with the square of its size, on
+    # the thread that answers every request, so a group may name no more indexers than a request
+    # may ask for. Dipper's group is the deployment's current agreements, kept within its target.
+    existing_indexers: Optional[Annotated[_IndexerList, Field(max_length=MAX_NUM_CANDIDATES)]] = (
+        None
+    )
     pending_agreements: Optional[_IndexersByDeployment] = None
     # Target group size (required). 0 or below selects nobody.
     num_candidates: int = Field(le=MAX_NUM_CANDIDATES)
