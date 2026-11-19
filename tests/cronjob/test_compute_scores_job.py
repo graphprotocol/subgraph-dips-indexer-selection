@@ -238,6 +238,14 @@ class TestTransformToScoresSchema:
 
         assert result["latency_ms"].isna().all()
 
+    def test_transform_sends_stake_and_fees_missing_when_none_were_read(self, sample_merged_df):
+        """With no stake or fees in the merged scores, neither goes out as 0, which iisa would
+        take for a reading.
+        """
+        result = transform_to_scores_schema(sample_merged_df)
+
+        assert result[["total_query_fees", "last_known_slashable_stake"]].isna().all().all()
+
     def test_transform_query_count_preserved(self, sample_merged_df):
         # Act
         result = transform_to_scores_schema(sample_merged_df)

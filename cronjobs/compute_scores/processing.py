@@ -1119,8 +1119,8 @@ def transform_to_scores_schema(merged: pd.DataFrame) -> pd.DataFrame:
 
     # Economic security metrics
     scores["stake_to_fees"] = merged.get("stake_to_fees")
-    scores["total_query_fees"] = merged.get("total_query_fees", 0.0)
-    scores["last_known_slashable_stake"] = merged.get("last_known_slashable_stake", 0.0)
+    scores["total_query_fees"] = merged.get("total_query_fees")
+    scores["last_known_slashable_stake"] = merged.get("last_known_slashable_stake")
     scores[STAKE_READ_AT] = merged.get(STAKE_READ_AT)
 
     # Organization/location
