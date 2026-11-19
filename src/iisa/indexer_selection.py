@@ -226,13 +226,12 @@ class IndexerSelector:
         # before normalisation, so stake_to_fees can tell indexers apart even
         # before on-chain payment claims appear.
         if self.optimistic_dips_fees and "total_query_fees" in self.data.columns:
-            dips_adjustment = self.data["indexer"].map(self.optimistic_dips_fees).fillna(0.0)
-            effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
-
             stake = self.data.get("last_known_slashable_stake")
             # With no indexer's stake above 0, as when the fallback scores of a degraded day hold
             # it missing or at 0, no stake was read and every indexer keeps the job's score.
             if stake is not None and pd.to_numeric(stake, errors="coerce").gt(0).any():
+                dips_adjustment = self.data["indexer"].map(self.optimistic_dips_fees).fillna(0.0)
+                effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
                 self.data["stake_to_fees"] = stake / effective_fees.replace(0.0, float("nan"))
                 # Drop pre-normalised column so _normalize_metrics recomputes it
                 self.data = self.data.drop(columns=["norm_stake_to_fees"], errors="ignore")

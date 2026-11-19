@@ -907,6 +907,29 @@ class TestOptimisticDipsFees:
         assert list(data["norm_stake_to_fees"]) == pytest.approx([0.0, 19 / 29, 1.0])
         assert list(history["norm_stake_to_fees"]) == [0.5, 0.5, 0.5]
 
+    def test_leaves_the_fees_unread_when_no_indexer_has_stake(self):
+        """With no stake there is no ratio to work out, so the expected fees are never added to
+        the query fees. Fees that are not numbers would raise if they were.
+        """
+        history = pd.DataFrame(
+            {
+                "indexer": ["A", "B"],
+                "destination_loc": ["loc1", "loc2"],
+                "org": ["org1", "org2"],
+                "last_known_slashable_stake": [None, 0.0],
+                "total_query_fees": ["unread", "unread"],
+                "norm_stake_to_fees": [0.5, 0.5],
+            }
+        )
+
+        processor = IndexerSelector(
+            history=history,
+            deployment_id=DeploymentId("test_subgraph"),
+            optimistic_dips_fees={"A": 90.0},
+        )
+
+        assert list(processor.data["norm_stake_to_fees"]) == [0.5, 0.5]
+
 
 class TestUptimeAndSuccessRateScaling:
     """Selection scores uptime and success rate on each indexer's own share, raised to the 6th
