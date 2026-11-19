@@ -25,6 +25,7 @@ import logging
 import math
 import numbers
 import os
+import re
 import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -793,6 +794,23 @@ class IISAState:
             self._initialized = False
             return False
 
+    def remove_stale_temp_files(self) -> None:
+        """Remove the temp files a killed process left beside each cache file.
+
+        Call it only before the service takes requests: the deployment stops the old pod before
+        starting a new one, so then nothing can be writing them.
+        """
+        if self.settings is None or self.data_manager is None:
+            return
+        paths = (
+            self.data_manager.scores_file_path,
+            self.settings.sync_status_file_path,
+            self.settings.freshness_file_path,
+        )
+        for path in paths:
+            if path is not None:
+                _remove_stale_temp_files(path)
+
     def refresh_data(self) -> bool:
         """Load pre-computed indexer scores from the cache file on disk.
 
@@ -940,6 +958,37 @@ def _atomic_write_json(path: str, payload: Any) -> None:
             os.remove(tmp_path)
         raise
     _fsync_directory(parent)
+
+
+# What follows a cache file's name in _atomic_write_json's temp files, or in the fixed
+# `<name>.tmp` that versions before them wrote.
+_TEMP_FILE_SUFFIX = re.compile(r"(?:\.[0-9a-f]{32})?\.tmp")
+
+
+def _remove_stale_temp_files(path: str) -> None:
+    """Remove the temp files beside `path` that a killed process left, since no write reuses them.
+
+    Safe only while nothing can be writing `path`.
+    """
+    parent = os.path.dirname(path) or "."
+    name = os.path.basename(path)
+    try:
+        entries = os.listdir(parent)
+    except FileNotFoundError:
+        logger.debug("No directory %s yet, so no temp files to remove", parent)
+        return
+    except OSError as e:
+        logger.warning("Could not list %s to remove stale temp files: %s", parent, e)
+        return
+    for entry in entries:
+        if not (entry.startswith(name) and _TEMP_FILE_SUFFIX.fullmatch(entry, len(name))):
+            continue
+        try:
+            os.remove(os.path.join(parent, entry))
+        except OSError as e:
+            logger.warning("Could not remove stale temp file %s: %s", entry, e)
+        else:
+            logger.info("Removed temp file %s left by an interrupted write", entry)
 
 
 def _fsync_directory(path: str) -> None:
@@ -1111,6 +1160,8 @@ async def lifespan(_app: FastAPI):
     if not _state.initialize(settings):
         logger.error("IISA initialization failed - cannot start service")
         raise RuntimeError("Failed to initialize IISA providers")
+
+    _state.remove_stale_temp_files()
 
     # Recover last cached scores from the RWO cache mount. Missing/empty cache
     # is acceptable — the service comes up in fallback mode and the next push

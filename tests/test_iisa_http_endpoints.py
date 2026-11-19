@@ -2474,6 +2474,40 @@ class TestPushSyncStatusEndpoint:
         assert response.status_code == 401
 
 
+def test_startup_removes_temp_files_left_by_killed_writes(tmp_path, monkeypatch):
+    """Temp files that a killed pod left beside each cache file, which no later write reuses,
+    are removed at startup, while the cache files and everything else stay.
+    """
+    from iisa import iisa_http_endpoints, score_loader
+    from iisa.iisa_http_endpoints import app
+
+    monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+    monkeypatch.setenv("IISA_SYNC_STATUS_FILE_PATH", str(tmp_path / "sync_status.json"))
+    monkeypatch.setenv("IISA_FRESHNESS_FILE_PATH", str(tmp_path / "freshness.json"))
+    iisa_http_endpoints.get_settings.cache_clear()
+    name = "0123456789abcdef" * 2
+    left_behind = [
+        "scores.json.tmp",
+        f"scores.json.{name}.tmp",
+        f"sync_status.json.{name}.tmp",
+        "freshness.json.tmp",
+    ]
+    kept = [
+        "scores.json",
+        "sync_status.json",
+        "scores.json.bak",
+        "scores.json.not-a-temp-name.tmp",
+        "other.json.tmp",
+    ]
+    for file_name in left_behind + kept:
+        (tmp_path / file_name).write_text("[]" if file_name == "scores.json" else "{}")
+
+    with TestClient(app):
+        pass
+
+    assert sorted(os.listdir(tmp_path)) == sorted(kept)
+
+
 class TestRequirePushTokenStartup:
     """Tests for the IISA_REQUIRE_PUSH_TOKEN hard-fail gate on lifespan."""
 
