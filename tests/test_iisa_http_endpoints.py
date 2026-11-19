@@ -2418,6 +2418,45 @@ class TestPushSyncStatusEndpoint:
         assert response.status_code == 200
         assert response.json() == {"status": "success", "indexers": 1}
 
+    def test_push_arriving_mid_save_waits_for_it(self, tmp_path, monkeypatch):
+        """A push arriving while another is between writing the cache file and serving its
+        sync status waits for it, so the payload written last is also the one served.
+        """
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        settings = Settings()
+        cache_path = tmp_path / "sync_status.json"
+        settings.sync_status_file_path = str(cache_path)
+        state = iisa_http_endpoints._state
+        state.initialize(settings)
+        write = iisa_http_endpoints._atomic_write_json
+        first_wrote, second_done = threading.Event(), threading.Event()
+
+        def write_then_wait_for_the_second(path, payload):
+            write(path, payload)
+            if not first_wrote.is_set():
+                # Unlocked, the second push finishes within this wait; locked, it can't, so the
+                # wait runs out and the first is served before the second gets its turn.
+                first_wrote.set()
+                second_done.wait(timeout=1)
+
+        monkeypatch.setattr(
+            iisa_http_endpoints, "_atomic_write_json", write_then_wait_for_the_second
+        )
+        first = self._sample_payload()
+        second = {**first, "0xBBB": first["0xAAA"]}
+        with ThreadPoolExecutor(2) as pool:
+            pushed_first = pool.submit(state.load_sync_status_from_dict, first)
+            assert first_wrote.wait(timeout=5)
+            pushed_second = pool.submit(state.load_sync_status_from_dict, second)
+            pushed_second.add_done_callback(lambda _: second_done.set())
+            assert [pushed_first.result(), pushed_second.result()] == [1, 2]
+
+        assert sorted(json.loads(cache_path.read_text())) == ["0xAAA", "0xBBB"]
+        assert state.sync_status.total_indexers == 2
+
     def test_push_sync_status_rejects_wrong_token(self, monkeypatch):
         monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
         from iisa import iisa_http_endpoints

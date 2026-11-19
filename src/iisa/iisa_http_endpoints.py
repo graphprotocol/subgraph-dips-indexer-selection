@@ -755,6 +755,8 @@ class IISAState:
         self.selection_records = SelectionRecordStore()
         # A threading lock, since POST /scores has a plain def handler, run on FastAPI's threadpool.
         self._scores_push_lock = threading.Lock()
+        # The same for POST /sync-status, so its file write and in-memory swap stay together.
+        self._sync_status_push_lock = threading.Lock()
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -878,9 +880,10 @@ class IISAState:
 
         data = SyncStatusData(raw, self.settings.sync_status_staleness_hours)
 
-        _atomic_write_json(self.settings.sync_status_file_path, raw)
+        with self._sync_status_push_lock:
+            _atomic_write_json(self.settings.sync_status_file_path, raw)
 
-        self._sync_status = data
+            self._sync_status = data
         return data.total_indexers
 
     def refresh_freshness(self) -> bool:
