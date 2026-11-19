@@ -21,7 +21,7 @@ from iisa import iisa_http_endpoints, score_loader
 from iisa.iisa_http_endpoints import (
     MAX_SELECTION_BODY_BYTES,
     SelectionRequest,
-    _SelectionBodyLimit,
+    _BodyLimit,
     app,
 )
 
@@ -306,7 +306,7 @@ def test_a_hostile_body_gets_a_short_refusal(fields):
 # --- The size of the whole body -------------------------------------------------------------
 #
 # The checks above run only once the whole body has been read and parsed, which for a huge body
-# could use up the service's memory first. So the body itself has a limit, on this route only.
+# could use up the service's memory first. So the body itself has a limit.
 
 TOO_LARGE = b'{"padding": "' + b"x" * (4 * 1024 * 1024) + b'"}'
 
@@ -375,7 +375,7 @@ async def _through_the_limit(pieces, declared_length=None, path="/select-indexer
     if declared_length is not None:
         headers.append((b"content-length", str(declared_length).encode()))
     scope = {"type": "http", "method": "POST", "path": path, "headers": headers}
-    await _SelectionBodyLimit(route)(scope, receive, send)
+    await _BodyLimit(route)(scope, receive, send)
     return sent[0]["status"], (read_by_route[0] if read_by_route else None), asked
 
 
@@ -444,7 +444,7 @@ async def test_the_pieces_are_let_go_once_joined():
     tracemalloc.start()
     before = tracemalloc.get_traced_memory()[0]
     try:
-        await _SelectionBodyLimit(route)(scope, receive, send)
+        await _BodyLimit(route)(scope, receive, send)
     finally:
         tracemalloc.stop()
 
@@ -453,7 +453,7 @@ async def test_the_pieces_are_let_go_once_joined():
     assert held < 1.5 * total, f"{held:,} bytes held for a {total:,} byte body"
 
 
-async def test_other_routes_pass_through_untouched():
+async def test_other_routes_are_not_held_to_the_selection_limit():
     pieces = _pieces(MAX_SELECTION_BODY_BYTES + 3 * PIECE)
 
     status, read, _ = await _through_the_limit(pieces, sum(map(len, pieces)), path="/scores")
