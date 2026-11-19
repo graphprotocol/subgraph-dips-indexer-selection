@@ -19,6 +19,7 @@ from iisa.iisa_http_endpoints import (
     MAX_SYNC_STATUS_BODY_BYTES,
     IISAState,
     Settings,
+    _BodyLimit,
     app,
 )
 
@@ -105,6 +106,55 @@ def test_a_body_at_the_limit_reaches_the_route(path, stream):
 
     # Refused by the route's own token check, so the limit let the whole body through.
     assert response.status_code == 401, response.text
+
+
+# --- What the limit applies to ------------------------------------------------------------------
+
+
+async def _through_the_limit(method, path, body, headers=()):
+    """Send ``body`` in 2 pieces through the limit to a stand-in route.
+
+    Returns the answer's status and the body the route read, None if it never ran.
+    """
+    half = len(body) // 2
+    messages = [
+        {"type": "http.request", "body": body[:half], "more_body": True},
+        {"type": "http.request", "body": body[half:], "more_body": False},
+    ]
+    sent = []
+    read_by_route = []
+
+    async def receive():
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    async def route(scope, receive, send):
+        read = b""
+        while True:
+            message = await receive()
+            read += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+        read_by_route.append(read)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    scope = {"type": "http", "method": method, "path": path, "headers": list(headers)}
+    await _BodyLimit(route)(scope, receive, send)
+    return sent[0]["status"], (read_by_route[0] if read_by_route else None)
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "OPTIONS"])
+@pytest.mark.parametrize("path", ["/scores", "/freshness"])
+async def test_a_method_that_carries_no_body_passes_through_unread(method, path):
+    body = b"x" * (LIMITS[path] + 1)
+
+    status, read = await _through_the_limit(method, path, body)
+
+    assert status == 200
+    assert read == body
 
 
 # --- Real pushes --------------------------------------------------------------------------------

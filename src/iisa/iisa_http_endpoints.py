@@ -1164,6 +1164,8 @@ _BODY_LIMITS = {
     "/freshness": MAX_FRESHNESS_BODY_BYTES,
     "/get-score": MAX_GET_SCORE_BODY_BYTES,
 }
+# A GET, HEAD or OPTIONS request has no body any route reads, so it passes through unread.
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
 class _BodyLimit:
@@ -1178,7 +1180,8 @@ class _BodyLimit:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        limit = _BODY_LIMITS.get(scope["path"]) if scope["type"] == "http" else None
+        carries_body = scope["type"] == "http" and scope["method"] in _BODY_METHODS
+        limit = _BODY_LIMITS.get(scope["path"]) if carries_body else None
         if limit is None:
             await self.app(scope, receive, send)
             return
