@@ -235,7 +235,7 @@ def sync_claim_checker(settings: Settings) -> Optional[SyncClaimChecker]:
 # =============================================================================
 
 # Limits on a selection request. /select-indexers takes no token, so without them a request
-# could be any size. Each field limit is far above anything a real request holds.
+# could be any size. Each is at least anything dipper sends, and most are far above it.
 # Dipper never asks for more than this many candidates.
 MAX_NUM_CANDIDATES = 100
 # A deployment's IPFS hash is 46 characters and an indexer address 42.
@@ -243,6 +243,10 @@ _MAX_ID_CHARS = 128
 _MAX_CHAIN_ID_CHARS = 64
 # Entries in a list or map of indexers, far more than the network has indexers.
 _MAX_INDEXERS = 10_000
+# Indexers in the request's current group. Dipper sends every active agreement on the deployment,
+# normally no more than its target, and a group grown past that must still get in to be trimmed.
+# This bounds the work 1 selection does on its worker thread.
+_MAX_GROUP_MEMBERS = 1_000
 # Keys in a map keyed by deployment. Dipper sends every deployment with a pending agreement or a
 # decline in the last 30 days, so these grow with all of dipper's work, not just this request.
 # The body limit below binds first, since 100,000 deployment ids alone are about 5 MB; this one
@@ -284,10 +288,7 @@ class SelectionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     deployment_id: _IdText
-    # Trimming a group above its target takes time that grows with the square of its size, on
-    # the thread that answers every request, so a group may name no more indexers than a request
-    # may ask for. Dipper's group is the deployment's current agreements, kept within its target.
-    existing_indexers: Optional[Annotated[_IndexerList, Field(max_length=MAX_NUM_CANDIDATES)]] = (
+    existing_indexers: Optional[Annotated[_IndexerList, Field(max_length=_MAX_GROUP_MEMBERS)]] = (
         None
     )
     pending_agreements: Optional[_IndexersByDeployment] = None

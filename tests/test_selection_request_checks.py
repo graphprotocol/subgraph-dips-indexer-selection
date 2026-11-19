@@ -231,12 +231,12 @@ def _members(count):
     return [f"0x{i:040x}" for i in range(count)]
 
 
-def test_100_members_is_accepted():
-    assert _post(_request(existing_indexers=_members(100))).status_code == 200
+def test_1000_members_is_accepted():
+    assert _post(_request(existing_indexers=_members(1_000))).status_code == 200
 
 
-def test_more_than_100_members_is_refused():
-    response = _post(_request(existing_indexers=_members(101)))
+def test_more_than_1000_members_is_refused():
+    response = _post(_request(existing_indexers=_members(1_001)))
 
     assert response.status_code == 422
     assert [e["loc"] for e in response.json()["detail"]] == [["body", "existing_indexers"]]
