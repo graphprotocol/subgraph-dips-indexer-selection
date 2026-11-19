@@ -20,9 +20,8 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      # Forbid never starts a run while one is active, so a hung run would hold off every later
-      # one. A normal run takes about 2.5 hours; 8 hours fits a failed attempt and its retry, and
-      # ends a hung run 16 hours before the next is due.
+      # Caps the whole run, retry included. Why and how it is sized: "Score job time limits" in
+      # k8s/README.md.
       activeDeadlineSeconds: 28800
       backoffLimit: 1
       template:

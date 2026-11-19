@@ -33,12 +33,6 @@ can be carried over does the run push the fallback scores, which give every inde
 the same quality. The scores record when each indexer's stake was read and its quality
 measured, and the run's log ends with a warning saying what it reused or carried over.
 
-The CronJob never starts a run while the last one is still going, so a run that hung would
-hold off every later run. Each run is therefore stopped and marked failed 8 hours after it
-starts. A normal run takes about 2.5 hours, so that leaves room for a failed attempt and its
-1 retry, and a hung run ends 16 hours before the next one is due. Until a run succeeds, the
-service keeps serving the scores it already holds.
-
 The sync-status fetcher runs all the time, from the CronJob's image. Every hour it reads
 indexer URLs from the Graph Network subgraph, asks each indexer's `/status` which
 deployments it has synced, keeps only the deployments the indexer also holds an active
@@ -62,6 +56,19 @@ for a lot of memory; the always-on service is comparatively small.
 | IISA service (deployment) | 500m / 4 | 1Gi / 2Gi |
 | Score-computation job | 2 / 8 | 50Gi / 50Gi |
 | Sync-status fetcher (deployment) | 250m / 1 | 512Mi / 1Gi |
+
+## Score job time limits
+
+The CronJob never starts a run while the last one is still going, so a run that hung would
+hold off every later run. Each run is therefore stopped and marked failed 8 hours after
+Kubernetes creates its Job. That clock starts before the pod is scheduled, so waiting for a
+node, pulling the image and the pause before a retry all count against it, as well as the
+time spent running.
+
+A normal run took about 2h24m when it was measured in April 2026, and has not been measured
+again since. 8 hours leaves room for that, for an attempt that fails and its 1 retry, and for
+the waits above, and a hung run ends about 16 hours before the next one is due at 09:00 UTC.
+Until a run succeeds, the service keeps serving the scores it already holds.
 
 ## Startup behaviour
 
