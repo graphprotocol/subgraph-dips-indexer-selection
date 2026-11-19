@@ -56,7 +56,7 @@ jobs:
             echo "Error: resolved tag '$TAG_NAME' does not match release tag pattern" >&2
             exit 1
           fi
-          echo "ref=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "name=$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "image_tag=${REGISTRY}/${IMAGE_NAME}:$TAG_NAME" >> "$GITHUB_OUTPUT"
 
