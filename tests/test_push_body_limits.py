@@ -9,10 +9,13 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from iisa import iisa_http_endpoints, score_loader
 from iisa.iisa_http_endpoints import (
+    _BODY_ROUTES,
+    DEFAULT_BODY_LIMIT,
     MAX_FRESHNESS_BODY_BYTES,
     MAX_GET_SCORE_BODY_BYTES,
     MAX_SCORES_BODY_BYTES,
@@ -111,7 +114,7 @@ def test_a_body_at_the_limit_reaches_the_route(path, stream):
 # --- What the limit applies to ------------------------------------------------------------------
 
 
-async def _through_the_limit(method, path, body, headers=()):
+async def _through_the_limit(method, path, body, headers=(), root_path=""):
     """Send ``body`` in 2 pieces through the limit to a stand-in route.
 
     Returns the answer's status and the body the route read, None if it never ran.
@@ -141,7 +144,13 @@ async def _through_the_limit(method, path, body, headers=()):
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
-    scope = {"type": "http", "method": method, "path": path, "headers": list(headers)}
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "root_path": root_path,
+        "headers": list(headers),
+    }
     await _BodyLimit(route)(scope, receive, send)
     return sent[0]["status"], (read_by_route[0] if read_by_route else None)
 
@@ -155,6 +164,41 @@ async def test_a_method_that_carries_no_body_passes_through_unread(method, path)
 
     assert status == 200
     assert read == body
+
+
+@pytest.mark.parametrize(
+    "method, path", [("POST", "/no-such-route"), ("PUT", "/scores"), ("POST", "/scores/")]
+)
+async def test_a_route_with_no_limit_of_its_own_is_held_to_the_default(method, path):
+    status, _ = await _through_the_limit(method, path, b"x" * (DEFAULT_BODY_LIMIT + 1))
+    status_at_limit, _ = await _through_the_limit(method, path, b"x" * DEFAULT_BODY_LIMIT)
+
+    assert status == 413
+    assert status_at_limit == 200
+
+
+async def test_a_route_under_a_root_path_keeps_its_own_limit():
+    within, over = b"x" * (DEFAULT_BODY_LIMIT + 1), b"x" * (MAX_SCORES_BODY_BYTES + 1)
+
+    status_within, read = await _through_the_limit(
+        "POST", "/iisa/scores", within, root_path="/iisa"
+    )
+    status_over, _ = await _through_the_limit("POST", "/iisa/scores", over, root_path="/iisa")
+
+    assert (status_within, read) == (200, within)
+    assert status_over == 413
+
+
+def test_every_route_that_takes_a_body_has_a_limit_of_its_own():
+    unlisted = [
+        (method, route.path)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods & {"POST", "PUT", "PATCH", "DELETE"}
+        if (method, route.path) not in _BODY_ROUTES
+    ]
+
+    assert unlisted == []
 
 
 # --- Real pushes --------------------------------------------------------------------------------

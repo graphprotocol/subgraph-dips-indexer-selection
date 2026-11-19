@@ -434,10 +434,10 @@ async def test_the_pieces_are_let_go_once_joined():
     assert held < 1.5 * total, f"{held:,} bytes held for a {total:,} byte body"
 
 
-async def test_other_routes_pass_through_untouched():
+async def test_other_routes_are_not_held_to_the_selection_limit():
     pieces = _pieces(MAX_SELECTION_BODY_BYTES + 3 * PIECE)
 
-    status, read, _ = await _through_the_limit(pieces, sum(map(len, pieces)), path="/health")
+    status, read, _ = await _through_the_limit(pieces, sum(map(len, pieces)), path="/scores")
 
     assert status == 200
     assert read == b"".join(pieces)

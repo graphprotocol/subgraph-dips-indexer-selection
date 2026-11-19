@@ -49,6 +49,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from starlette._utils import get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import score_columns as cols
@@ -1157,34 +1158,42 @@ MAX_FRESHNESS_BODY_BYTES = 16 * 1024 * 1024
 # A score request names 1 indexer in about 60 bytes.
 MAX_GET_SCORE_BODY_BYTES = 64 * 1024
 
-_BODY_LIMITS = {
-    "/select-indexers": MAX_SELECTION_BODY_BYTES,
-    "/scores": MAX_SCORES_BODY_BYTES,
-    "/sync-status": MAX_SYNC_STATUS_BODY_BYTES,
-    "/freshness": MAX_FRESHNESS_BODY_BYTES,
-    "/get-score": MAX_GET_SCORE_BODY_BYTES,
+_BODY_ROUTES = {
+    ("POST", "/select-indexers"): MAX_SELECTION_BODY_BYTES,
+    ("POST", "/scores"): MAX_SCORES_BODY_BYTES,
+    ("POST", "/sync-status"): MAX_SYNC_STATUS_BODY_BYTES,
+    ("POST", "/freshness"): MAX_FRESHNESS_BODY_BYTES,
+    ("POST", "/get-score"): MAX_GET_SCORE_BODY_BYTES,
 }
 # A GET, HEAD or OPTIONS request has no body any route reads, so it passes through unread.
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# Any other request with a body, as to a path with no route, is held to this, so a route added
+# or renamed without a limit of its own still has one.
+DEFAULT_BODY_LIMIT = 64 * 1024
+
+
+def _body_limit(method: str, route_path: str) -> int:
+    """The most body a request may send, by its method and its path as the routes match it."""
+    return _BODY_ROUTES.get((method, route_path), DEFAULT_BODY_LIMIT)
 
 
 class _BodyLimit:
-    """Refuse a body over its route's limit in _BODY_LIMITS with a 413 before it is parsed.
+    """Refuse a body over its route's limit with a 413 before it is parsed.
 
     A route's own checks, its token check included, run only once the whole body has been read
-    and parsed, so a huge body could use up the service's memory first. Other routes pass
-    through untouched.
+    and parsed, so a huge body could use up the service's memory first. Requests whose method
+    carries no body pass through untouched.
     """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        carries_body = scope["type"] == "http" and scope["method"] in _BODY_METHODS
-        limit = _BODY_LIMITS.get(scope["path"]) if carries_body else None
-        if limit is None:
+        if scope["type"] != "http" or scope["method"] not in _BODY_METHODS:
             await self.app(scope, receive, send)
             return
+        # The path without any root_path the app is served under, as the routes match it.
+        limit = _body_limit(scope["method"], get_route_path(scope))
         declared = dict(scope["headers"]).get(b"content-length", b"")
         if declared.isdigit() and int(declared) > limit:
             await _body_too_large(scope, receive, send, limit)
