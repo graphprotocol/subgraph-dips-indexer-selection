@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.16.2](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.16.1...v2.16.2) (2026-11-19)
+
+
+### Fixed
+
+* **api:** stop a freshness push running the pod out of memory ([#481](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/481)) ([42a3352](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/42a33529c1cf202ce2fcbd01cb33bb0ca2f70838))
+
 ## [2.16.1](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.16.0...v2.16.1) (2026-11-19)
 
 
