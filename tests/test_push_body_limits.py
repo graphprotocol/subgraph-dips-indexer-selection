@@ -6,6 +6,7 @@ what its real sender pushes.
 """
 
 import json
+import random
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -278,32 +279,39 @@ def _chains(count: int) -> list[str]:
 
 
 def _score_record(n: int, chains: list[str]) -> dict:
-    """1 indexer's scores in the shape the daily score job pushes, on each of ``chains``."""
+    """1 indexer's scores in the shape the daily score job pushes, on each of ``chains``.
+
+    Its measures are random, so each is written with all the digits a float can take; the job
+    rounds to 10 decimal places, so its pushes are no longer than these.
+    """
+    rng = random.Random(n)
     return {
         "indexer": f"0x{n:040x}",
         "url": f"https://indexer-{n}.some-operator.example.com/",
-        "lat_lin_reg_coefficient": 0.012,
-        "lat_coefficient_std_error": 0.002,
-        "lat_coefficient_upper_bound": 0.016,
-        "latency_ms": 180.5,
-        "lat_normalized_score": 0.7,
-        "uptime_score": 0.99,
+        "lat_lin_reg_coefficient": rng.random(),
+        "lat_coefficient_std_error": rng.random(),
+        "lat_coefficient_upper_bound": rng.random(),
+        "latency_ms": rng.uniform(10, 2_000),
+        "lat_normalized_score": rng.random(),
+        "uptime_score": rng.random(),
         "observed_duration_seconds": 2_419_200.0,
-        "uptime_duration_seconds": 2_395_000.0,
-        "success_rate": 0.98,
-        "uptime_by_chain": dict.fromkeys(chains, 0.987654321),
-        "success_rate_by_chain": dict.fromkeys(chains, 0.976543210),
-        "queries_by_chain": dict.fromkeys(chains, 1_234_567),
-        "stake_to_fees": 1_500.0,
-        "total_query_fees": 2_000.0,
-        "last_known_slashable_stake": 3_000_000.0,
+        "uptime_duration_seconds": rng.uniform(0, 2_419_200),
+        "success_rate": rng.random(),
+        "uptime_by_chain": {chain: rng.random() for chain in chains},
+        "success_rate_by_chain": {chain: rng.random() for chain in chains},
+        "queries_by_chain": {chain: rng.randrange(10_000_000) for chain in chains},
+        "stake_to_fees": rng.uniform(0, 1e6),
+        "total_query_fees": rng.uniform(0, 1e5),
+        "last_known_slashable_stake": rng.uniform(1e5, 1e8),
         "stake_read_at": datetime.now(timezone.utc).isoformat(),
         "org": "Some Hosting Provider GmbH",
-        "dst_lat": 52.4,
-        "dst_lon": 4.9,
+        "dst_lat": rng.uniform(-90, 90),
+        "dst_lon": rng.uniform(-180, 180),
         "dips_info_available": True,
-        "dips_min_grt_per_30_days": json.dumps(dict.fromkeys(chains, 450.0)),
-        "dips_min_grt_per_billion_entities_per_30_days": "200.0",
+        "dips_min_grt_per_30_days": json.dumps(
+            {chain: rng.uniform(100, 5_000) for chain in chains}
+        ),
+        "dips_min_grt_per_billion_entities_per_30_days": str(rng.uniform(100, 5_000)),
         "dips_supported_networks": json.dumps(chains),
         "graph_node_version": "0.36.1",
         "graph_node_commit": "0123456789abcdef0123456789abcdef01234567",
@@ -312,7 +320,7 @@ def _score_record(n: int, chains: list[str]) -> dict:
     }
 
 
-@pytest.mark.parametrize("indexers, chains", [(300, 50), (1_000, 100)])
+@pytest.mark.parametrize("indexers, chains", [(300, 50), (1_000, 100), (1_900, 100)])
 def test_a_real_scores_push_is_accepted(indexers, chains):
     records = [_score_record(n, _chains(chains)) for n in range(indexers)]
 

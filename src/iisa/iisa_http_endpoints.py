@@ -1160,9 +1160,9 @@ app = FastAPI(
 # 50 times its size in memory. So a route's token is checked before any body is read, and each
 # body has a limit, a sanity cap for senders with the token sized from what they push.
 
-# The score job's daily push: about 1,100 bytes an indexer plus 140 a chain it served or priced,
-# so 300 indexers on 50 chains is about 2.4 MB, and 16 MiB holds 1,000 indexers on 100 chains.
-MAX_SCORES_BODY_BYTES = 16 * 1024 * 1024
+# The score job's daily push: up to about 1,200 bytes an indexer plus 165 a chain it served or
+# priced, so 1,000 indexers on 100 chains is about 17.5 MB, and this holds twice that.
+MAX_SCORES_BODY_BYTES = 32 * 1024 * 1024
 # The sync-status fetcher's push: about 50 bytes for each deployment an indexer claims and holds
 # an active allocation on, so 16 MiB holds about 330,000.
 MAX_SYNC_STATUS_BODY_BYTES = 16 * 1024 * 1024
