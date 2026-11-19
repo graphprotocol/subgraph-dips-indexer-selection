@@ -17,6 +17,7 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - GET /selections - The record of each recent selection for a required ?deployment (read token)
 """
 
+import contextlib
 import hmac
 import itertools
 import json
@@ -24,6 +25,8 @@ import logging
 import math
 import numbers
 import os
+import re
+import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -773,6 +776,10 @@ class IISAState:
         self.lapse_warnings = LogLimit(LAPSE_WARNING_INTERVAL_MINUTES)
         # In memory only, so a restart starts with none; each record's log line is what lasts.
         self.selection_records = SelectionRecordStore()
+        # A threading lock, since POST /scores has a plain def handler, run on FastAPI's threadpool.
+        self._scores_push_lock = threading.Lock()
+        # The same for POST /sync-status, so its file write and in-memory swap stay together.
+        self._sync_status_push_lock = threading.Lock()
         self._initialized: bool = False
 
     def initialize(self, settings: Settings) -> bool:
@@ -808,6 +815,23 @@ class IISAState:
             logger.warning("Service will operate in random selection fallback mode")
             self._initialized = False
             return False
+
+    def remove_stale_temp_files(self) -> None:
+        """Remove the temp files a killed process left beside each cache file.
+
+        Call it only before the service takes requests: the deployment stops the old pod before
+        starting a new one, so then nothing can be writing them.
+        """
+        if self.settings is None or self.data_manager is None:
+            return
+        paths = (
+            self.data_manager.scores_file_path,
+            self.settings.sync_status_file_path,
+            self.settings.freshness_file_path,
+        )
+        for path in paths:
+            if path is not None:
+                _remove_stale_temp_files(path)
 
     def refresh_data(self) -> bool:
         """Load pre-computed indexer scores from the cache file on disk.
@@ -861,12 +885,14 @@ class IISAState:
 
         # Transform succeeded — the payload is known to be loadable.
         # Safe to write to disk; a restart will now reload successfully.
-        _atomic_write_json(scores_path, records)
+        # The lock keeps an overlapping push from landing between the write and the commit.
+        with self._scores_push_lock:
+            _atomic_write_json(scores_path, records)
 
-        # Commit the already-validated transformed frame to in-memory state.
-        self.data_manager.commit_scores(transformed, computed_at)
-        self._history = self.data_manager.get_data()
-        return len(self._history) if self._history is not None else 0
+            # Commit the already-validated transformed frame to in-memory state.
+            self.data_manager.commit_scores(transformed, computed_at)
+            self._history = self.data_manager.get_data()
+            return len(self._history) if self._history is not None else 0
 
     def refresh_sync_status(self) -> bool:
         """Load sync status from the cache file. Returns True on success."""
@@ -894,9 +920,10 @@ class IISAState:
 
         data = SyncStatusData(raw, self.settings.sync_status_staleness_hours)
 
-        _atomic_write_json(self.settings.sync_status_file_path, raw)
+        with self._sync_status_push_lock:
+            _atomic_write_json(self.settings.sync_status_file_path, raw)
 
-        self._sync_status = data
+            self._sync_status = data
         return data.total_indexers
 
     def refresh_freshness(self) -> bool:
@@ -933,19 +960,72 @@ class IISAState:
 
 
 def _atomic_write_json(path: str, payload: Any) -> None:
-    """Write JSON to `path` atomically via tmp + os.replace.
+    """Write JSON to `path` atomically via a temp file + os.replace.
 
-    The temporary file lives in the same directory so the rename is within
-    a single filesystem. Callers must hold no other reference to `path`
-    during the replace.
+    The temp file sits in the same directory, so the rename stays on 1 filesystem, and has its
+    own name, so overlapping writes never share one. It reaches the disk before the rename and is
+    removed on failure. Callers must hold no other reference to `path` during the replace.
     """
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(payload, f, default=str)
-    os.replace(tmp_path, path)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp_path, "x") as f:
+            json.dump(payload, f, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp_path)
+        raise
+    _fsync_directory(parent)
+
+
+# What follows a cache file's name in _atomic_write_json's temp files, or in the fixed
+# `<name>.tmp` that versions before them wrote.
+_TEMP_FILE_SUFFIX = re.compile(r"(?:\.[0-9a-f]{32})?\.tmp")
+
+
+def _remove_stale_temp_files(path: str) -> None:
+    """Remove the temp files beside `path` that a killed process left, since no write reuses them.
+
+    Safe only while nothing can be writing `path`.
+    """
+    parent = os.path.dirname(path) or "."
+    name = os.path.basename(path)
+    try:
+        entries = os.listdir(parent)
+    except FileNotFoundError:
+        logger.debug("No directory %s yet, so no temp files to remove", parent)
+        return
+    except OSError as e:
+        logger.warning("Could not list %s to remove stale temp files: %s", parent, e)
+        return
+    for entry in entries:
+        if not (entry.startswith(name) and _TEMP_FILE_SUFFIX.fullmatch(entry, len(name))):
+            continue
+        try:
+            os.remove(os.path.join(parent, entry))
+        except OSError as e:
+            logger.warning("Could not remove stale temp file %s: %s", entry, e)
+        else:
+            logger.info("Removed temp file %s left by an interrupted write", entry)
+
+
+def _fsync_directory(path: str) -> None:
+    """Flush a directory's entries to disk, so a rename into it survives a power cut."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        # The new file is already in place; raising now would fail a push that has landed.
+        logger.warning("Could not flush directory %s to disk after a write: %s", path, e)
 
 
 def _extract_computed_at(scores_df: pd.DataFrame) -> Optional[datetime]:
@@ -1102,6 +1182,8 @@ async def lifespan(_app: FastAPI):
     if not _state.initialize(settings):
         logger.error("IISA initialization failed - cannot start service")
         raise RuntimeError("Failed to initialize IISA providers")
+
+    _state.remove_stale_temp_files()
 
     # Recover last cached scores from the RWO cache mount. Missing/empty cache
     # is acceptable — the service comes up in fallback mode and the next push
