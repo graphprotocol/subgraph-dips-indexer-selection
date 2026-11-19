@@ -17,6 +17,7 @@ Endpoints ("push token" means IISA_PUSH_TOKEN only, "read token" either it or II
 - GET /selections - The record of each recent selection for a required ?deployment (read token)
 """
 
+import asyncio
 import contextlib
 import hmac
 import itertools
@@ -29,10 +30,21 @@ import re
 import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache, partial
-from typing import Annotated, Any, Literal, NamedTuple, Optional, Self, TypeGuard, cast
+from typing import (
+    Annotated,
+    Any,
+    Literal,
+    NamedTuple,
+    Optional,
+    Self,
+    TypeGuard,
+    TypeVar,
+    cast,
+)
 
 import pandas as pd
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
@@ -236,7 +248,7 @@ def sync_claim_checker(settings: Settings) -> Optional[SyncClaimChecker]:
 # =============================================================================
 
 # Limits on a selection request. /select-indexers takes no token, so without them a request
-# could be any size. Each field limit is far above anything a real request holds.
+# could be any size. Each is at least anything dipper sends, and most are far above it.
 # Dipper never asks for more than this many candidates.
 MAX_NUM_CANDIDATES = 100
 # A deployment's IPFS hash is 46 characters and an indexer address 42.
@@ -244,6 +256,10 @@ _MAX_ID_CHARS = 128
 _MAX_CHAIN_ID_CHARS = 64
 # Entries in a list or map of indexers, far more than the network has indexers.
 _MAX_INDEXERS = 10_000
+# Indexers in the request's current group. Dipper sends every active agreement on the deployment,
+# normally no more than its target, and a group grown past that must still get in to be trimmed.
+# This bounds the work 1 selection does on its worker thread.
+_MAX_GROUP_MEMBERS = 1_000
 # Keys in a map keyed by deployment. Dipper sends every deployment with a pending agreement or a
 # decline in the last 30 days, so these grow with all of dipper's work, not just this request.
 # The body limit below binds first, since 100,000 deployment ids alone are about 5 MB; this one
@@ -285,10 +301,7 @@ class SelectionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     deployment_id: _IdText
-    # Trimming a group above its target takes time that grows with the square of its size, on
-    # the thread that answers every request, so a group may name no more indexers than a request
-    # may ask for. Dipper's group is the deployment's current agreements, kept within its target.
-    existing_indexers: Optional[Annotated[_IndexerList, Field(max_length=MAX_NUM_CANDIDATES)]] = (
+    existing_indexers: Optional[Annotated[_IndexerList, Field(max_length=_MAX_GROUP_MEMBERS)]] = (
         None
     )
     pending_agreements: Optional[_IndexersByDeployment] = None
@@ -1948,7 +1961,9 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
 
     if request.num_candidates <= 0:
         nobody = SelectionResponse(deployment_id=request.deployment_id, indexers=[])
-        _record_selection(request, _SelectionRun(nobody, "nothing_asked_for"))
+        run = _SelectionRun(nobody, "nothing_asked_for")
+        # Off the event loop but not on the selection worker, so it never waits behind scoring.
+        await asyncio.to_thread(_record_selection, request, run)
         return nobody
 
     logger.info(
@@ -1968,17 +1983,7 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
     )
 
     try:
-        run = await _run_selection(request)
-        response = run.response
-        indexer_ids = [i.id for i in response.indexers]
-        logger.info(
-            "Selected %d indexers for deployment %s: %s",
-            len(response.indexers),
-            request.deployment_id,
-            indexer_ids,
-        )
-        _record_selection(request, run)
-        return response
+        return (await _run_selection(request)).response
     except Exception as e:
         logger.exception("Selection failed for deployment %s", request.deployment_id)
         raise HTTPException(status_code=500, detail=f"Selection failed: {e}")
@@ -2738,21 +2743,23 @@ def _prepare_selection(request: SelectionRequest) -> _Selection:
     """Everything a selection needs before scoring, or its answer when there is nothing to
     score: no scores loaded, or no candidate within the price limits.
     """
-    if _state.history is None:
+    # Read once, since a push swaps in new scores and 1 selection must not mix 2 sets.
+    history = _state.history
+    if history is None:
         nobody = SelectionResponse(deployment_id=request.deployment_id, indexers=[])
         return _Selection(request, pd.DataFrame(), set(), [], {}, {}, nobody, "no_scores")
 
-    request, dropped = _without_failing_members(_state.history, request)
+    request, dropped = _without_failing_members(history, request)
 
     # Filter by price constraints before scoring. With no candidate left, the members that
     # may stay are the answer, since an empty one makes dipper cancel every agreement.
     filtered_out: dict[str, str] = {}
-    filtered_history = _price_filtered_candidates(_state.history, request, filtered_out)
+    filtered_history = _price_filtered_candidates(history, request, filtered_out)
     if filtered_history is None:
         members = SelectionResponse(
             deployment_id=request.deployment_id,
             indexers=_build_selected_indexers(
-                list(request.existing_indexers or []), _state.history, request.chain_id
+                list(request.existing_indexers or []), history, request.chain_id
             ),
         )
         empty = pd.DataFrame()
@@ -2817,7 +2824,8 @@ def _select_with_processor(request: SelectionRequest) -> SelectionResponse:
 
 async def _select_checking_sync_claims(request: SelectionRequest) -> SelectionResponse:
     """_select_with_processor, with the synced claims that could win a candidate a place
-    checked through the gateway first, when the check is switched on.
+    checked through the gateway first, when the check is switched on, and the selection
+    logged and recorded as POST /select-indexers does.
     """
     return (await _run_selection(request)).response
 
@@ -2845,57 +2853,96 @@ class _SelectionRun(NamedTuple):
     checks: Optional[_ClaimChecks] = None
 
 
+_T = TypeVar("_T")
+
+# 1 worker, so selections take turns at the scores as they did on the event loop. The endpoint
+# takes no token, and many at once would share 1 interpreter lock and each run slower.
+_SELECTION_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="selection")
+
+
+async def _on_selection_worker(work: Callable[..., _T], *args: Any) -> _T:
+    """``work(*args)`` on the selection worker, once the work queued ahead of it is done."""
+    return await asyncio.get_running_loop().run_in_executor(_SELECTION_WORKER, work, *args)
+
+
 async def _run_selection(request: SelectionRequest) -> _SelectionRun:
     """Select for the request, checking the synced claims that could win a candidate a place
-    through the gateway first, when the check is switched on.
+    through the gateway first, when the check is switched on, then log and record it.
+
+    The work through the scores takes 2 turns on the selection worker, before and after the
+    checks, so a large group never holds up /health and the checks never hold up the worker.
     """
+    selection, processor = await _on_selection_worker(_prepare_and_select, request)
+    checks: Optional[_ClaimChecks] = None
+    recount: Optional[set[str]] = None
+    if processor is not None and _state.sync_checker is not None:
+        checks, recount = await _check_claims(selection, processor, _state.sync_checker)
+    return await _on_selection_worker(
+        _finish_selection, request, selection, processor, checks, recount
+    )
+
+
+def _prepare_and_select(request: SelectionRequest) -> tuple[_Selection, Optional[IndexerSelector]]:
+    """The prepared selection and its selector, or no selector when preparing settled it."""
     selection = _prepare_selection(request)
     if selection.answer is not None:
-        return _SelectionRun(selection.answer, selection.outcome, selection)
-    processor = _build_selector(
+        return selection, None
+    return selection, _build_selector(
         selection.request, selection.history, selection.synced, selection.stale
     )
-    checks = None
-    if _state.sync_checker is not None:
-        processor, checks = await _with_claims_checked(selection, processor, _state.sync_checker)
-    response = _selection_response(selection, processor)
-    return _SelectionRun(response, selection.outcome, selection, processor, checks)
 
 
-async def _with_claims_checked(
+def _finish_selection(
+    request: SelectionRequest,
+    selection: _Selection,
+    processor: Optional[IndexerSelector],
+    checks: Optional[_ClaimChecks],
+    recount: Optional[set[str]],
+) -> _SelectionRun:
+    """Settle the selection, selecting again counting only the synced claims in ``recount`` when
+    it is given, then log and record it and give its run.
+    """
+    if processor is not None and recount is not None:
+        processor = _build_selector(selection.request, selection.history, recount, selection.stale)
+    if processor is None:
+        run = _SelectionRun(cast(SelectionResponse, selection.answer), selection.outcome, selection)
+    else:
+        response = _selection_response(selection, processor)
+        run = _SelectionRun(response, selection.outcome, selection, processor, checks)
+    logger.info(
+        "Selected %d indexers for deployment %s: %s",
+        len(run.response.indexers),
+        request.deployment_id,
+        [i.id for i in run.response.indexers],
+    )
+    _record_selection(request, run)
+    return run
+
+
+async def _check_claims(
     selection: _Selection, processor: IndexerSelector, checker: SyncClaimChecker
-) -> tuple[IndexerSelector, Optional[_ClaimChecks]]:
-    """Check, through the gateway and all at once, the claim of every candidate the selection
-    could have picked ahead of the rest because it says it has synced, and select again if any
-    of those claims was not confirmed or was left unasked.
-
-    IndexerSelector._note_claims_that_could_win says which candidates those are. Members of
-    the starting group are never asked, and nothing is asked when the selection found no such
-    candidate. Beyond MAX_CHECKS_PER_SELECTION the best scores are asked and the rest are left
-    unasked.
-
-    The second selection counts the starting members' claims as given and, among candidates,
-    only the claims that were confirmed. An indexer whose claim is not counted still competes
-    on its score.
+) -> tuple[Optional[_ClaimChecks], Optional[set[str]]]:
+    """Check through the gateway, all at once, the synced claim of each candidate that could win
+    a place on it (IndexerSelector._note_claims_that_could_win), never a starting member's, the
+    best scores first and at most MAX_CHECKS_PER_SELECTION. Gives how they went and, when any
+    claim was unconfirmed or unasked, the claims to count selecting again: the starting members'
+    and the confirmed ones. An indexer whose claim is not counted still competes on its score.
     """
     request = selection.request
     claimants = list(dict.fromkeys(indexer.lower() for indexer in processor.preferred_on_a_claim()))
     asked = claimants[:MAX_CHECKS_PER_SELECTION]
     not_asked = claimants[MAX_CHECKS_PER_SELECTION:]
     if not asked:
-        return processor, None
+        return None, None
     unconfirmed = await checker.unconfirmed(request.deployment_id, asked)
     _log_claim_checks(request.deployment_id, asked, unconfirmed, not_asked)
     checks = _ClaimChecks(asked, unconfirmed, not_asked)
     if not unconfirmed and not not_asked:
-        return processor, checks
+        return checks, None
     members = {indexer.lower() for indexer in processor.initial_group}
     claims = {indexer.lower() for indexer in selection.synced}
     confirmed = set(asked) - unconfirmed.keys()
-    again = _build_selector(
-        request, selection.history, (claims & members) | confirmed, selection.stale
-    )
-    return again, checks
+    return checks, (claims & members) | confirmed
 
 
 def _log_claim_checks(

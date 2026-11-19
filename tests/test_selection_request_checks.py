@@ -6,10 +6,14 @@ ceiling would select blocked or over-priced indexers. This is also the 1 endpoin
 token, so nothing in a request may be unboundedly large.
 """
 
+import asyncio
 import json
+import threading
+import time
 import tracemalloc
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -227,12 +231,12 @@ def _members(count):
     return [f"0x{i:040x}" for i in range(count)]
 
 
-def test_100_members_is_accepted():
-    assert _post(_request(existing_indexers=_members(100))).status_code == 200
+def test_1000_members_is_accepted():
+    assert _post(_request(existing_indexers=_members(1_000))).status_code == 200
 
 
-def test_more_than_100_members_is_refused():
-    response = _post(_request(existing_indexers=_members(101)))
+def test_more_than_1000_members_is_refused():
+    response = _post(_request(existing_indexers=_members(1_001)))
 
     assert response.status_code == 422
     assert [e["loc"] for e in response.json()["detail"]] == [["body", "existing_indexers"]]
@@ -470,3 +474,135 @@ def test_the_scores_push_is_not_held_to_the_selection_body_limit():
 
     # Read and checked in full: refused for lacking score columns, not for its size.
     assert response.status_code == 422, response.status_code
+
+
+# --- A selection running beside other requests ----------------------------------------------
+
+
+def test_scores_pushed_during_a_selection_do_not_reach_it(monkeypatch):
+    loaded = iisa_http_endpoints._state.history
+    reads = []
+
+    # Every read after the first sees the scores of a push that has since landed, with nobody.
+    def history(_state):
+        reads.append(None)
+        return loaded if len(reads) == 1 else loaded.iloc[0:0]
+
+    monkeypatch.setattr(iisa_http_endpoints.IISAState, "history", property(history))
+
+    request = iisa_http_endpoints.SelectionRequest(**_request())
+    selection = iisa_http_endpoints._prepare_selection(request)
+
+    assert selection.answer is None, selection.outcome
+    assert sorted(selection.history["indexer"]) == sorted(INDEXERS)
+
+
+@pytest.mark.parametrize(
+    ("step", "num_candidates"),
+    [
+        ("_prepare_selection", 2),
+        ("_build_selector", 2),
+        ("_selection_response", 2),
+        ("_record_selection", 2),
+        pytest.param("_record_selection", 0, id="_record_selection-nobody-asked-for"),
+    ],
+)
+async def test_health_answers_while_a_slow_selection_runs(monkeypatch, step, num_candidates):
+    began = threading.Event()
+    answered = threading.Event()
+    began_at = []
+    original = getattr(iisa_http_endpoints, step)
+
+    # Busy in Python, holding the interpreter lock as real selection work does, until /health
+    # has answered or 2 s have passed.
+    def slow_step(*args):
+        began_at.append(time.perf_counter())
+        began.set()
+        give_up = time.perf_counter() + 2
+        while not answered.is_set() and time.perf_counter() < give_up:
+            pass
+        return original(*args)
+
+    monkeypatch.setattr(iisa_http_endpoints, step, slow_step)
+
+    async def health_once_selecting(client):
+        await asyncio.to_thread(began.wait, 5)
+        response = await client.get("/health")
+        answered.set()
+        return response, time.perf_counter()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://iisa") as client:
+        selection, (health, answered_at) = await asyncio.gather(
+            client.post("/select-indexers", json=_request(num_candidates=num_candidates)),
+            health_once_selecting(client),
+        )
+
+    assert selection.status_code == 200
+    assert health.status_code == 200
+    late = answered_at - began_at[0]
+    assert late < 0.5, f"/health answered {late:.2f} s into the selection"
+
+
+async def test_selections_take_turns_at_their_work(monkeypatch):
+    lock = threading.Lock()
+    running = [0]
+    most = [0]
+
+    def taking_a_turn(original):
+        def step(*args):
+            with lock:
+                running[0] += 1
+                most[0] = max(most[0], running[0])
+            time.sleep(0.05)
+            with lock:
+                running[0] -= 1
+            return original(*args)
+
+        return step
+
+    for name in ("_prepare_selection", "_build_selector", "_selection_response"):
+        monkeypatch.setattr(
+            iisa_http_endpoints, name, taking_a_turn(getattr(iisa_http_endpoints, name))
+        )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://iisa") as client:
+        first, second = await asyncio.gather(
+            client.post("/select-indexers", json=_request()),
+            client.post("/select-indexers", json=_request(deployment_id="QmOther")),
+        )
+
+    assert (first.status_code, second.status_code) == (200, 200)
+    assert most[0] == 1, f"{most[0]} selections worked at once"
+
+
+async def test_a_request_for_nobody_answers_while_a_selection_holds_the_worker(monkeypatch):
+    began = threading.Event()
+    release = threading.Event()
+    prepare = iisa_http_endpoints._prepare_selection
+
+    def held_prepare(request):
+        began.set()
+        release.wait(2)
+        return prepare(request)
+
+    monkeypatch.setattr(iisa_http_endpoints, "_prepare_selection", held_prepare)
+
+    async def nobody_once_selecting(client):
+        await asyncio.to_thread(began.wait, 5)
+        asked = time.perf_counter()
+        response = await client.post("/select-indexers", json=_request(num_candidates=0))
+        seconds = time.perf_counter() - asked
+        release.set()
+        return response, seconds
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://iisa") as client:
+        selection, (nobody, seconds) = await asyncio.gather(
+            client.post("/select-indexers", json=_request()), nobody_once_selecting(client)
+        )
+
+    assert selection.status_code == 200
+    assert (nobody.status_code, nobody.json()["indexers"]) == (200, [])
+    assert seconds < 0.5, f"asking for nobody took {seconds:.2f} s"
