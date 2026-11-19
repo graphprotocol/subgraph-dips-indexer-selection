@@ -475,19 +475,10 @@ class IndexerSelector:
         share an operator or a location, the lowest scorer goes anyway. A group of 1 needs no
         spread, so a target of 1 keeps the best scorer. A member with no score counts as 0.
         """
-        scored = {member: self._score_of(member) for member in self.current_group}
-        totals = {member: total or 0.0 for member, total in scored.items()}
-        unrankable = all(total is None for total in scored.values()) or any(
-            map(pd.isna, totals.values())
-        )
-        if len(self.current_group) > self.target_size and unrankable:
-            logger.error(
-                "deployment=%s kept a group of %d above its target of %d: no member has a usable "
-                "total, as when scoring failed, so trimming would cancel members at random",
-                self.deployment_id,
-                len(self.current_group),
-                self.target_size,
-            )
+        if len(self.current_group) <= self.target_size:
+            return
+        totals = self._member_totals()
+        if totals is None:
             return
         ranked = sorted(self.current_group, key=totals.__getitem__)
         spread_needed = self.target_size >= 2
@@ -502,15 +493,33 @@ class IndexerSelector:
                 if keeper is not None:
                     member = keeper
             ranked.remove(member)
-            kept_spread = spread_possible or not spread_needed
+            # Trimming to 1 has no spread to keep, so its removals say nothing about it.
+            kept_spread = spread_possible if spread_needed else None
             self._remove_member(member, totals[member], kept_spread=kept_spread)
+
+    def _member_totals(self) -> Optional[dict[IndexerId, float]]:
+        """Each member's total, 0 for a member with no score row; None, logged, when no member
+        has a usable total, as when scoring failed, so trimming would cancel members at random.
+        """
+        scored = {member: self._score_of(member) for member in self.current_group}
+        totals = {member: total or 0.0 for member, total in scored.items()}
+        if all(total is None for total in scored.values()) or any(map(pd.isna, totals.values())):
+            logger.error(
+                "deployment=%s kept a group of %d above its target of %d: no member has a usable "
+                "total, as when scoring failed, so trimming would cancel members at random",
+                self.deployment_id,
+                len(self.current_group),
+                self.target_size,
+            )
+            return None
+        return totals
 
     def _keeps_spread_without(self, member: IndexerId) -> bool:
         rest = self.current_group.copy()
         rest.remove(member)
         return bool(self._meets_decentralization_requirements_indexer_removal(rest))
 
-    def _remove_member(self, indexer: IndexerId, score: float, kept_spread: bool) -> None:
+    def _remove_member(self, indexer: IndexerId, score: float, kept_spread: Optional[bool]) -> None:
         self.current_group.remove(indexer)
         self.steps.append(Step("removed", indexer, score=score, kept_spread=kept_spread))
         logger.info(
@@ -520,7 +529,9 @@ class IndexerSelector:
             score,
             len(self.current_group),
             self.target_size,
-            "" if kept_spread else ", without keeping the group spread, since no removal could",
+            ", without keeping the group spread, since no removal could"
+            if kept_spread is False
+            else "",
         )
 
     def _meets_decentralization_requirements_indexer_removal(self, group):

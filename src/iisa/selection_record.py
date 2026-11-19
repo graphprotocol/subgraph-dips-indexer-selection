@@ -197,7 +197,8 @@ class RecordedStep(BaseModel):
     decentralisation: Optional[Literal["met", "fallback"]] = Field(
         description="met: the pick or removal left the group spread over 2 operators and 2 "
         "locations, or the group is too small to need it. fallback: no candidate or removal "
-        "could, so the best total was taken, or the lowest removed, regardless."
+        "could, so the best total was taken, or the lowest removed, regardless. Null when the "
+        "rule doesn't apply, as when trimming a group down to 1."
     )
     passed_over: list[str] = Field(
         description="Candidates ranked ahead of the pick that were skipped because they would "

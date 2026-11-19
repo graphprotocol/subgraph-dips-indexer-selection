@@ -155,7 +155,7 @@ class TestLeaving:
         selector._assign_indexers_to_subgraph()
 
         assert selector.current_group == ["B"]
-        assert selector.steps == [Step("removed", "A", score=0.5, kept_spread=True)]
+        assert selector.steps == [Step("removed", "A", score=0.5, kept_spread=None)]
 
     def test_a_group_whose_totals_failed_is_left_as_it_is(self):
         """With scoring failed every total is NaN, so trimming would cancel members at random."""
