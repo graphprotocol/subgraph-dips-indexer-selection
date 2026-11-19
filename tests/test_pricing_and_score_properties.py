@@ -755,16 +755,6 @@ def test_selection_never_returns_a_member_whose_own_prices_fail(case):
         ), f"selected {indexer} despite an invalid or over-ceiling price"
 
 
-# Properties that do not hold yet: each needs a decision, so each is a strict xfail with a
-# hand-written example that fails today. Remove the xfail once the behaviour is settled. Each
-# names the error it expects, so a new crash still fails the run.
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="A group already bigger than num_candidates is trimmed only while it keeps 2 orgs "
-    "and 2 locations, so it can stay bigger than asked. Trimming anyway cancels a live "
-    "agreement, which needs a decision.",
-)
 @given(case=selection_cases(existing_meets_rules=False))
 @example(
     case=_example_case(
@@ -774,10 +764,24 @@ def test_selection_never_returns_a_member_whose_own_prices_fail(case):
     )
 )
 def test_selection_never_returns_more_than_asked_when_the_group_is_too_big(case):
-    selected, _ = _select(case)
+    selected, selector = _select(case)
+    # A group with no member to rank it by is kept whole rather than trimmed at random, as a
+    # member with no score row is never dropped (dipper would cancel its agreement).
+    if selector is not None and _no_member_ranked(selector):
+        return
     assert len(selected) <= case.request.num_candidates
 
 
+def _no_member_ranked(selector: IndexerSelector) -> bool:
+    totals = [selector._score_of(member) for member in selector.initial_group]
+    return all(total is None for total in totals) or any(
+        total is not None and pd.isna(total) for total in totals
+    )
+
+
+# Properties that do not hold yet: each needs a decision, so each is a strict xfail with a
+# hand-written example that fails today. Remove the xfail once the behaviour is settled. Each
+# names the error it expects, so a new crash still fails the run.
 @pytest.mark.xfail(
     strict=True,
     raises=TypeError,

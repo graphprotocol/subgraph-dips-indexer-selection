@@ -107,7 +107,8 @@ class Pick(NamedTuple):
 class Step(NamedTuple):
     """1 change a selection made to the group, noted as it happened: ``indexer`` was "added",
     "removed", or swapped in for the member ``replaced``. ``pick`` is the search that found an
-    indexer added or swapped in, and ``score`` the total a removal was decided on.
+    indexer added or swapped in. For a removal, ``score`` is the total it was decided on, and
+    ``kept_spread`` is False when no removal could keep the group spread.
     """
 
     action: str
@@ -115,6 +116,7 @@ class Step(NamedTuple):
     replaced: Optional[IndexerId] = None
     pick: Optional[Pick] = None
     score: Optional[float] = None
+    kept_spread: Optional[bool] = None
 
 
 class IndexerSelector:
@@ -468,41 +470,69 @@ class IndexerSelector:
         )
 
     def _remove_indexers_from_group(self):
+        """Remove the lowest-scoring member whose removal keeps the group spread over 2 operators
+        and 2 locations, until the group is down to target_size. When none does, as when members
+        share an operator or a location, the lowest scorer goes anyway. A group of 1 needs no
+        spread, so a target of 1 keeps the best scorer. A member with no score counts as 0.
         """
-        Remove worst indexers until group has target_size indexers.
-        """
+        if len(self.current_group) <= self.target_size:
+            return
+        totals = self._member_totals()
+        if totals is None:
+            return
+        ranked = sorted(self.current_group, key=totals.__getitem__)
+        spread_needed = self.target_size >= 2
+        spread_possible = spread_needed
         while len(self.current_group) > self.target_size:
-            indexer_scores = []
-            for indexer in self.current_group:
-                row = self.data[self.data["indexer"] == indexer]
-                score = (
-                    row["weighted_score"].iloc[0]
-                    if not row.empty and "weighted_score" in row.columns
-                    else 0.0
-                )
-                indexer_scores.append((indexer, score))
+            member = ranked[0]
+            if spread_possible:
+                keeper = next((m for m in ranked if self._keeps_spread_without(m)), None)
+                # Removing members only narrows the group, so once no removal keeps it spread
+                # none ever will, and the rest go lowest first without checking again.
+                spread_possible = keeper is not None
+                if keeper is not None:
+                    member = keeper
+            ranked.remove(member)
+            # Trimming to 1 has no spread to keep, so its removals say nothing about it.
+            kept_spread = spread_possible if spread_needed else None
+            self._remove_member(member, totals[member], kept_spread=kept_spread)
 
-            # Sort by score, worst (lowest) first
-            indexer_scores.sort(key=lambda x: x[1])
+    def _member_totals(self) -> Optional[dict[IndexerId, float]]:
+        """Each member's total, 0 for a member with no score row; None, logged, when no member
+        has a usable total, as when scoring failed, so trimming would cancel members at random.
+        """
+        scored = {member: self._score_of(member) for member in self.current_group}
+        totals = {member: total or 0.0 for member, total in scored.items()}
+        if all(total is None for total in scored.values()) or any(map(pd.isna, totals.values())):
+            logger.error(
+                "deployment=%s kept a group of %d above its target of %d: no member has a usable "
+                "total, as when scoring failed, so trimming would cancel members at random",
+                self.deployment_id,
+                len(self.current_group),
+                self.target_size,
+            )
+            return None
+        return totals
 
-            for indexer, score in indexer_scores:
-                temp_group = self.current_group.copy()
-                temp_group.remove(indexer)
+    def _keeps_spread_without(self, member: IndexerId) -> bool:
+        rest = self.current_group.copy()
+        rest.remove(member)
+        return bool(self._meets_decentralization_requirements_indexer_removal(rest))
 
-                if self._meets_decentralization_requirements_indexer_removal(temp_group):
-                    self.current_group.remove(indexer)
-                    self.steps.append(Step("removed", indexer, score=score))
-                    logger.info(
-                        "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)",
-                        self.deployment_id,
-                        indexer[:10],
-                        score,
-                        len(self.current_group),
-                        self.target_size,
-                    )
-                    break
-            else:
-                break
+    def _remove_member(self, indexer: IndexerId, score: float, kept_spread: Optional[bool]) -> None:
+        self.current_group.remove(indexer)
+        self.steps.append(Step("removed", indexer, score=score, kept_spread=kept_spread))
+        logger.info(
+            "deployment=%s removed worst indexer %s (score=%.4f, group now %d/%d)%s",
+            self.deployment_id,
+            indexer[:10],
+            score,
+            len(self.current_group),
+            self.target_size,
+            ", without keeping the group spread, since no removal could"
+            if kept_spread is False
+            else "",
+        )
 
     def _meets_decentralization_requirements_indexer_removal(self, group):
         """

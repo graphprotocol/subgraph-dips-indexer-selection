@@ -500,9 +500,26 @@ class TestMembers:
         assert record["final_group"] == [B, C]
         (step,) = record["steps"]
         assert (step["action"], step["indexer"]) == ("removed", A)
-        assert (step["pool"], step["decentralisation"], step["passed_over"]) == (None, None, [])
+        assert (step["pool"], step["decentralisation"], step["passed_over"]) == (None, "met", [])
         assert step["weighted_score"] == _candidate(record, A)["weighted_score"]
         assert _candidate(record, A)["reasons"] == ["over_target"]
+
+    def test_a_removal_that_could_not_keep_the_group_spread_is_recorded_as_a_fallback(
+        self, load, select
+    ):
+        """D, its twin T and X share 1 operator and 1 location, so no removal keeps them spread."""
+        same_place = {"org": f"org-{D[2:4]}", "dst_lat": int(D[2:4], 16) / 4}
+        load(*RANKED, TWIN, _scores(X, 0.96, **same_place))
+
+        record = select(num_candidates=2, existing_indexers=[D, T, X])
+
+        (step,) = record["steps"]
+        assert (step["action"], step["indexer"], step["decentralisation"]) == (
+            "removed",
+            X,
+            "fallback",
+        )
+        assert record["decentralisation"]["fell_back"] is True
 
 
 class TestSyncedClaims:
