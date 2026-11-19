@@ -52,11 +52,11 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           TAG_NAME="${INPUT_TAG:-${DISPATCH_TAG:-$REF_NAME}}"
-          if ! [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+          if ! [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "Error: resolved tag '$TAG_NAME' does not match release tag pattern" >&2
             exit 1
           fi
-          echo "ref=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "name=$TAG_NAME" >> "$GITHUB_OUTPUT"
           echo "image_tag=${REGISTRY}/${IMAGE_NAME}:$TAG_NAME" >> "$GITHUB_OUTPUT"
 
@@ -147,19 +147,26 @@ jobs:
       # Glob `*` expands to digest-named files written by the build job's Export digest step.
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
         run: |
           docker buildx imagetools create \
-            -t ${{ needs.resolve.outputs.image_tag }} \
+            -t "$IMAGE_TAG" \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect image
+        env:
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
         run: |
-          docker buildx imagetools inspect ${{ needs.resolve.outputs.image_tag }}
+          docker buildx imagetools inspect "$IMAGE_TAG"
 
       - name: Summary
+        env:
+          TAG_NAME: ${{ needs.resolve.outputs.tag_name }}
+          IMAGE_TAG: ${{ needs.resolve.outputs.image_tag }}
         run: |
           echo "## Release Image Published to GHCR (multi-arch)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: \`${{ needs.resolve.outputs.tag_name }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: \`${{ needs.resolve.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: \`$TAG_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image**: \`$IMAGE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Platforms**: linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
