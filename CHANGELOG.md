@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.16.1](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.16.0...v2.16.1) (2026-11-19)
+
+
+### Fixed
+
+* **api:** check the token and size of a body before reading it ([#476](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/476)) ([5cd50fc](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/5cd50fcaa65b5427e27c71750e5c8c8c0048d5ff))
+* **api:** keep /health answering while a slow selection runs ([#480](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/480)) ([9f5cca8](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/9f5cca8aad956a0c1163591f1dfdc68c03980915))
+* **api:** refuse selection requests naming over 100 members ([#471](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/471)) ([a88604c](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/a88604c93a8970b8badb1b29598fb3439e7b81df))
+* **api:** stop overlapping score pushes corrupting the cache ([#473](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/473)) ([84ea0cf](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/84ea0cf518b7c67bc2a6aed9fca5e731bf3d63a7))
+* **ci:** pin CI actions and stop release tags running as code ([#472](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/472)) ([b2a14a3](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/b2a14a30d588608b40af0a27e281030114e6a489))
+* **k8s:** stop a hung score run blocking every later run ([#470](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/470)) ([f2c2ef7](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/f2c2ef77531539d8da9051e493c3156f9d157d81))
+* **replay:** stop 1 bad gateway attempt breaking scoring ([#474](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/474)) ([49abba8](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/49abba8521fd0c4b5fe413832df9c4c0a4078ede))
+* **selection:** match request addresses regardless of case ([#469](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/469)) ([85fde9c](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/85fde9c8007b7e0414530b16547eb611cc2d05bb))
+* **selection:** trim oversized groups down to their target ([#468](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/468)) ([06ad454](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/06ad4541ee58493080f08d0138302605bb470c78))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-49abba8 ([#479](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/479)) ([4951e91](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/4951e91430991b5d1aa939c43d63467e9d7211d7))
+
 ## [2.16.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.15.0...v2.16.0) (2026-11-18)
 
 
