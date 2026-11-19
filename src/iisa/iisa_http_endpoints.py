@@ -753,7 +753,7 @@ class IISAState:
         self.lapse_warnings = LogLimit(LAPSE_WARNING_INTERVAL_MINUTES)
         # In memory only, so a restart starts with none; each record's log line is what lasts.
         self.selection_records = SelectionRecordStore()
-        # A threading lock, since the sync push handler runs on FastAPI's threadpool.
+        # A threading lock, since POST /scores has a plain def handler, run on FastAPI's threadpool.
         self._scores_push_lock = threading.Lock()
         self._initialized: bool = False
 
