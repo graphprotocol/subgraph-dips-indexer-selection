@@ -380,6 +380,48 @@ class _InternCache(dict[str, str]):
         return interned
 
 
+@dataclass
+class _UnusableValues:
+    """Attempts in 1 sample-pass partition read with a value replaced by _usable_values."""
+
+    fees: int = 0
+    blocks_behind: int = 0
+
+
+def _usable_values(fee: float, blocks_behind: int, unusable: _UnusableValues) -> Tuple[float, int]:
+    """Return an attempt's fee and blocks_behind as values the scoring frame can hold.
+
+    A fee that is not finite becomes missing: the latency regression drops rows with a missing
+    fee, while an infinite one makes its scaler raise, and uptime and success rates still count
+    the attempt. blocks_behind is clipped to its int64 column. Each change is counted.
+    """
+    if not math.isfinite(fee):
+        fee = math.nan
+        unusable.fees += 1
+    if blocks_behind > _BLOCKS_BEHIND_MAX:
+        blocks_behind = _BLOCKS_BEHIND_MAX
+        unusable.blocks_behind += 1
+    return fee, blocks_behind
+
+
+def _warn_about_unusable_values(partition: int, unusable: _UnusableValues) -> None:
+    """Log how many values the sample pass replaced in 1 partition, if it replaced any."""
+    if unusable.fees:
+        logger.warning(
+            "sample p%d: kept %s attempt(s) with a fee that is not a finite number with the fee "
+            "missing, which leaves them out of the latency regression",
+            partition,
+            f"{unusable.fees:,}",
+        )
+    if unusable.blocks_behind:
+        logger.warning(
+            "sample p%d: clipped blocks_behind to %s in %s attempt(s) where it was larger",
+            partition,
+            f"{_BLOCKS_BEHIND_MAX:,}",
+            f"{unusable.blocks_behind:,}",
+        )
+
+
 def _sample_partition_worker(args: tuple) -> tuple:
     """
     Sample pass for a single partition. Runs in a child process.
@@ -401,8 +443,7 @@ def _sample_partition_worker(args: tuple) -> tuple:
     reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     stats = _PartitionReadStats()
-    missing_fees = 0
-    clipped_blocks_behind = 0
+    unusable = _UnusableValues()
 
     # Protobuf returns a fresh str per message even for repeated values, so each value is
     # interned once on first sight and every later row is a dict hit (2.76B attempts in
@@ -436,16 +477,11 @@ def _sample_partition_worker(args: tuple) -> tuple:
                 key = (dep_bytes, idx_bytes)
                 n = counts[key]
 
-                # The latency regression drops rows with a missing fee, while an infinite one
-                # makes its scaler raise; uptime and success rates still count the attempt.
+                # Checked inline so only an attempt with a value to replace pays for a call.
                 fee = attempt.fee_grt
-                if not math.isfinite(fee):
-                    fee = math.nan
-                    missing_fees += 1
                 blocks_behind = attempt.blocks_behind
-                if blocks_behind > _BLOCKS_BEHIND_MAX:
-                    blocks_behind = _BLOCKS_BEHIND_MAX
-                    clipped_blocks_behind += 1
+                if not (math.isfinite(fee) and blocks_behind <= _BLOCKS_BEHIND_MAX):
+                    fee, blocks_behind = _usable_values(fee, blocks_behind, unusable)
 
                 # query_id is unique per query, so interning it would cost cycles for no saving.
                 row = (
@@ -466,20 +502,7 @@ def _sample_partition_worker(args: tuple) -> tuple:
 
                 counts[key] += 1
 
-    if missing_fees:
-        logger.warning(
-            "sample p%d: kept %s attempt(s) with a fee that is not a finite number with the fee "
-            "missing, which leaves them out of the latency regression",
-            partition,
-            f"{missing_fees:,}",
-        )
-    if clipped_blocks_behind:
-        logger.warning(
-            "sample p%d: clipped blocks_behind to %s in %s attempt(s) where it was larger",
-            partition,
-            f"{_BLOCKS_BEHIND_MAX:,}",
-            f"{clipped_blocks_behind:,}",
-        )
+    _warn_about_unusable_values(partition, unusable)
     return (reservoirs, counts, stats.filtered)
 
 
