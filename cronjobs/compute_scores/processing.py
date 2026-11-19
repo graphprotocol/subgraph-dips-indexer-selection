@@ -1989,9 +1989,10 @@ def compute_degraded_scores(indexer_urls: Dict[str, str]) -> pd.DataFrame:
     scores["org"] = None
     scores["dst_lat"] = None
     scores["dst_lon"] = None
-    scores["total_query_fees"] = 0.0
-    scores["last_known_slashable_stake"] = 0.0
-    # Never read from the network, so a later run can never take these zeros for stake.
+    # Stake was never read, so stake and fees go out missing rather than as a reading of 0 that
+    # iisa would work a ratio out from, and with no read time no later run can reuse them.
+    scores["total_query_fees"] = None
+    scores["last_known_slashable_stake"] = None
     scores[STAKE_READ_AT] = None
     # Nor measured from the replay, so these equal scores can never pass for a measurement.
     scores[QUALITY_MEASURED_AT] = None

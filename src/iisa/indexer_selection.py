@@ -229,20 +229,24 @@ class IndexerSelector:
             dips_adjustment = self.data["indexer"].map(self.optimistic_dips_fees).fillna(0.0)
             effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
 
-            if "last_known_slashable_stake" in self.data.columns:
-                self.data["stake_to_fees"] = self.data[
-                    "last_known_slashable_stake"
-                ] / effective_fees.replace(0.0, float("nan"))
+            stake = self.data.get("last_known_slashable_stake")
+            # With no stake read, as on a degraded day, there is no ratio to work out, so every
+            # indexer keeps the stake-to-fees score the job sent.
+            if stake is not None and stake.notna().any():
+                self.data["stake_to_fees"] = stake / effective_fees.replace(0.0, float("nan"))
                 # Drop pre-normalised column so _normalize_metrics recomputes it
                 self.data = self.data.drop(columns=["norm_stake_to_fees"], errors="ignore")
-
-            adjusted_count = (dips_adjustment > 0).sum()
-            logger.info(
-                "deployment=%s applied optimistic DIPs fees to %d/%d indexers",
-                self.deployment_id,
-                adjusted_count,
-                len(self.data),
-            )
+                logger.info(
+                    "deployment=%s applied optimistic DIPs fees to %d/%d indexers",
+                    self.deployment_id,
+                    (dips_adjustment > 0).sum(),
+                    len(self.data),
+                )
+            else:
+                logger.info(
+                    "deployment=%s left optimistic DIPs fees out: the scores hold no stake",
+                    self.deployment_id,
+                )
 
         # Get the current group of indexers for the subgraph using '_get_current_group'
         self.current_group = self._get_current_group()

@@ -274,6 +274,15 @@ class TestNothingToCarryOver:
         assert [row["indexer"] for row in pushed] == INDEXERS and _is_fallback(pushed)
         assert any("mode=degraded" in r.getMessage() for r in caplog.records)
 
+    def test_the_fallback_scores_send_stake_and_fees_as_missing(self, monkeypatch, iisa, clock):
+        """No stake was read, so none is sent, and iisa keeps the neutral score for everyone
+        rather than work a ratio out from zeros nobody read.
+        """
+        pushed = _failed_run(monkeypatch, iisa)
+
+        assert _by_indexer(pushed, [*STAKE_COLUMNS, READ_AT]) == {i: [None] * 4 for i in INDEXERS}
+        assert {row["norm_stake_to_fees"] for row in pushed} == {0.5}
+
     def test_fallback_scores_are_never_carried_over(self, monkeypatch, iisa, clock):
         fallback = _failed_run(monkeypatch, iisa)
         clock["now"] = NOW + DAY

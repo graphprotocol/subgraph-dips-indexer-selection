@@ -300,7 +300,7 @@ class TestStakeReadTime:
         assert ((read_at >= before) & (read_at <= after)).all()
 
     def test_the_fallback_scores_have_no_read_time(self, monkeypatch):
-        """The fallback never reads stake, so its zeros can never pass for a reading."""
+        """The fallback never reads stake, so nothing in it can ever pass for a reading."""
         monkeypatch.setattr(processing, "fetch_dips_info", _pricing)
         monkeypatch.setattr(processing, "fetch_and_filter_graph_node_versions", lambda df, _u: df)
 
@@ -416,13 +416,14 @@ class TestReusingAnEarlierRead:
         assert _pushed_stake(pushed)[INDEXERS[2]] == [None] * 3
         assert _first(caplog.records, "WARNING", "out of today's scores") is None
 
-    def test_the_fallback_snapshot_is_never_reused(self, monkeypatch, iisa, clock):
-        """The fallback sends stake and fees as 0 with a neutral score and no read time."""
+    @pytest.mark.parametrize("unread", [None, 0.0], ids=["missing", "zero-as-older-jobs-sent"])
+    def test_the_fallback_snapshot_is_never_reused(self, monkeypatch, iisa, clock, unread):
+        """The fallback sends a neutral score with no stake, fees or read time."""
         iisa.held = [
             {
                 "indexer": indexer,
-                "last_known_slashable_stake": 0.0,
-                "total_query_fees": 0.0,
+                "last_known_slashable_stake": unread,
+                "total_query_fees": unread,
                 "stake_to_fees": None,
                 "norm_stake_to_fees": 0.5,
                 READ_AT: None,
