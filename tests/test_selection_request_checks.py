@@ -223,6 +223,21 @@ def test_no_candidates_still_selects_nobody(count):
     assert response.json()["indexers"] == []
 
 
+def _members(count):
+    return [f"0x{i:040x}" for i in range(count)]
+
+
+def test_100_members_is_accepted():
+    assert _post(_request(existing_indexers=_members(100))).status_code == 200
+
+
+def test_more_than_100_members_is_refused():
+    response = _post(_request(existing_indexers=_members(101)))
+
+    assert response.status_code == 422
+    assert [e["loc"] for e in response.json()["detail"]] == [["body", "existing_indexers"]]
+
+
 @pytest.mark.parametrize(
     ("fields", "location"),
     [

@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -1032,6 +1034,116 @@ class TestPushScoresEndpoint:
         assert response.status_code == 200
         assert response.json()["rows"] == 1
         assert scores_path.exists()
+
+    def test_overlapping_pushes_leave_disk_and_memory_agreeing(self, tmp_path, monkeypatch):
+        """Pushes of 2 different payloads at once, as when an operator re-runs the score job
+        while the scheduled run is pushing, all succeed and leave a whole cache file holding
+        the payload being served, so a restart serves the same scores rather than none.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        # Large enough that the writes overlap; the 2 payloads differ in size and computed_at.
+        payloads = [
+            [
+                {**self._sample_payload()[0], "indexer": f"0x{hour}{i:06d}", "computed_at": at}
+                for i in range(rows)
+            ]
+            for hour, rows in ((9, 1500), (10, 1501))
+            for at in [f"2026-04-14T{hour:02d}:00:00+00:00"]
+        ] * 2
+
+        for _ in range(5):
+            barrier = threading.Barrier(len(payloads))
+
+            def push(payload):
+                barrier.wait()
+                return client.post("/scores", json=payload).status_code
+
+            with ThreadPoolExecutor(len(payloads)) as pool:
+                codes = list(pool.map(push, payloads))
+
+            assert codes == [200] * len(payloads)
+            on_disk = json.loads(scores_path.read_text())
+            served = iisa_http_endpoints._state.data_manager.snapshot
+            assert len(on_disk) == len(served.data)
+            assert datetime.fromisoformat(on_disk[0]["computed_at"]) == served.computed_at
+            assert os.listdir(tmp_path) == ["scores.json"]
+
+    def test_push_arriving_mid_commit_waits_for_it(self, tmp_path, monkeypatch):
+        """A push arriving while another is between writing the cache file and serving its
+        scores waits for it, so the payload written last is also the one served.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        state = iisa_http_endpoints._state
+        state.initialize(Settings())
+        commit = state.data_manager.commit_scores
+        first_committing, second_committed = threading.Event(), threading.Event()
+
+        def commit_after_the_second(transformed, computed_at):
+            if first_committing.is_set():
+                commit(transformed, computed_at)
+                second_committed.set()
+                return
+            # Unlocked, the second push commits within this wait; locked, it can't, so the wait
+            # runs out and the first commits before the second gets its turn.
+            first_committing.set()
+            second_committed.wait(timeout=1)
+            commit(transformed, computed_at)
+
+        monkeypatch.setattr(state.data_manager, "commit_scores", commit_after_the_second)
+        first, second = (
+            [{**self._sample_payload()[0], "computed_at": f"2026-04-14T{hour}:00:00+00:00"}]
+            for hour in ("09", "10")
+        )
+        with ThreadPoolExecutor(2) as pool:
+            pushed_first = pool.submit(state.load_scores_from_records, first)
+            assert first_committing.wait(timeout=5)
+            pushed_second = pool.submit(state.load_scores_from_records, second)
+            assert [pushed_first.result(), pushed_second.result()] == [1, 1]
+
+        latest = datetime(2026, 4, 14, 10, tzinfo=timezone.utc)
+        on_disk = json.loads(scores_path.read_text())
+        assert datetime.fromisoformat(on_disk[0]["computed_at"]) == latest
+        assert state.data_manager.snapshot.computed_at == latest
+
+    def test_failed_cache_write_keeps_the_previous_cache(self, tmp_path, monkeypatch):
+        """A write that fails partway, such as on a full disk, answers 500 and leaves the
+        previous cache file and the served scores as they were, with no partial file behind.
+        """
+        from iisa import iisa_http_endpoints, score_loader
+        from iisa.iisa_http_endpoints import Settings, app
+
+        scores_path = tmp_path / "scores.json"
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(scores_path))
+        iisa_http_endpoints.get_settings.cache_clear()
+        iisa_http_endpoints._state.initialize(Settings())
+        client = TestClient(app, raise_server_exceptions=False)
+        assert client.post("/scores", json=self._sample_payload()).status_code == 200
+        before = scores_path.read_text()
+        served = iisa_http_endpoints._state.data_manager.snapshot
+
+        def half_written(payload, f, **kwargs):
+            f.write("[{")
+            raise OSError(28, "No space left on device")
+
+        later = [{**self._sample_payload()[0], "computed_at": "2026-04-15T09:00:00+00:00"}]
+        with patch("iisa.iisa_http_endpoints.json.dump", side_effect=half_written):
+            response = client.post("/scores", json=later)
+
+        assert response.status_code == 500
+        assert scores_path.read_text() == before
+        assert iisa_http_endpoints._state.data_manager.snapshot is served
+        assert os.listdir(tmp_path) == ["scores.json"]
 
 
 class TestScoresStatusEndpoint:
@@ -2306,6 +2418,45 @@ class TestPushSyncStatusEndpoint:
         assert response.status_code == 200
         assert response.json() == {"status": "success", "indexers": 1}
 
+    def test_push_arriving_mid_save_waits_for_it(self, tmp_path, monkeypatch):
+        """A push arriving while another is between writing the cache file and serving its
+        sync status waits for it, so the payload written last is also the one served.
+        """
+        from iisa import iisa_http_endpoints
+        from iisa.iisa_http_endpoints import Settings
+
+        iisa_http_endpoints.get_settings.cache_clear()
+        settings = Settings()
+        cache_path = tmp_path / "sync_status.json"
+        settings.sync_status_file_path = str(cache_path)
+        state = iisa_http_endpoints._state
+        state.initialize(settings)
+        write = iisa_http_endpoints._atomic_write_json
+        first_wrote, second_done = threading.Event(), threading.Event()
+
+        def write_then_wait_for_the_second(path, payload):
+            write(path, payload)
+            if not first_wrote.is_set():
+                # Unlocked, the second push finishes within this wait; locked, it can't, so the
+                # wait runs out and the first is served before the second gets its turn.
+                first_wrote.set()
+                second_done.wait(timeout=1)
+
+        monkeypatch.setattr(
+            iisa_http_endpoints, "_atomic_write_json", write_then_wait_for_the_second
+        )
+        first = self._sample_payload()
+        second = {**first, "0xBBB": first["0xAAA"]}
+        with ThreadPoolExecutor(2) as pool:
+            pushed_first = pool.submit(state.load_sync_status_from_dict, first)
+            assert first_wrote.wait(timeout=5)
+            pushed_second = pool.submit(state.load_sync_status_from_dict, second)
+            pushed_second.add_done_callback(lambda _: second_done.set())
+            assert [pushed_first.result(), pushed_second.result()] == [1, 2]
+
+        assert sorted(json.loads(cache_path.read_text())) == ["0xAAA", "0xBBB"]
+        assert state.sync_status.total_indexers == 2
+
     def test_push_sync_status_rejects_wrong_token(self, monkeypatch):
         monkeypatch.setenv("IISA_PUSH_TOKEN", "secret")
         from iisa import iisa_http_endpoints
@@ -2321,6 +2472,40 @@ class TestPushSyncStatusEndpoint:
             headers={"Authorization": "Bearer wrong"},
         )
         assert response.status_code == 401
+
+
+def test_startup_removes_temp_files_left_by_killed_writes(tmp_path, monkeypatch):
+    """Temp files that a killed pod left beside each cache file, which no later write reuses,
+    are removed at startup, while the cache files and everything else stay.
+    """
+    from iisa import iisa_http_endpoints, score_loader
+    from iisa.iisa_http_endpoints import app
+
+    monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "scores.json"))
+    monkeypatch.setenv("IISA_SYNC_STATUS_FILE_PATH", str(tmp_path / "sync_status.json"))
+    monkeypatch.setenv("IISA_FRESHNESS_FILE_PATH", str(tmp_path / "freshness.json"))
+    iisa_http_endpoints.get_settings.cache_clear()
+    name = "0123456789abcdef" * 2
+    left_behind = [
+        "scores.json.tmp",
+        f"scores.json.{name}.tmp",
+        f"sync_status.json.{name}.tmp",
+        "freshness.json.tmp",
+    ]
+    kept = [
+        "scores.json",
+        "sync_status.json",
+        "scores.json.bak",
+        "scores.json.not-a-temp-name.tmp",
+        "other.json.tmp",
+    ]
+    for file_name in left_behind + kept:
+        (tmp_path / file_name).write_text("[]" if file_name == "scores.json" else "{}")
+
+    with TestClient(app):
+        pass
+
+    assert sorted(os.listdir(tmp_path)) == sorted(kept)
 
 
 class TestRequirePushTokenStartup:

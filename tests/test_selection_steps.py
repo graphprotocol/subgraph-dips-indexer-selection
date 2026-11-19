@@ -123,14 +123,93 @@ class TestLeaving:
         selector._assign_indexers_to_subgraph()
 
         assert selector.current_group == ["B", "C"]
-        assert selector.steps == [Step("removed", "A", score=0.5)]
+        assert selector.steps == [Step("removed", "A", score=0.5, kept_spread=True)]
+
+    def test_a_removal_that_keeps_the_group_spread_is_preferred_over_a_lower_total(self):
+        """Taking out A, the lowest, would leave B and C in 1 operator, so C goes instead."""
+        orgs = {"B": "shared", "C": "shared"}
+        selector = _selector(
+            {"A": 0.5, "B": 0.9, "C": 0.7}, group=("A", "B", "C"), target=2, orgs=orgs
+        )
+
+        selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["A", "B"]
+        assert selector.steps == [Step("removed", "C", score=0.7, kept_spread=True)]
+
+    def test_the_lowest_total_is_removed_when_no_removal_keeps_the_group_spread(self):
+        orgs = dict.fromkeys("ABC", "shared")
+        selector = _selector(
+            {"A": 0.5, "B": 0.9, "C": 0.7}, group=("A", "B", "C"), target=2, orgs=orgs
+        )
+
+        selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["B", "C"]
+        assert selector.steps == [Step("removed", "A", score=0.5, kept_spread=False)]
+
+    def test_a_group_shrinks_to_a_target_of_1(self):
+        """A group of 1 can't be spread, so the spread can't decide which member stays."""
+        selector = _selector({"A": 0.5, "B": 0.9}, group=("A", "B"), target=1)
+
+        selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["B"]
+        assert selector.steps == [Step("removed", "A", score=0.5, kept_spread=None)]
+
+    def test_a_group_whose_totals_failed_is_left_as_it_is(self):
+        """With scoring failed every total is NaN, so trimming would cancel members at random."""
+        nan = float("nan")
+        selector = _selector({"A": nan, "B": nan, "C": nan}, group=("A", "B", "C"), target=1)
+
+        selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["A", "B", "C"]
+        assert selector.steps == []
+
+    def test_a_group_with_no_scored_member_is_left_as_it_is(self):
+        """None of X, Y and Z has a score row, so there is nothing to rank them by."""
+        selector = _selector({"A": 0.5}, group=("X", "Y", "Z"), target=1)
+
+        selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["X", "Y", "Z"]
+        assert selector.steps == []
+
+    def test_trimming_to_a_target_of_1_keeps_the_best_scorer(self):
+        """Only taking out H keeps the 3 spread, but a group of 1 needs no spread, so H stays."""
+        selector = _selector({"H": 0.9, "X": 0.5, "Y": 0.1}, group=("H", "X", "Y"), target=1)
+        selector.data["org"] = ["o1", "o1", "o2"]
+        selector.data["destination_loc"] = ["l1", "l2", "l1"]
+
+        selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["H"]
+        assert [step.indexer for step in selector.steps] == ["Y", "X"]
+
+    def test_once_no_removal_keeps_the_group_spread_the_rest_go_without_checking_again(self):
+        """Removing members only narrows a group, so once 1 pass finds no removal that keeps it
+        spread, none can, and a group of thousands isn't checked again for every member shed."""
+        orgs = dict.fromkeys("ABCDE", "shared")
+        scores = {"A": 0.1, "B": 0.5, "C": 0.3, "D": 0.9, "E": 0.7}
+        selector = _selector(scores, group=tuple("ABCDE"), target=2, orgs=orgs)
+        check = selector._meets_decentralization_requirements_indexer_removal
+
+        with patch.object(
+            selector, "_meets_decentralization_requirements_indexer_removal", wraps=check
+        ) as spread_check:
+            selector._assign_indexers_to_subgraph()
+
+        assert selector.current_group == ["D", "E"]
+        assert [step.indexer for step in selector.steps] == ["A", "C", "B"]
+        assert spread_check.call_count == 5
 
     def test_a_member_with_no_score_is_removed_on_a_total_of_0(self):
         selector = _selector({"B": 0.9, "C": 0.7}, group=("X", "B", "C"), target=2)
 
         selector._assign_indexers_to_subgraph()
 
-        assert selector.steps == [Step("removed", "X", score=0.0)]
+        assert selector.steps == [Step("removed", "X", score=0.0, kept_spread=True)]
 
     def test_a_failing_member_swapped_out_is_a_step_naming_both(self):
         scores = {"A": 0.05, "B": 0.9, "C": 0.7, "D": 0.8}
