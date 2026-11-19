@@ -21,6 +21,7 @@ there is no shared filesystem between the cronjob and the iisa service.
 
 import json
 import logging
+import math
 import os
 import random
 import sys
@@ -87,6 +88,10 @@ _ROW_COLUMNS: Tuple[str, ...] = (
     "subgraph_network",
     "url",
 )
+
+# blocks_behind is a uint64 in the proto but goes into an int64 column in _build_dataframe.
+# Nothing scores on it, so a larger value is clipped and the rest of the attempt kept.
+_BLOCKS_BEHIND_MAX = int(np.iinfo(np.int64).max)
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +321,8 @@ def _count_partition_worker(args: tuple) -> tuple:
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     fees: Dict[bytes, float] = defaultdict(float)
     stats = _PartitionReadStats()
+    unusable_fees = 0
+    isfinite = math.isfinite  # a local name is cheaper to call on every attempt
 
     queries = _iter_partition_queries(
         "count",
@@ -336,8 +343,21 @@ def _count_partition_worker(args: tuple) -> tuple:
                 dep_bytes = bytes(attempt.deployment)
                 if len(dep_bytes) == 32 and len(idx_bytes) == 20:
                     counts[(dep_bytes, idx_bytes)] += 1
-                    fees[idx_bytes] += attempt.fee_grt
+                    # 1 fee that is not finite swamps the total and negative ones can net it to
+                    # 0 or below; a NaN or 0 total reads in iisa as the best stake-to-fees.
+                    fee = attempt.fee_grt
+                    if isfinite(fee) and fee >= 0.0:
+                        fees[idx_bytes] += fee
+                    else:
+                        unusable_fees += 1
 
+    if unusable_fees:
+        logger.warning(
+            "count p%d: left %s attempt(s) with a fee that is negative or not a finite number out "
+            "of the indexers' fee totals",
+            partition,
+            f"{unusable_fees:,}",
+        )
     return (counts, fees, stats.messages, stats.filtered)
 
 
@@ -361,6 +381,53 @@ class _InternCache(dict[str, str]):
         return interned
 
 
+@dataclass
+class _UnusableValues:
+    """Attempts in 1 sample-pass partition read with a value replaced by _usable_values."""
+
+    fees: int = 0
+    blocks_behind: int = 0
+
+
+def _usable_values(fee: float, blocks_behind: int, unusable: _UnusableValues) -> Tuple[float, int]:
+    """Return an attempt's fee and blocks_behind as values the scoring frame can hold.
+
+    A negative or non-finite fee becomes missing: the latency regression drops rows with a
+    missing fee, while an infinite one makes its scaler raise, and uptime and success rates
+    still count the attempt. blocks_behind is clipped to its int64 column. Each change is counted.
+    """
+    if not (math.isfinite(fee) and fee >= 0.0):
+        fee = math.nan
+        unusable.fees += 1
+    if blocks_behind > _BLOCKS_BEHIND_MAX:
+        blocks_behind = _BLOCKS_BEHIND_MAX
+        unusable.blocks_behind += 1
+    return fee, blocks_behind
+
+
+def _warn_about_unusable_values(partition: int, unusable: _UnusableValues) -> None:
+    """Log how many attempts the sample pass read in 1 partition with a value it had to replace.
+
+    The counts include attempts the reservoir went on to drop.
+    """
+    if unusable.fees:
+        logger.warning(
+            "sample p%d: read %s attempt(s) with a fee that is negative or not a finite number; "
+            "any the sample keeps have the fee missing, which leaves them out of the latency "
+            "regression",
+            partition,
+            f"{unusable.fees:,}",
+        )
+    if unusable.blocks_behind:
+        logger.warning(
+            "sample p%d: read %s attempt(s) with blocks_behind above %s; any the sample keeps "
+            "have it clipped to that",
+            partition,
+            f"{unusable.blocks_behind:,}",
+            f"{_BLOCKS_BEHIND_MAX:,}",
+        )
+
+
 def _sample_partition_worker(args: tuple) -> tuple:
     """
     Sample pass for a single partition. Runs in a child process.
@@ -382,6 +449,8 @@ def _sample_partition_worker(args: tuple) -> tuple:
     reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     stats = _PartitionReadStats()
+    unusable = _UnusableValues()
+    isfinite = math.isfinite  # a local name is cheaper to call on every attempt
 
     # Protobuf returns a fresh str per message even for repeated values, so each value is
     # interned once on first sight and every later row is a dict hit (2.76B attempts in
@@ -415,12 +484,18 @@ def _sample_partition_worker(args: tuple) -> tuple:
                 key = (dep_bytes, idx_bytes)
                 n = counts[key]
 
+                # Checked inline so only an attempt with a value to replace pays for a call.
+                fee = attempt.fee_grt
+                blocks_behind = attempt.blocks_behind
+                if not (isfinite(fee) and fee >= 0.0 and blocks_behind <= _BLOCKS_BEHIND_MAX):
+                    fee, blocks_behind = _usable_values(fee, blocks_behind, unusable)
+
                 # query_id is unique per query, so interning it would cost cycles for no saving.
                 row = (
                     query.query_id,
-                    attempt.fee_grt,
+                    fee,
                     ts_ms,
-                    attempt.blocks_behind,
+                    blocks_behind,
                     attempt.response_time_ms,
                     status_cache[attempt.result],
                     chain_cache[attempt.indexed_chain],
@@ -434,6 +509,7 @@ def _sample_partition_worker(args: tuple) -> tuple:
 
                 counts[key] += 1
 
+    _warn_about_unusable_values(partition, unusable)
     return (reservoirs, counts, stats.filtered)
 
 
