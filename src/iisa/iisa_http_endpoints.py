@@ -1140,9 +1140,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Besides /select-indexers, the routes that take a body check their token only after parsing all
-# of it, which for tiny JSON elements uses up to about 50 times its size in memory on POST /scores
-# and 26 on the rest. So each has its own limit, sized from its real sender with room to grow.
+# The routes that take a token and a body check the token only after parsing all of the body,
+# which for tiny JSON elements uses up to about 50 times its size in memory on POST /scores and
+# 26 on the rest. So each has its own limit, sized from its real sender with room to grow.
 
 # The score job's daily push: about 1,100 bytes an indexer plus 140 a chain it served or priced,
 # so 300 indexers on 50 chains is about 2.4 MB, and 16 MiB holds 1,000 indexers on 100 chains.
