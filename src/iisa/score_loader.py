@@ -287,14 +287,14 @@ class DataManager:
         return True
 
     def _transform_scores_to_perf_history(self, scores_df: pd.DataFrame) -> pd.DataFrame:
-        """Rename CronJob score columns to the names IndexerSelector expects.
-
-        Maps lat_coefficient_upper_bound -> latency-CI column, success_rate -> average_status,
-        lat_normalized_score -> norm_lat_lin_reg_coefficient, uptime_score (x100) -> "% up_x",
-        and dst_lat/dst_lon -> destination_loc. A missing location or org goes in empty, since
-        selection reads both.
+        """Rename CronJob score columns to the names IndexerSelector expects, and lowercase
+        indexer addresses as selection requests are. Maps lat_coefficient_upper_bound ->
+        latency-CI column, success_rate -> average_status, lat_normalized_score ->
+        norm_lat_lin_reg_coefficient, uptime_score (x100) -> "% up_x", and dst_lat/dst_lon ->
+        destination_loc. A missing location or org goes in empty, since selection reads both.
         """
         df = scores_df.copy()
+        df[cols.INDEXER] = df[cols.INDEXER].str.lower()
 
         df = df.rename(columns=cols.CRONJOB_TO_SELECTOR_RENAME)
 

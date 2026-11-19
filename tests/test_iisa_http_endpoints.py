@@ -94,17 +94,17 @@ class TestPydanticModels:
             chain_id="arbitrum-one",
             existing_indexers=["0x111"],
             num_candidates=2,
-            blocklist=["0xBAD"],
-            pending_agreements={"Qm123": ["0xPEND"]},
-            declined_indexers={"Qm123": ["0xDEC"]},
+            blocklist=["0xbad"],
+            pending_agreements={"Qm123": ["0xpend"]},
+            declined_indexers={"Qm123": ["0xdec"]},
         )
 
         # Assert
         assert request.existing_indexers == ["0x111"]
         assert request.num_candidates == 2
-        assert request.blocklist == ["0xBAD"]
-        assert request.pending_agreements == {"Qm123": ["0xPEND"]}
-        assert request.declined_indexers == {"Qm123": ["0xDEC"]}
+        assert request.blocklist == ["0xbad"]
+        assert request.pending_agreements == {"Qm123": ["0xpend"]}
+        assert request.declined_indexers == {"Qm123": ["0xdec"]}
 
     def test_selection_request_missing_num_candidates_raises(self):
         """Verify ValidationError when num_candidates missing."""
@@ -2055,7 +2055,7 @@ class TestSelectWithProcessor:
         request = SelectionRequest(
             deployment_id="Qm123",
             chain_id="arbitrum-one",
-            blocklist=["0xBAD1", "0xBAD2"],
+            blocklist=["0xbad1", "0xbad2"],
             num_candidates=3,
         )
 
@@ -2064,7 +2064,7 @@ class TestSelectWithProcessor:
 
         # Assert
         call_kwargs = mock_processor_class.call_args[1]
-        assert call_kwargs["indexer_denylist"] == ["0xBAD1", "0xBAD2"]
+        assert call_kwargs["indexer_denylist"] == ["0xbad1", "0xbad2"]
 
     @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_with_processor_builds_existing_agreements(
@@ -2084,7 +2084,7 @@ class TestSelectWithProcessor:
         request = SelectionRequest(
             deployment_id="Qm123",
             chain_id="arbitrum-one",
-            existing_indexers=["0xEXIST1", "0xEXIST2"],
+            existing_indexers=["0xexist1", "0xexist2"],
             num_candidates=3,
         )
 
@@ -2093,7 +2093,7 @@ class TestSelectWithProcessor:
 
         # Assert
         call_kwargs = mock_processor_class.call_args[1]
-        assert call_kwargs["existing_agreements"] == {"Qm123": ["0xEXIST1", "0xEXIST2"]}
+        assert call_kwargs["existing_agreements"] == {"Qm123": ["0xexist1", "0xexist2"]}
 
     @patch("iisa.iisa_http_endpoints.IndexerSelector")
     def test_select_with_processor_passes_pending_agreements(
@@ -2110,7 +2110,7 @@ class TestSelectWithProcessor:
 
         iisa_http_endpoints._state._history = mock_history_df
 
-        pending = {"Qm123": ["0xPEND1"], "Qm456": ["0xPEND2"]}
+        pending = {"Qm123": ["0xpend1"], "Qm456": ["0xpend2"]}
         request = SelectionRequest(
             deployment_id="Qm123",
             chain_id="arbitrum-one",
@@ -2140,7 +2140,7 @@ class TestSelectWithProcessor:
 
         iisa_http_endpoints._state._history = mock_history_df
 
-        declined = {"Qm123": ["0xDEC1", "0xDEC2"]}
+        declined = {"Qm123": ["0xdec1", "0xdec2"]}
         request = SelectionRequest(
             deployment_id="Qm123",
             chain_id="arbitrum-one",
