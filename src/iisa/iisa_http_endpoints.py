@@ -319,6 +319,12 @@ class SelectionRequest(BaseModel):
             raise ValueError(f"has {len(data):,} fields, more than the {most} a request may have")
         return data
 
+    @field_validator("existing_indexers")
+    @classmethod
+    def _each_member_once(cls, members: Optional[list[str]]) -> Optional[list[str]]:
+        """A member named twice, as once in capitals, counts once, or it would fill 2 places."""
+        return None if members is None else list(dict.fromkeys(members))
+
 
 class SelectedIndexer(BaseModel):
     """Indexer entry in the selection response, including pricing info."""
