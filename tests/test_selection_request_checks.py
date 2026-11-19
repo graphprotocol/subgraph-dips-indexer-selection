@@ -498,9 +498,16 @@ def test_scores_pushed_during_a_selection_do_not_reach_it(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "step", ["_prepare_selection", "_build_selector", "_selection_response", "_record_selection"]
+    ("step", "num_candidates"),
+    [
+        ("_prepare_selection", 2),
+        ("_build_selector", 2),
+        ("_selection_response", 2),
+        ("_record_selection", 2),
+        pytest.param("_record_selection", 0, id="_record_selection-nobody-asked-for"),
+    ],
 )
-async def test_health_answers_while_a_slow_selection_runs(monkeypatch, step):
+async def test_health_answers_while_a_slow_selection_runs(monkeypatch, step, num_candidates):
     began = threading.Event()
     answered = threading.Event()
     began_at = []
@@ -527,7 +534,8 @@ async def test_health_answers_while_a_slow_selection_runs(monkeypatch, step):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://iisa") as client:
         selection, (health, answered_at) = await asyncio.gather(
-            client.post("/select-indexers", json=_request()), health_once_selecting(client)
+            client.post("/select-indexers", json=_request(num_candidates=num_candidates)),
+            health_once_selecting(client),
         )
 
     assert selection.status_code == 200

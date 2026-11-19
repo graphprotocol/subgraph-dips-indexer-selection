@@ -1880,7 +1880,8 @@ async def select_indexers(request: SelectionRequest) -> SelectionResponse:
 
     if request.num_candidates <= 0:
         nobody = SelectionResponse(deployment_id=request.deployment_id, indexers=[])
-        _record_selection(request, _SelectionRun(nobody, "nothing_asked_for"))
+        run = _SelectionRun(nobody, "nothing_asked_for")
+        await _on_selection_worker(_record_selection, request, run)
         return nobody
 
     logger.info(
