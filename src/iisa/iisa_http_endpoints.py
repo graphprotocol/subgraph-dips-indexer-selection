@@ -52,6 +52,8 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from starlette._utils import get_route_path
+from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import score_columns as cols
@@ -603,6 +605,7 @@ def _log_safe(text: str, limit: int = 200) -> str:
 # Outcomes are checked 1 by 1 once the push is read, so any item is accepted here and refused
 # later. The schema says so while still describing the outcome that gets applied.
 _OutcomeItem = Annotated[Any, WithJsonSchema({"anyOf": [FreshnessOutcome.model_json_schema(), {}]})]
+MAX_FRESHNESS_OUTCOMES = 50_000
 
 
 class FreshnessPush(BaseModel):
@@ -614,7 +617,7 @@ class FreshnessPush(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     minute: Annotated[datetime, BeforeValidator(_whole_utc_minute)]
-    outcomes: list[_OutcomeItem] = Field(max_length=50_000)
+    outcomes: list[_OutcomeItem] = Field(max_length=MAX_FRESHNESS_OUTCOMES)
     _accepted: list[FreshnessOutcome] = PrivateAttr(default_factory=list)
     _refused: int = PrivateAttr(default=0)
     _first_refusal: Optional[str] = PrivateAttr(default=None)
@@ -1089,7 +1092,7 @@ def _require_push_token(authorization: Optional[str]) -> None:
 
     When IISA_PUSH_TOKEN is unset, auth is off (local dev convenience).
     """
-    _require_one_of([get_settings().push_token], authorization)
+    _require_one_of(_push_tokens(), authorization)
 
 
 def _require_read_token(authorization: Optional[str]) -> None:
@@ -1097,27 +1100,40 @@ def _require_read_token(authorization: Optional[str]) -> None:
 
     When neither is set, auth is off (local dev convenience).
     """
+    _require_one_of(_read_tokens(), authorization)
+
+
+def _push_tokens() -> list[Optional[str]]:
+    return [get_settings().push_token]
+
+
+def _read_tokens() -> list[Optional[str]]:
     settings = get_settings()
-    _require_one_of([settings.push_token, settings.read_token], authorization)
+    return [settings.push_token, settings.read_token]
 
 
 def _require_one_of(tokens: list[Optional[str]], authorization: Optional[str]) -> None:
-    """Raise a 401 unless the bearer token is 1 of the tokens set; with none set, allow all.
+    """Raise a 401 unless the bearer token is 1 of the tokens set; with none set, allow all."""
+    refusal = _token_refusal(tokens, authorization)
+    if refusal is not None:
+        raise HTTPException(status_code=401, detail=refusal)
 
-    "Bearer" is matched in any letter case per RFC 6750 §2.1, the token exactly.
-    hmac.compare_digest dodges timing oracles; it compares bytes, since it refuses text with
-    non-ASCII letters. Every token is compared, so the time taken says nothing about which one
-    the provided token was closest to.
+
+def _token_refusal(tokens: list[Optional[str]], authorization: Optional[str]) -> Optional[str]:
+    """Why the bearer token is refused, or None when it is 1 of the tokens set or none is set.
+
+    "Bearer" is matched in any letter case per RFC 6750 §2.1, the token exactly. Every token is
+    compared with hmac.compare_digest, on bytes since it refuses non-ASCII text, so the time
+    taken says nothing about the token or which one it was closest to.
     """
     expected = [token.encode() for token in tokens if token]
     if not expected:
-        return
+        return None
     if not authorization or authorization[:7].lower() != "bearer ":
-        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+        return "Missing or malformed Authorization header"
     provided = authorization[7:].strip().encode()
     matches = [hmac.compare_digest(provided, token) for token in expected]
-    if not any(matches):
-        raise HTTPException(status_code=401, detail="Invalid bearer token")
+    return None if any(matches) else "Invalid bearer token"
 
 
 # Global state
@@ -1227,25 +1243,84 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# FastAPI parses a whole body before a route runs, which for tiny JSON elements takes up to about
+# 50 times its size in memory. So a route's token is checked before any body is read, and each
+# body has a limit, a sanity cap for senders with the token sized from what they push.
 
-class _SelectionBodyLimit:
-    """Refuse a /select-indexers body over MAX_SELECTION_BODY_BYTES with a 413 before it is parsed.
+# The score job's daily push: up to about 1,200 bytes an indexer plus 165 a chain it served or
+# priced, so 1,000 indexers on 100 chains is about 17.5 MB, and this holds twice that.
+MAX_SCORES_BODY_BYTES = 32 * 1024 * 1024
+# The sync-status fetcher's push: about 50 bytes for each deployment an indexer claims and holds
+# an active allocation on, so 16 MiB holds about 330,000.
+MAX_SYNC_STATUS_BODY_BYTES = 16 * 1024 * 1024
+# The freshness prober's push: up to MAX_FRESHNESS_OUTCOMES outcomes, and requests escapes text
+# to up to 12 bytes a character, so the longest outcome FreshnessOutcome accepts takes 5,668
+# bytes. This holds that many of the longest, so no push its rules allow is refused and lost.
+MAX_FRESHNESS_BODY_BYTES = MAX_FRESHNESS_OUTCOMES * 5_700 + 1024
+# A score request names 1 indexer in about 60 bytes.
+MAX_GET_SCORE_BODY_BYTES = 64 * 1024
 
-    The request's own checks run only once the whole body has been read and parsed, and this is
-    the 1 endpoint that takes no token, so a huge body could use up the service's memory first.
-    Only this route is covered, since the score job's POST /scores is legitimately large.
+
+class _BodyRoute(NamedTuple):
+    """The most body a route reads, and the tokens it accepts, None for a route with no token."""
+
+    limit: int
+    tokens: Optional[Callable[[], list[Optional[str]]]] = None
+
+
+_BODY_ROUTES = {
+    ("POST", "/select-indexers"): _BodyRoute(MAX_SELECTION_BODY_BYTES),
+    ("POST", "/scores"): _BodyRoute(MAX_SCORES_BODY_BYTES, _push_tokens),
+    ("POST", "/sync-status"): _BodyRoute(MAX_SYNC_STATUS_BODY_BYTES, _push_tokens),
+    ("POST", "/freshness"): _BodyRoute(MAX_FRESHNESS_BODY_BYTES, _push_tokens),
+    ("POST", "/get-score"): _BodyRoute(MAX_GET_SCORE_BODY_BYTES, _read_tokens),
+}
+# A GET, HEAD or OPTIONS request has no body any route reads, so it passes through unread.
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+# Any other request with a body, as to a path with no route, is held to this, so a route added
+# or renamed without a limit of its own still has one.
+DEFAULT_BODY_LIMIT = 64 * 1024
+
+
+def _body_route(method: str, route_path: str) -> _BodyRoute:
+    """What a request is checked against, by its method and its path as the routes match it."""
+    return _BODY_ROUTES.get((method, route_path), _BodyRoute(DEFAULT_BODY_LIMIT))
+
+
+def _token_refusal_for(route: _BodyRoute, scope: Scope) -> Optional[str]:
+    """Why the request's bearer token is refused, or None when its route accepts it."""
+    if route.tokens is None:
+        return None
+    return _token_refusal(route.tokens(), Headers(scope=scope).get("authorization"))
+
+
+class _BodyLimit:
+    """Before a body is read, refuse a request without its route's token with a 401, and one
+    whose body is over its route's limit with a 413.
+
+    A route's own checks, its token check included, run only once the whole body has been read
+    and parsed, so a huge body could use up the service's memory first. Requests whose method
+    carries no body pass through untouched.
     """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] != "/select-indexers":
+        if scope["type"] != "http" or scope["method"] not in _BODY_METHODS:
             await self.app(scope, receive, send)
             return
+        # The path without any root_path the app is served under, as the routes match it.
+        route = _body_route(scope["method"], get_route_path(scope))
+        refusal = _token_refusal_for(route, scope)
+        if refusal is not None:
+            # The answer the route's own check would give, as FastAPI writes an HTTPException.
+            await JSONResponse(status_code=401, content={"detail": refusal})(scope, receive, send)
+            return
+        limit = route.limit
         declared = dict(scope["headers"]).get(b"content-length", b"")
-        if declared.isdigit() and int(declared) > MAX_SELECTION_BODY_BYTES:
-            await _body_too_large(scope, receive, send)
+        if declared.isdigit() and int(declared) > limit:
+            await _body_too_large(scope, receive, send, limit)
             return
 
         # No length, or one within the limit: read the body, counting what arrives.
@@ -1256,8 +1331,8 @@ class _SelectionBodyLimit:
             if message["type"] != "http.request":
                 return  # The client went away before sending the whole body.
             received += len(message.get("body", b""))
-            if received > MAX_SELECTION_BODY_BYTES:
-                await _body_too_large(scope, receive, send)
+            if received > limit:
+                await _body_too_large(scope, receive, send, limit)
                 return
             pieces.append(message.get("body", b""))
             if not message.get("more_body", False):
@@ -1278,16 +1353,16 @@ class _SelectionBodyLimit:
         await self.app(scope, replay, send)
 
 
-async def _body_too_large(scope: Scope, receive: Receive, send: Send) -> None:
-    logger.warning("Refused a /select-indexers body over %s bytes", f"{MAX_SELECTION_BODY_BYTES:,}")
+async def _body_too_large(scope: Scope, receive: Receive, send: Send, limit: int) -> None:
+    logger.warning("Refused a %s body over %s bytes", scope["path"], f"{limit:,}")
     response = JSONResponse(
         status_code=413,
-        content={"detail": f"Request body is over the {MAX_SELECTION_BODY_BYTES:,} byte limit"},
+        content={"detail": f"Request body is over the {limit:,} byte limit"},
     )
     await response(scope, receive, send)
 
 
-app.add_middleware(_SelectionBodyLimit)
+app.add_middleware(_BodyLimit)
 
 
 def _json_safe(value: Any) -> Any:
@@ -1404,7 +1479,9 @@ async def health_check() -> HealthResponse:
 
 
 @app.post(
-    "/scores", response_model=ScoresAcceptedResponse, responses=_documented_errors(400, 401, 503)
+    "/scores",
+    response_model=ScoresAcceptedResponse,
+    responses=_documented_errors(400, 401, 413, 503),
 )
 def push_scores(
     payload: Annotated[list[dict[str, Any]], Body(min_length=1)],
@@ -1729,7 +1806,7 @@ def dips_indexers(
 @app.post(
     "/sync-status",
     response_model=SyncStatusAcceptedResponse,
-    responses=_documented_errors(400, 401, 503),
+    responses=_documented_errors(400, 401, 413, 503),
 )
 def push_sync_status(
     payload: dict[str, Any],
@@ -1762,7 +1839,7 @@ def push_sync_status(
 @app.post(
     "/freshness",
     response_model=FreshnessAcceptedResponse,
-    responses=_documented_errors(400, 401, 503),
+    responses=_documented_errors(400, 401, 413, 503),
 )
 def push_freshness(
     push: FreshnessPush,
@@ -1817,7 +1894,11 @@ def freshness_report(
     return FreshnessResponse.model_validate(_state.freshness.snapshot(_enforcement()))
 
 
-@app.post("/get-score", response_model=ScoreResponse, responses=_documented_errors(400, 401, 503))
+@app.post(
+    "/get-score",
+    response_model=ScoreResponse,
+    responses=_documented_errors(400, 401, 413, 503),
+)
 async def get_score(
     request: ScoreRequest,
     authorization: Optional[str] = Header(None),
