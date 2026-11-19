@@ -230,9 +230,9 @@ class IndexerSelector:
             effective_fees = self.data["total_query_fees"].fillna(0.0) + dips_adjustment
 
             stake = self.data.get("last_known_slashable_stake")
-            # With no stake read, as on a degraded day, there is no ratio to work out, so every
-            # indexer keeps the stake-to-fees score the job sent.
-            if stake is not None and stake.notna().any():
+            # With no indexer's stake above 0, as when the fallback scores of a degraded day hold
+            # it missing or at 0, no stake was read and every indexer keeps the job's score.
+            if stake is not None and pd.to_numeric(stake, errors="coerce").gt(0).any():
                 self.data["stake_to_fees"] = stake / effective_fees.replace(0.0, float("nan"))
                 # Drop pre-normalised column so _normalize_metrics recomputes it
                 self.data = self.data.drop(columns=["norm_stake_to_fees"], errors="ignore")

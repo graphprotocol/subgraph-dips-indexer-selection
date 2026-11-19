@@ -2,9 +2,10 @@
 
 When the score job can measure nothing and has nothing recent to carry over, it pushes the
 fallback scores: the same quality for every indexer, a neutral stake-to-fees score of 0.5, and
-stake and fees missing. Selection adds dipper's expected DIPs fees to the query fees before it
-works out stake-to-fees, and doing that with stake nobody read would put every indexer that holds
-an agreement at the bottom on the heaviest part of value. So it must keep the neutral score.
+stake and fees missing, or 0 from older jobs. Selection adds dipper's expected DIPs fees to the
+query fees before it works out stake-to-fees, and doing that with stake nobody read would put
+every indexer that holds an agreement at the bottom on the heaviest part of value. So it must
+keep the neutral score.
 """
 
 from types import SimpleNamespace
@@ -27,9 +28,10 @@ A, B, C, D = ("0x" + pair * 20 for pair in ("a1", "b2", "c3", "d4"))
 INDEXERS = [A, B, C, D]
 
 
-def _fallback_record(indexer: str) -> dict[str, Any]:
+def _fallback_record(indexer: str, unread: Optional[float]) -> dict[str, Any]:
     """1 indexer as the score job's fallback pushes it, which the job's own tests check for the
-    stake columns. Every indexer has the same price, so nothing should set 1 apart from another.
+    stake columns, with unread for its stake and fees. Every indexer has the same price, so
+    nothing should set 1 apart from another.
     """
     return {
         "indexer": indexer,
@@ -51,8 +53,8 @@ def _fallback_record(indexer: str) -> dict[str, Any]:
         "org": None,
         "dst_lat": None,
         "dst_lon": None,
-        "total_query_fees": None,
-        "last_known_slashable_stake": None,
+        "total_query_fees": unread,
+        "last_known_slashable_stake": unread,
         "stake_read_at": None,
         "quality_measured_at": None,
         "computed_at": "2026-11-19T09:00:00Z",
@@ -64,8 +66,10 @@ def _fallback_record(indexer: str) -> dict[str, Any]:
     }
 
 
-@pytest.fixture
-def service(monkeypatch: pytest.MonkeyPatch, tmp_path) -> SimpleNamespace:
+@pytest.fixture(params=[None, 0.0], ids=["stake-missing", "stake-0-as-older-jobs-send"])
+def service(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> SimpleNamespace:
     """A fresh service holding the fallback scores, pushed to it as the score job pushes them,
     and a way to restart it so it reads them back from its cache file.
     """
@@ -81,7 +85,8 @@ def service(monkeypatch: pytest.MonkeyPatch, tmp_path) -> SimpleNamespace:
 
     start()
     client = TestClient(endpoints.app, raise_server_exceptions=False)
-    pushed = client.post("/scores", json=[_fallback_record(i) for i in INDEXERS], headers=AUTH)
+    records = [_fallback_record(indexer, request.param) for indexer in INDEXERS]
+    pushed = client.post("/scores", json=records, headers=AUTH)
     assert pushed.status_code == 200, pushed.text
     yield SimpleNamespace(restart=start)
     endpoints.get_settings.cache_clear()
