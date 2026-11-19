@@ -502,13 +502,18 @@ def test_scores_pushed_during_a_selection_do_not_reach_it(monkeypatch):
 )
 async def test_health_answers_while_a_slow_selection_runs(monkeypatch, step):
     began = threading.Event()
+    answered = threading.Event()
     began_at = []
     original = getattr(iisa_http_endpoints, step)
 
+    # Busy in Python, holding the interpreter lock as real selection work does, until /health
+    # has answered or 2 s have passed.
     def slow_step(*args):
         began_at.append(time.perf_counter())
         began.set()
-        time.sleep(2)
+        give_up = time.perf_counter() + 2
+        while not answered.is_set() and time.perf_counter() < give_up:
+            pass
         return original(*args)
 
     monkeypatch.setattr(iisa_http_endpoints, step, slow_step)
@@ -516,6 +521,7 @@ async def test_health_answers_while_a_slow_selection_runs(monkeypatch, step):
     async def health_once_selecting(client):
         await asyncio.to_thread(began.wait, 5)
         response = await client.get("/health")
+        answered.set()
         return response, time.perf_counter()
 
     transport = httpx.ASGITransport(app=app)
