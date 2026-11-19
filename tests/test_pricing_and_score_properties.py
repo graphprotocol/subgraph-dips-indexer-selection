@@ -16,7 +16,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pytest
-from hypothesis import example, given, note, reproduce_failure
+from hypothesis import example, given, note
 from hypothesis import strategies as st
 
 from iisa import iisa_http_endpoints as endpoints
@@ -763,7 +763,6 @@ def test_selection_never_returns_a_member_whose_own_prices_fail(case):
         existing_indexers=[FIRST, SECOND],
     )
 )
-@reproduce_failure('6.170.15', b'AXicc2RnAAFGRwYNBihwZGBkQOICeUCuI4YwuiYICYHobAQfSYPGQMswEVDKCPIhoyMzQhiTwQAAaXQQKA==')
 def test_selection_never_returns_more_than_asked_when_the_group_is_too_big(case):
     selected, selector = _select(case)
     # A group with no member to rank it by is kept whole rather than trimmed at random, as a
