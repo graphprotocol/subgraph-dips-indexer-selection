@@ -57,6 +57,27 @@ for a lot of memory; the always-on service is comparatively small.
 | Score-computation job | 2 / 8 | 50Gi / 50Gi |
 | Sync-status fetcher (deployment) | 250m / 1 | 512Mi / 1Gi |
 
+## Score job time limits
+
+The CronJob never starts a run while the last one is still going, so a run that hung would
+hold off every later run. 2 limits stop that, and a stopped attempt or run is marked failed.
+
+Each attempt is stopped 4 hours after a node takes its pod, so pulling the image counts
+against that limit but waiting for a node does not. A failed attempt gets 1 retry, and this
+limit keeps a hung attempt from using up the time its retry needs.
+
+The whole run, first attempt and retry together, is stopped 8 hours after Kubernetes creates
+its Job. That clock starts before the first pod is scheduled, so waiting for a node, pulling
+the image and the pause before a retry all count against it, as well as the time spent
+running.
+
+A normal run took about 2h24m when it was measured in April 2026, and has not been measured
+again since. 4 hours gives an attempt 96 minutes more than that. When the first attempt
+hangs, its retry has what is left of the 8 hours, just under 4, which covers a normal run and
+the waits above. A hung run ends about 16 hours before the next one is due at 09:00 UTC, and
+until a run succeeds the service keeps serving the scores it already holds. If normal runs
+grow past about 3 hours, raise both limits, keeping the run's limit twice the attempt's.
+
 ## Startup behaviour
 
 The service reads its cache file on startup, which is quick, but the probes leave
