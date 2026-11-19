@@ -1118,25 +1118,51 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Besides /select-indexers, the routes that take a body check their token only after parsing all
+# of it, which for tiny JSON elements uses up to about 50 times its size in memory on POST /scores
+# and 26 on the rest. So each has its own limit, sized from its real sender with room to grow.
 
-class _SelectionBodyLimit:
-    """Refuse a /select-indexers body over MAX_SELECTION_BODY_BYTES with a 413 before it is parsed.
+# The score job's daily push: about 1,100 bytes an indexer plus 140 a chain it served or priced,
+# so 300 indexers on 50 chains is about 2.4 MB, and 16 MiB holds 1,000 indexers on 100 chains.
+MAX_SCORES_BODY_BYTES = 16 * 1024 * 1024
+# The sync-status fetcher's push: about 50 bytes for each deployment an indexer claims and holds
+# an active allocation on, so 16 MiB holds about 330,000.
+MAX_SYNC_STATUS_BODY_BYTES = 16 * 1024 * 1024
+# The freshness prober's push: at most 50,000 outcomes a minute, about 225 bytes a pass and 680
+# with every field full, so 16 MiB holds 50,000 passes or about 24,000 full outcomes. A minute
+# refused for its size is lost, as any minute that doesn't arrive is.
+MAX_FRESHNESS_BODY_BYTES = 16 * 1024 * 1024
+# A score request names 1 indexer in about 60 bytes.
+MAX_GET_SCORE_BODY_BYTES = 64 * 1024
 
-    The request's own checks run only once the whole body has been read and parsed, and this is
-    the 1 endpoint that takes no token, so a huge body could use up the service's memory first.
-    Only this route is covered, since the score job's POST /scores is legitimately large.
+_BODY_LIMITS = {
+    "/select-indexers": MAX_SELECTION_BODY_BYTES,
+    "/scores": MAX_SCORES_BODY_BYTES,
+    "/sync-status": MAX_SYNC_STATUS_BODY_BYTES,
+    "/freshness": MAX_FRESHNESS_BODY_BYTES,
+    "/get-score": MAX_GET_SCORE_BODY_BYTES,
+}
+
+
+class _BodyLimit:
+    """Refuse a body over its route's limit in _BODY_LIMITS with a 413 before it is parsed.
+
+    A route's own checks, its token check included, run only once the whole body has been read
+    and parsed, so a huge body could use up the service's memory first. Other routes pass
+    through untouched.
     """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] != "/select-indexers":
+        limit = _BODY_LIMITS.get(scope["path"]) if scope["type"] == "http" else None
+        if limit is None:
             await self.app(scope, receive, send)
             return
         declared = dict(scope["headers"]).get(b"content-length", b"")
-        if declared.isdigit() and int(declared) > MAX_SELECTION_BODY_BYTES:
-            await _body_too_large(scope, receive, send)
+        if declared.isdigit() and int(declared) > limit:
+            await _body_too_large(scope, receive, send, limit)
             return
 
         # No length, or one within the limit: read the body, counting what arrives.
@@ -1147,8 +1173,8 @@ class _SelectionBodyLimit:
             if message["type"] != "http.request":
                 return  # The client went away before sending the whole body.
             received += len(message.get("body", b""))
-            if received > MAX_SELECTION_BODY_BYTES:
-                await _body_too_large(scope, receive, send)
+            if received > limit:
+                await _body_too_large(scope, receive, send, limit)
                 return
             pieces.append(message.get("body", b""))
             if not message.get("more_body", False):
@@ -1169,16 +1195,16 @@ class _SelectionBodyLimit:
         await self.app(scope, replay, send)
 
 
-async def _body_too_large(scope: Scope, receive: Receive, send: Send) -> None:
-    logger.warning("Refused a /select-indexers body over %s bytes", f"{MAX_SELECTION_BODY_BYTES:,}")
+async def _body_too_large(scope: Scope, receive: Receive, send: Send, limit: int) -> None:
+    logger.warning("Refused a %s body over %s bytes", scope["path"], f"{limit:,}")
     response = JSONResponse(
         status_code=413,
-        content={"detail": f"Request body is over the {MAX_SELECTION_BODY_BYTES:,} byte limit"},
+        content={"detail": f"Request body is over the {limit:,} byte limit"},
     )
     await response(scope, receive, send)
 
 
-app.add_middleware(_SelectionBodyLimit)
+app.add_middleware(_BodyLimit)
 
 
 def _json_safe(value: Any) -> Any:
@@ -1295,7 +1321,9 @@ async def health_check() -> HealthResponse:
 
 
 @app.post(
-    "/scores", response_model=ScoresAcceptedResponse, responses=_documented_errors(400, 401, 503)
+    "/scores",
+    response_model=ScoresAcceptedResponse,
+    responses=_documented_errors(400, 401, 413, 503),
 )
 def push_scores(
     payload: Annotated[list[dict[str, Any]], Body(min_length=1)],
@@ -1620,7 +1648,7 @@ def dips_indexers(
 @app.post(
     "/sync-status",
     response_model=SyncStatusAcceptedResponse,
-    responses=_documented_errors(400, 401, 503),
+    responses=_documented_errors(400, 401, 413, 503),
 )
 def push_sync_status(
     payload: dict[str, Any],
@@ -1653,7 +1681,7 @@ def push_sync_status(
 @app.post(
     "/freshness",
     response_model=FreshnessAcceptedResponse,
-    responses=_documented_errors(400, 401, 503),
+    responses=_documented_errors(400, 401, 413, 503),
 )
 def push_freshness(
     push: FreshnessPush,
@@ -1708,7 +1736,11 @@ def freshness_report(
     return FreshnessResponse.model_validate(_state.freshness.snapshot(_enforcement()))
 
 
-@app.post("/get-score", response_model=ScoreResponse, responses=_documented_errors(400, 401, 503))
+@app.post(
+    "/get-score",
+    response_model=ScoreResponse,
+    responses=_documented_errors(400, 401, 413, 503),
+)
 async def get_score(
     request: ScoreRequest,
     authorization: Optional[str] = Header(None),

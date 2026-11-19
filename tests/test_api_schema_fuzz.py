@@ -29,7 +29,13 @@ from schemathesis.specs.openapi.checks import (
 
 from iisa import iisa_http_endpoints, score_loader
 from iisa.freshness import minute_index, minute_text
-from iisa.iisa_http_endpoints import FreshnessPush, IISAState, SelectionRequest, Settings
+from iisa.iisa_http_endpoints import (
+    _BODY_LIMITS,
+    FreshnessPush,
+    IISAState,
+    SelectionRequest,
+    Settings,
+)
 
 PUSH_TOKEN = "schema-fuzz-push-token"
 AUTH_HEADERS = {"Authorization": f"Bearer {PUSH_TOKEN}"}
@@ -300,9 +306,21 @@ def _rejected_by_freshness_checks(case: schemathesis.Case, response: schemathesi
     )
 
 
+def _refused_for_its_size(case: schemathesis.Case, response: schemathesis.Response) -> bool:
+    """True when a body over its route's size limit got the 413 the schema lists for it."""
+    limit = _BODY_LIMITS.get(case.path)
+    body = response.request.body or b""
+    size = len(body.encode() if isinstance(body, str) else body)
+    return response.status_code == 413 and limit is not None and size > limit
+
+
 def _known_gaps(case: schemathesis.Case, response: schemathesis.Response) -> list[CheckFunction]:
     """Checks to skip for the cases that need a decision rather than a fix."""
     excluded: list[CheckFunction] = []
+    # A schema can't state how large a body may be, so a schema-valid body over its route's
+    # limit gets the 413 the schema lists instead of being accepted.
+    if _refused_for_its_size(case, response):
+        excluded.append(positive_data_acceptance)
     # Starlette answers OPTIONS /scores and /freshness with `Allow: POST` alone, since GET and
     # POST are two routes on one path and it stops at the first. Only a custom 405 handler
     # would fix that.
