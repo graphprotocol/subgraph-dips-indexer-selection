@@ -21,6 +21,7 @@ there is no shared filesystem between the cronjob and the iisa service.
 
 import json
 import logging
+import math
 import os
 import random
 import sys
@@ -87,6 +88,10 @@ _ROW_COLUMNS: Tuple[str, ...] = (
     "subgraph_network",
     "url",
 )
+
+# blocks_behind is a uint64 in the proto but goes into an int64 column in _build_dataframe.
+# Nothing scores on it, so a larger value is clipped and the rest of the attempt kept.
+_BLOCKS_BEHIND_MAX = int(np.iinfo(np.int64).max)
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +321,7 @@ def _count_partition_worker(args: tuple) -> tuple:
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     fees: Dict[bytes, float] = defaultdict(float)
     stats = _PartitionReadStats()
+    unusable_fees = 0
 
     queries = _iter_partition_queries(
         "count",
@@ -336,8 +342,21 @@ def _count_partition_worker(args: tuple) -> tuple:
                 dep_bytes = bytes(attempt.deployment)
                 if len(dep_bytes) == 32 and len(idx_bytes) == 20:
                     counts[(dep_bytes, idx_bytes)] += 1
-                    fees[idx_bytes] += attempt.fee_grt
+                    # 1 fee that is not finite swamps the total; a NaN total reads in iisa as
+                    # the best stake-to-fees.
+                    fee = attempt.fee_grt
+                    if math.isfinite(fee):
+                        fees[idx_bytes] += fee
+                    else:
+                        unusable_fees += 1
 
+    if unusable_fees:
+        logger.warning(
+            "count p%d: left %s attempt(s) with a fee that is not a finite number out of the "
+            "indexers' fee totals",
+            partition,
+            f"{unusable_fees:,}",
+        )
     return (counts, fees, stats.messages, stats.filtered)
 
 
@@ -382,6 +401,8 @@ def _sample_partition_worker(args: tuple) -> tuple:
     reservoirs: Dict[Tuple[bytes, bytes], List[tuple]] = defaultdict(list)
     counts: Dict[Tuple[bytes, bytes], int] = defaultdict(int)
     stats = _PartitionReadStats()
+    missing_fees = 0
+    clipped_blocks_behind = 0
 
     # Protobuf returns a fresh str per message even for repeated values, so each value is
     # interned once on first sight and every later row is a dict hit (2.76B attempts in
@@ -415,12 +436,23 @@ def _sample_partition_worker(args: tuple) -> tuple:
                 key = (dep_bytes, idx_bytes)
                 n = counts[key]
 
+                # The latency regression drops rows with a missing fee, while an infinite one
+                # makes its scaler raise; uptime and success rates still count the attempt.
+                fee = attempt.fee_grt
+                if not math.isfinite(fee):
+                    fee = math.nan
+                    missing_fees += 1
+                blocks_behind = attempt.blocks_behind
+                if blocks_behind > _BLOCKS_BEHIND_MAX:
+                    blocks_behind = _BLOCKS_BEHIND_MAX
+                    clipped_blocks_behind += 1
+
                 # query_id is unique per query, so interning it would cost cycles for no saving.
                 row = (
                     query.query_id,
-                    attempt.fee_grt,
+                    fee,
                     ts_ms,
-                    attempt.blocks_behind,
+                    blocks_behind,
                     attempt.response_time_ms,
                     status_cache[attempt.result],
                     chain_cache[attempt.indexed_chain],
@@ -434,6 +466,20 @@ def _sample_partition_worker(args: tuple) -> tuple:
 
                 counts[key] += 1
 
+    if missing_fees:
+        logger.warning(
+            "sample p%d: kept %s attempt(s) with a fee that is not a finite number with the fee "
+            "missing, which leaves them out of the latency regression",
+            partition,
+            f"{missing_fees:,}",
+        )
+    if clipped_blocks_behind:
+        logger.warning(
+            "sample p%d: clipped blocks_behind to %s in %s attempt(s) where it was larger",
+            partition,
+            f"{_BLOCKS_BEHIND_MAX:,}",
+            f"{clipped_blocks_behind:,}",
+        )
     return (reservoirs, counts, stats.filtered)
 
 
