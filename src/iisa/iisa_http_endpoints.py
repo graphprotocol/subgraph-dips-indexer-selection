@@ -47,7 +47,7 @@ from typing import (
 )
 
 import pandas as pd
-from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -69,6 +69,14 @@ from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import score_columns as cols
+from .backup import (
+    COPY_INTERVAL_SECONDS,
+    FRESHNESS_COPY,
+    SCORES_COPY,
+    Backup,
+    BackupLocation,
+    backup_from,
+)
 from .freshness import (
     HISTORY_DAYS,
     MIN_SCORED_MINUTES,
@@ -179,6 +187,9 @@ class Settings(BaseSettings):
     sync_check_timeout_seconds: float = Field(default=5.0, gt=0, le=10)
     # The oldest a deployment's latest block may be for a claim to be confirmed.
     sync_check_bar_seconds: float = Field(default=36.0, gt=0)
+    # Optional gs://<bucket>/<path> to copy the scores and freshness files to and to restore a
+    # missing or unreadable one from at startup; see backup.py. Unset, nothing is copied.
+    backup_url: Optional[str] = None
 
     @field_validator(
         "push_token", "read_token", "sync_check_gateway_url", "sync_check_gateway_api_key"
@@ -208,6 +219,15 @@ class Settings(BaseSettings):
         if url is not None and not url.startswith(("http://", "https://")):
             raise ValueError("IISA_SYNC_CHECK_GATEWAY_URL must start with http:// or https://")
         return self
+
+    @field_validator("backup_url")
+    @classmethod
+    def _check_backup_url(cls, url: Optional[str]) -> Optional[str]:
+        """Refuse a bucket address that isn't gs://<bucket>[/<path>], so a typo stops startup."""
+        if not url:
+            return None
+        BackupLocation.parse(url)
+        return url
 
     @field_validator("freshness_exempt_chains", mode="before")
     @classmethod
@@ -793,6 +813,7 @@ class IISAState:
         self._history: Optional[pd.DataFrame] = None
         self._sync_status: Optional["SyncStatusData"] = None
         self.sync_checker: Optional[SyncClaimChecker] = None
+        self.backup: Optional[Backup] = None
         self.freshness = FreshnessStore()
         self.lapse_warnings = LogLimit(LAPSE_WARNING_INTERVAL_MINUTES)
         # In memory only, so a restart starts with none; each record's log line is what lasts.
@@ -811,6 +832,7 @@ class IISAState:
         """
         self.settings = settings
         self.sync_checker = sync_claim_checker(settings)
+        self.backup = backup_from(settings.backup_url)
         logger.info(
             "Candidates' synced claims are %s",
             "checked through the gateway before they can win a place"
@@ -851,6 +873,25 @@ class IISAState:
         for path in paths:
             if path is not None:
                 _remove_stale_temp_files(path)
+
+    def restore_from_bucket(self, path: Optional[str], copy: str, hold: bool = False) -> bool:
+        """Restore the file at ``path`` from its copy in the bucket, as Backup.restore does.
+        False when backups are off or nothing was restored."""
+        backup = self.backup
+        return backup is not None and path is not None and backup.restore(path, copy, hold)
+
+    def copy_to_bucket(self) -> None:
+        """Copy the scores and freshness files to the bucket, each only if it changed."""
+        self.copy_scores_to_bucket()
+        if self.backup is not None and self.settings is not None:
+            self.backup.copy_if_changed(self.settings.freshness_file_path, FRESHNESS_COPY)
+
+    def copy_scores_to_bucket(self) -> None:
+        """Copy the scores file to the bucket if it changed."""
+        if self.backup is not None and self.data_manager is not None:
+            path = self.data_manager.scores_file_path
+            if path is not None:
+                self.backup.copy_if_changed(path, SCORES_COPY)
 
     def refresh_data(self) -> bool:
         """Load pre-computed indexer scores from the cache file on disk.
@@ -1215,34 +1256,76 @@ async def lifespan(_app: FastAPI):
         raise RuntimeError("Failed to initialize IISA providers")
 
     _state.remove_stale_temp_files()
-
-    # Recover last cached scores from the RWO cache mount. Missing/empty cache
-    # is acceptable: selections get a 503 until the cronjob's next push fills it.
-    logger.info("Attempting to recover cached scores from disk...")
-    if _state.refresh_data():
-        logger.info("Recovered cached scores on startup")
-    else:
-        logger.warning(
-            "Could not load cached scores on startup; refusing selections with a 503 "
-            "until the first POST /scores arrives."
-        )
-
-    # Sync status: also optional on startup
-    if _state.refresh_sync_status():
-        logger.info("Recovered cached sync status on startup")
-    else:
-        logger.info("No cached sync status on startup (optional)")
-
-    if _state.refresh_freshness():
-        logger.info("Recovered freshness state on startup")
-    else:
-        logger.info("No freshness state on startup; marks start again from the first push")
+    _recover_cache_files()
+    copying = None
+    if _state.backup is not None:
+        copying = asyncio.create_task(_copy_to_bucket_every(COPY_INTERVAL_SECONDS))
 
     logger.info("IISA service ready")
 
     yield
 
     logger.info("Shutting down IISA service...")
+    if copying is not None:
+        copying.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await copying
+
+
+def _recover_cache_files() -> None:
+    """Load the cache files the volume holds, restoring a missing or unreadable one from the
+    bucket when backups are on. Each is optional: without scores, selections get a 503 until
+    the score job's next push."""
+    if _state.backup is None:
+        logger.info("IISA_BACKUP_URL is unset, so the cache files aren't copied to a bucket")
+    else:
+        logger.info("Copying the cache files to %s", _state.backup.location)
+
+    scores_path = _state.data_manager.scores_file_path if _state.data_manager else None
+    logger.info("Attempting to recover cached scores from disk...")
+    if _state.refresh_data():
+        logger.info("Recovered cached scores on startup")
+    elif _state.restore_from_bucket(scores_path, SCORES_COPY) and _state.refresh_data():
+        logger.info("Recovered scores from the bucket on startup")
+    else:
+        logger.warning(
+            "Could not load cached scores on startup; refusing selections with a 503 "
+            "until the first POST /scores arrives."
+        )
+
+    # Sync status: also optional on startup, and pushed again every hour
+    if _state.refresh_sync_status():
+        logger.info("Recovered cached sync status on startup")
+    else:
+        logger.info("No cached sync status on startup (optional)")
+
+    _recover_freshness()
+
+
+def _recover_freshness() -> None:
+    """Load the freshness state, restoring it from the bucket when the volume's copy is missing
+    or unreadable. A copy the bucket holds but the service can't use stays there untouched."""
+    path = _state.settings.freshness_file_path if _state.settings else None
+    if _state.refresh_freshness():
+        logger.info("Recovered freshness state on startup")
+        return
+    if _state.restore_from_bucket(path, FRESHNESS_COPY, hold=True):
+        if _state.refresh_freshness():
+            logger.info("Recovered freshness state from the bucket on startup")
+            return
+        if _state.backup is not None and path is not None:
+            _state.backup.hold(path)
+    logger.info("No freshness state on startup; marks start again from the first push")
+
+
+async def _copy_to_bucket_every(seconds: float) -> None:
+    """Copy the cache files that changed to the bucket now and every ``seconds`` after."""
+    while True:
+        try:
+            await asyncio.to_thread(_state.copy_to_bucket)
+        except Exception:
+            logger.exception("Copying the cache files to the bucket failed")
+        await asyncio.sleep(seconds)
 
 
 app = FastAPI(
@@ -1494,6 +1577,7 @@ async def health_check() -> HealthResponse:
 )
 def push_scores(
     payload: Annotated[list[dict[str, Any]], Body(min_length=1)],
+    background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(None),
 ) -> ScoresAcceptedResponse:
     """Accept a pushed scores snapshot from the cronjob.
@@ -1521,6 +1605,8 @@ def push_scores(
         raise HTTPException(status_code=500, detail="Failed to accept scores")
 
     logger.info("Accepted pushed scores: %d rows", rows)
+    # After the reply, so a slow or unreachable bucket never holds up or fails the push.
+    background_tasks.add_task(_state.copy_scores_to_bucket)
     return ScoresAcceptedResponse(status="success", rows=rows)
 
 
