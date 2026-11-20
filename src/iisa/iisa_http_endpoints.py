@@ -807,8 +807,7 @@ class IISAState:
         """
         Initialize the IISA providers.
 
-        Returns True if initialization succeeded, False if we should fall back
-        to random selection mode.
+        Returns True if initialization succeeded, False if it failed, which stops startup.
         """
         self.settings = settings
         self.sync_checker = sync_claim_checker(settings)
@@ -831,9 +830,8 @@ class IISAState:
             self._initialized = True
             return True
 
-        except Exception as e:
-            logger.warning("Failed to initialize IISA providers: %s", e)
-            logger.warning("Service will operate in random selection fallback mode")
+        except Exception:
+            logger.exception("Failed to initialize IISA providers, so the service cannot start")
             self._initialized = False
             return False
 
@@ -1214,21 +1212,19 @@ async def lifespan(_app: FastAPI):
 
     # Initialize providers
     if not _state.initialize(settings):
-        logger.error("IISA initialization failed - cannot start service")
         raise RuntimeError("Failed to initialize IISA providers")
 
     _state.remove_stale_temp_files()
 
     # Recover last cached scores from the RWO cache mount. Missing/empty cache
-    # is acceptable — the service comes up in fallback mode and the next push
-    # from the cronjob will populate it.
+    # is acceptable: selections get a 503 until the cronjob's next push fills it.
     logger.info("Attempting to recover cached scores from disk...")
     if _state.refresh_data():
         logger.info("Recovered cached scores on startup")
     else:
         logger.warning(
-            "No cached scores found on startup; serving in random-selection "
-            "fallback mode until the first POST /scores arrives."
+            "Could not load cached scores on startup; refusing selections with a 503 "
+            "until the first POST /scores arrives."
         )
 
     # Sync status: also optional on startup

@@ -2577,6 +2577,52 @@ class TestRequirePushTokenStartup:
         assert any("IISA_PUSH_TOKEN is not set" in rec.message for rec in caplog.records)
 
 
+@patch("iisa.iisa_http_endpoints.FileScoreLoader", side_effect=OSError("bad mount"))
+def test_a_failed_initialisation_logs_its_cause_once(mock_loader_class, monkeypatch, caplog):
+    """An initialisation that fails stops startup with 1 error line carrying the traceback."""
+    from iisa import iisa_http_endpoints
+    from iisa.iisa_http_endpoints import IISAState, app
+
+    for name in ("IISA_PUSH_TOKEN", "IISA_REQUIRE_PUSH_TOKEN", "IISA_LOG_LEVEL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(iisa_http_endpoints, "_state", IISAState())
+    iisa_http_endpoints.get_settings.cache_clear()
+
+    with caplog.at_level(logging.ERROR, logger="iisa-service"):
+        with pytest.raises(RuntimeError, match="Failed to initialize IISA providers"):
+            with TestClient(app):
+                pass
+
+    (error,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert error.exc_info is not None and "bad mount" in str(error.exc_info[1])
+
+
+@patch("iisa.iisa_http_endpoints.DataManager")
+@patch("iisa.iisa_http_endpoints.FileScoreLoader")
+def test_startup_without_scores_says_selections_are_refused(
+    mock_loader_class, mock_dm_class, monkeypatch, caplog
+):
+    """The startup warning about missing scores says what a selection then gets: a 503."""
+    from iisa import iisa_http_endpoints
+    from iisa.iisa_http_endpoints import IISAState, app
+
+    for name in ("IISA_PUSH_TOKEN", "IISA_REQUIRE_PUSH_TOKEN", "IISA_LOG_LEVEL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(iisa_http_endpoints, "_state", IISAState())
+    iisa_http_endpoints.get_settings.cache_clear()
+    mock_dm_class.return_value = MagicMock(**{"load_scores.return_value": False})
+    request = {"deployment_id": "Qm123", "chain_id": "arbitrum-one", "num_candidates": 3}
+
+    with caplog.at_level(logging.WARNING, logger="iisa-service"):
+        with TestClient(app) as client:
+            response = client.post("/select-indexers", json=request)
+
+    warnings = [r.getMessage() for r in caplog.records if "on startup" in r.getMessage()]
+    assert response.status_code == 503
+    assert warnings, "startup logged nothing about the missing scores"
+    assert all("random" not in w and "refus" in w for w in warnings), warnings
+
+
 class TestExtractChainPrice:
     """Tests for _extract_chain_price -- parses per-chain price from JSON blob."""
 
