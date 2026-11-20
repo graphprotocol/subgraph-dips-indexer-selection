@@ -9,6 +9,7 @@ its copy, so neither waits on the next push nor starts again from nothing.
 
 import contextlib
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -117,8 +118,8 @@ class GcsBucket:
             if e.code == 401:
                 self._forget_token()
             raise BackupError(f"{what} returned {e.code}", e.code in RETRYABLE_STATUSES) from e
-        except OSError as e:
-            raise BackupError(f"{what} failed: {e}", retryable=True) from e
+        except (OSError, http.client.HTTPException) as e:
+            raise BackupError(f"{what} failed: {e!r}", retryable=True) from e
 
     def _access_token(self) -> str:
         """A token for the pod's Google service account, fetched again a minute before it ends."""
@@ -130,8 +131,8 @@ class GcsBucket:
                 with self._open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                     body = json.loads(response.read())
                 token, lifetime = str(body["access_token"]), float(body["expires_in"])
-            except (OSError, ValueError, KeyError, TypeError) as e:
-                raise BackupError(f"No token from the GKE metadata server: {e}", True) from e
+            except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as e:
+                raise BackupError(f"No token from the GKE metadata server: {e!r}", True) from e
             self._token = (token, time.monotonic() + lifetime - 60)
             return token
 

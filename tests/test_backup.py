@@ -1,5 +1,6 @@
 """Copying the cache files to a bucket and restoring them from it."""
 
+import http.client
 import json
 import logging
 import time
@@ -174,6 +175,8 @@ class TestGcsBucket:
             (_http_error(429), True),
             (urllib.error.URLError("no route"), True),
             (TimeoutError("timed out"), True),
+            (http.client.IncompleteRead(b"par"), True),
+            (http.client.BadStatusLine("garbled"), True),
         ],
     )
     def test_says_whether_a_failure_may_clear_up(self, failure, retryable):
@@ -195,8 +198,11 @@ class TestGcsBucket:
         assert bucket.get("testnet/freshness.json") == b"saved"
         assert len(opener.requests) == 4
 
-    def test_no_metadata_server_is_a_failure_that_may_clear_up(self):
-        bucket = GcsBucket("iisa-test", open_url=Opener(urllib.error.URLError("no host")))
+    @pytest.mark.parametrize(
+        "failure", [urllib.error.URLError("no host"), http.client.IncompleteRead(b"{")]
+    )
+    def test_no_token_is_a_failure_that_may_clear_up(self, failure):
+        bucket = GcsBucket("iisa-test", open_url=Opener(failure))
 
         with pytest.raises(BackupError, match="metadata server") as raised:
             bucket.get("testnet/freshness.json")
