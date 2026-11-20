@@ -9,6 +9,7 @@ days are counted from the Unix epoch in UTC, so a day here is a UTC day.
 """
 
 import logging
+import os
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -519,7 +520,8 @@ class FreshnessStore:
 
 def load_state(path: str) -> FreshnessState:
     """Read the saved state from ``path``. A missing file gives empty state, and so does an
-    unreadable or malformed one, after a warning saying why.
+    unreadable or malformed one, once it is moved aside: the first save after it would otherwise
+    replace a file that may still hold weeks of history, such as one a newer release wrote.
     """
     try:
         raw = Path(path).read_bytes()
@@ -527,17 +529,35 @@ def load_state(path: str) -> FreshnessState:
         logger.debug("No freshness file at %s; starting with no freshness history", path)
         return FreshnessState()
     except OSError as e:
-        logger.warning("Cannot read freshness file %s (%s); starting with no history", path, e)
+        _move_aside(path, f"cannot be read ({e})")
         return FreshnessState()
     try:
         return FreshnessState.model_validate_json(raw)
     except ValidationError as e:
         first = e.errors()[0]
-        logger.warning(
-            "Freshness file %s is malformed (%d errors, first at %s: %s); starting with no history",
-            path,
-            e.error_count(),
-            ".".join(str(part) for part in first["loc"]) or "top level",
-            first["msg"],
+        where = ".".join(str(part) for part in first["loc"]) or "top level"
+        _move_aside(
+            path, f"is malformed ({e.error_count()} errors, first at {where}: {first['msg']})"
         )
         return FreshnessState()
+
+
+def _move_aside(path: str, problem: str) -> None:
+    """Rename the freshness file at ``path`` to a name with the time in it, where it stays until
+    someone inspects, repairs or deletes it, and log that the service starts with no history.
+    """
+    kept = f"{path}.unreadable-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    try:
+        os.replace(path, kept)
+    except OSError as e:
+        logger.error(
+            "Freshness file %s %s, and it could not be moved aside (%s), so the next save "
+            "replaces it; starting with no history",
+            path,
+            problem,
+            e,
+        )
+        return
+    logger.error(
+        "Freshness file %s %s; moved it to %s and starting with no history", path, problem, kept
+    )

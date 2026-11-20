@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -792,7 +793,7 @@ class TestSavedFile:
         ],
         ids=["not-json", "not-text", "not-object", "newer-version", "bad-minute", "no-last"],
     )
-    def test_malformed_file_gives_empty_state_with_a_warning(self, tmp_path, caplog, content):
+    def test_malformed_file_is_moved_aside_for_empty_state(self, tmp_path, caplog, content):
         path = tmp_path / "freshness.json"
         path.write_bytes(content)
 
@@ -800,12 +801,47 @@ class TestSavedFile:
             state = load_state(str(path))
 
         assert state.last_minute is None and state.chains == {}
+        (kept,) = tmp_path.glob("freshness.json.unreadable-*")
+        assert kept.read_bytes() == content and not path.exists()
         assert len(caplog.records) == 1
         assert "malformed" in caplog.records[0].getMessage()
+        assert kept.name in caplog.records[0].getMessage()
 
-    def test_unreadable_file_gives_empty_state_with_a_warning(self, tmp_path, caplog):
+    def test_unreadable_file_is_moved_aside_for_empty_state(self, tmp_path, caplog):
+        path = tmp_path / "freshness.json"
+        path.mkdir()
+
         with caplog.at_level(logging.WARNING, logger="iisa.freshness"):
-            state = load_state(str(tmp_path))
+            state = load_state(str(path))
 
         assert state.last_minute is None
-        assert "Cannot read freshness file" in caplog.records[0].getMessage()
+        assert [p.name for p in tmp_path.glob("freshness.json.unreadable-*")] != []
+        assert "cannot be read" in caplog.records[0].getMessage()
+
+    def test_the_next_save_leaves_a_moved_file_alone(self, tmp_path):
+        path = tmp_path / "freshness.json"
+        path.write_bytes(b"{ cut short")
+        store = FreshnessStore(load_state(str(path)))
+
+        store.apply(START, [_check("pass")], lambda saved: path.write_text(json.dumps(saved)))
+
+        (kept,) = tmp_path.glob("freshness.json.unreadable-*")
+        assert kept.read_bytes() == b"{ cut short"
+        assert json.loads(path.read_text())["last_minute"] == START
+
+    def test_a_file_that_cannot_be_moved_is_reported_as_about_to_be_replaced(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        path = tmp_path / "freshness.json"
+        path.write_bytes(b"not json")
+
+        def refuse(*_args: object) -> None:
+            raise PermissionError("read-only")
+
+        monkeypatch.setattr(os, "replace", refuse)
+        with caplog.at_level(logging.WARNING, logger="iisa.freshness"):
+            state = load_state(str(path))
+
+        assert state.last_minute is None and path.read_bytes() == b"not json"
+        (record,) = caplog.records
+        assert record.levelno == logging.ERROR and "next save replaces it" in record.getMessage()
