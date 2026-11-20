@@ -1332,9 +1332,10 @@ class TestScoresWeightedEndpoint:
         # An indexer is scored per chain only, so no total sits beside its chains.
         assert {key for entry in body["scores"] for key in entry} == {"indexer", "chains"}
 
-        # Each chain is scored against the indexers that support and priced it. No chain has
-        # freshness checks, so freshness is left out. Latency and stake_to_fees arrive pre-scaled
-        # and are kept; 98.5% uptime and success each score their own share to the 6th power.
+        # Each chain is scored against the indexers that support it and priced it, prices in.
+        # No chain has freshness checks, so freshness is left out of each chain's score.
+        # Latency and stake_to_fees arrive pre-scaled and are kept; 98.5% uptime and success
+        # each score their own share to the 6th power.
         shaped = 0.985**6
         quality = 0.2 * shaped + 0.8 * 0.8
         abc = entries_by_id["0xabc"]
