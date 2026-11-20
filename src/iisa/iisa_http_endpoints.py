@@ -1223,7 +1223,7 @@ async def lifespan(_app: FastAPI):
         logger.info("Recovered cached scores on startup")
     else:
         logger.warning(
-            "No cached scores found on startup; refusing selections with a 503 "
+            "Could not load cached scores on startup; refusing selections with a 503 "
             "until the first POST /scores arrives."
         )
 
