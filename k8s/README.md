@@ -118,7 +118,9 @@ the pod's Kubernetes service account needs Storage Object User (`roles/storage.o
 the bucket. Give the deployment a service account of its own (`serviceAccountName`) first: the
 score job and the sync-status fetcher run as the namespace's default one, and granting that
 would let them write the copies too. Turn on object versioning with a rule that deletes old versions after 30 days, so
-a bad file copied over a good one can still be got back.
+a bad file copied over a good one can still be got back. The pause in copying the freshness
+file lasts only until the next restart, when the history the service started again from
+replaces the copy; from then the older versions are the only way back to it.
 
 ## Prerequisites
 
