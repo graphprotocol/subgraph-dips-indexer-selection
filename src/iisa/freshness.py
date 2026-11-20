@@ -521,8 +521,9 @@ class FreshnessStore:
 
 def load_state(path: str) -> FreshnessState:
     """Read the saved state from ``path``. A missing file gives empty state, and so does an
-    unreadable or malformed one, once it is moved aside: the first save after it would otherwise
-    replace a file that may still hold weeks of history, such as one a newer release wrote.
+    unreadable or malformed one, which is first moved aside if it can be: the next save would
+    otherwise replace a file that may still hold weeks of history, such as one a newer release
+    wrote.
     """
     try:
         raw = Path(path).read_bytes()
@@ -554,7 +555,7 @@ def _move_aside(path: str, problem: str) -> None:
     except OSError as e:
         logger.error(
             "Freshness file %s %s, and it could not be moved aside (%s), so the next save "
-            "replaces it; starting with no history",
+            "may replace it; starting with no history",
             path,
             problem,
             e,

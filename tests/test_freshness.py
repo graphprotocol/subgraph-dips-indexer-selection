@@ -860,4 +860,4 @@ class TestSavedFile:
 
         assert state.last_minute is None and path.read_bytes() == b"not json"
         (record,) = caplog.records
-        assert record.levelno == logging.ERROR and "next save replaces it" in record.getMessage()
+        assert record.levelno == logging.ERROR and "next save may replace it" in record.getMessage()
