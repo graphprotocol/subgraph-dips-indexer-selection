@@ -830,8 +830,8 @@ class IISAState:
             self._initialized = True
             return True
 
-        except Exception as e:
-            logger.error("Failed to initialize IISA providers: %s", e)
+        except Exception:
+            logger.exception("Failed to initialize IISA providers, so the service cannot start")
             self._initialized = False
             return False
 
@@ -1212,7 +1212,6 @@ async def lifespan(_app: FastAPI):
 
     # Initialize providers
     if not _state.initialize(settings):
-        logger.error("IISA initialization failed - cannot start service")
         raise RuntimeError("Failed to initialize IISA providers")
 
     _state.remove_stale_temp_files()
@@ -1224,7 +1223,7 @@ async def lifespan(_app: FastAPI):
         logger.info("Recovered cached scores on startup")
     else:
         logger.warning(
-            "No cached scores found on startup; refusing selections with a 503 "
+            "Could not load cached scores on startup; refusing selections with a 503 "
             "until the first POST /scores arrives."
         )
 
