@@ -816,7 +816,9 @@ class TestSavedFile:
             state = load_state(str(path))
 
         assert state.last_minute is None
-        assert [p.name for p in tmp_path.glob("freshness.json.unreadable-*")] != []
+        (kept,) = tmp_path.glob("freshness.json.unreadable-*")
+        assert kept.is_dir() and not path.exists()
+        assert caplog.records[0].levelno == logging.ERROR
         assert "cannot be read" in caplog.records[0].getMessage()
         assert (
             f"cannot be read (Is a directory); moved it to {path}."
