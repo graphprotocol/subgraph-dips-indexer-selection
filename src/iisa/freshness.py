@@ -11,6 +11,7 @@ days are counted from the Unix epoch in UTC, so a day here is a UTC day.
 import logging
 import os
 import threading
+import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -543,10 +544,11 @@ def load_state(path: str) -> FreshnessState:
 
 
 def _move_aside(path: str, problem: str) -> None:
-    """Rename the freshness file at ``path`` to a name with the time in it, where it stays until
-    someone inspects, repairs or deletes it, and log that the service starts with no history.
+    """Rename the freshness file at ``path`` to a name with the time and a random part in it, so
+    no other file moved aside is replaced, where it stays until someone inspects, repairs or
+    deletes it, and log that the service starts with no history.
     """
-    kept = f"{path}.unreadable-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    kept = f"{path}.unreadable-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
     try:
         os.replace(path, kept)
     except OSError as e:

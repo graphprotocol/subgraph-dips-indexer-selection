@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import pytest
 
+from iisa import freshness
 from iisa.freshness import (
     RECENT_ANSWERED_MINUTES,
     Check,
@@ -817,6 +818,21 @@ class TestSavedFile:
         assert state.last_minute is None
         assert [p.name for p in tmp_path.glob("freshness.json.unreadable-*")] != []
         assert "cannot be read" in caplog.records[0].getMessage()
+
+    def test_files_moved_aside_in_the_same_second_are_both_kept(self, tmp_path, monkeypatch):
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz: Any = None) -> "Frozen":
+                return cls(2026, 11, 20, 9, tzinfo=timezone.utc)
+
+        monkeypatch.setattr(freshness, "datetime", Frozen)
+        path = tmp_path / "freshness.json"
+        for content in (b"first", b"second"):
+            path.write_bytes(content)
+            load_state(str(path))
+
+        kept = sorted(p.read_bytes() for p in tmp_path.glob("freshness.json.unreadable-*"))
+        assert kept == [b"first", b"second"]
 
     def test_the_next_save_leaves_a_moved_file_alone(self, tmp_path):
         path = tmp_path / "freshness.json"
