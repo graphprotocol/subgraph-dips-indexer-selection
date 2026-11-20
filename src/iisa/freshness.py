@@ -11,6 +11,7 @@ days are counted from the Unix epoch in UTC, so a day here is a UTC day.
 import logging
 import os
 import threading
+import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -520,8 +521,9 @@ class FreshnessStore:
 
 def load_state(path: str) -> FreshnessState:
     """Read the saved state from ``path``. A missing file gives empty state, and so does an
-    unreadable or malformed one, once it is moved aside: the first save after it would otherwise
-    replace a file that may still hold weeks of history, such as one a newer release wrote.
+    unreadable or malformed one, which is first moved aside if it can be: the next save would
+    otherwise replace a file that may still hold weeks of history, such as one a newer release
+    wrote.
     """
     try:
         raw = Path(path).read_bytes()
@@ -529,7 +531,7 @@ def load_state(path: str) -> FreshnessState:
         logger.debug("No freshness file at %s; starting with no freshness history", path)
         return FreshnessState()
     except OSError as e:
-        _move_aside(path, f"cannot be read ({e})")
+        _move_aside(path, f"cannot be read ({e.strerror or e})")
         return FreshnessState()
     try:
         return FreshnessState.model_validate_json(raw)
@@ -543,16 +545,17 @@ def load_state(path: str) -> FreshnessState:
 
 
 def _move_aside(path: str, problem: str) -> None:
-    """Rename the freshness file at ``path`` to a name with the time in it, where it stays until
-    someone inspects, repairs or deletes it, and log that the service starts with no history.
+    """Rename the freshness file at ``path`` to a name with the time and a random part in it, so
+    no other file moved aside is replaced, where it stays until someone inspects, repairs or
+    deletes it, and log that the service starts with no history.
     """
-    kept = f"{path}.unreadable-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    kept = f"{path}.unreadable-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
     try:
         os.replace(path, kept)
     except OSError as e:
         logger.error(
             "Freshness file %s %s, and it could not be moved aside (%s), so the next save "
-            "replaces it; starting with no history",
+            "may replace it; starting with no history",
             path,
             problem,
             e,

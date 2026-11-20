@@ -1332,9 +1332,10 @@ class TestScoresWeightedEndpoint:
         # An indexer is scored per chain only, so no total sits beside its chains.
         assert {key for entry in body["scores"] for key in entry} == {"indexer", "chains"}
 
-        # Each chain is scored against the indexers that support and priced it. No chain has
-        # freshness checks, so freshness is left out. Latency and stake_to_fees arrive pre-scaled
-        # and are kept; 98.5% uptime and success each score their own share to the 6th power.
+        # Each chain is scored against the indexers that support it and priced it, prices in.
+        # No chain has freshness checks, so freshness is left out of each chain's score.
+        # Latency and stake_to_fees arrive pre-scaled and are kept; 98.5% uptime and success
+        # each score their own share to the 6th power.
         shaped = 0.985**6
         quality = 0.2 * shaped + 0.8 * 0.8
         abc = entries_by_id["0xabc"]
@@ -2576,6 +2577,26 @@ class TestRequirePushTokenStartup:
         assert any("IISA_PUSH_TOKEN is not set" in rec.message for rec in caplog.records)
 
 
+@patch("iisa.iisa_http_endpoints.FileScoreLoader", side_effect=OSError("bad mount"))
+def test_a_failed_initialisation_logs_its_cause_once(mock_loader_class, monkeypatch, caplog):
+    """An initialisation that fails stops startup with 1 error line carrying the traceback."""
+    from iisa import iisa_http_endpoints
+    from iisa.iisa_http_endpoints import IISAState, app
+
+    for name in ("IISA_PUSH_TOKEN", "IISA_REQUIRE_PUSH_TOKEN", "IISA_LOG_LEVEL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(iisa_http_endpoints, "_state", IISAState())
+    iisa_http_endpoints.get_settings.cache_clear()
+
+    with caplog.at_level(logging.ERROR, logger="iisa-service"):
+        with pytest.raises(RuntimeError, match="Failed to initialize IISA providers"):
+            with TestClient(app):
+                pass
+
+    (error,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert error.exc_info is not None and "bad mount" in str(error.exc_info[1])
+
+
 @patch("iisa.iisa_http_endpoints.DataManager")
 @patch("iisa.iisa_http_endpoints.FileScoreLoader")
 def test_startup_without_scores_says_selections_are_refused(
@@ -2585,6 +2606,8 @@ def test_startup_without_scores_says_selections_are_refused(
     from iisa import iisa_http_endpoints
     from iisa.iisa_http_endpoints import IISAState, app
 
+    for name in ("IISA_PUSH_TOKEN", "IISA_REQUIRE_PUSH_TOKEN", "IISA_LOG_LEVEL"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(iisa_http_endpoints, "_state", IISAState())
     iisa_http_endpoints.get_settings.cache_clear()
     mock_dm_class.return_value = MagicMock(**{"load_scores.return_value": False})
