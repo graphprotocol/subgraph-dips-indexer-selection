@@ -531,7 +531,7 @@ def load_state(path: str) -> FreshnessState:
         logger.debug("No freshness file at %s; starting with no freshness history", path)
         return FreshnessState()
     except OSError as e:
-        _move_aside(path, f"cannot be read ({e})")
+        _move_aside(path, f"cannot be read ({e.strerror or e})")
         return FreshnessState()
     try:
         return FreshnessState.model_validate_json(raw)

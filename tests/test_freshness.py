@@ -818,6 +818,10 @@ class TestSavedFile:
         assert state.last_minute is None
         assert [p.name for p in tmp_path.glob("freshness.json.unreadable-*")] != []
         assert "cannot be read" in caplog.records[0].getMessage()
+        assert (
+            f"cannot be read (Is a directory); moved it to {path}."
+            in caplog.records[0].getMessage()
+        )
 
     def test_files_moved_aside_in_the_same_second_are_both_kept(self, tmp_path, monkeypatch):
         class Frozen(datetime):
