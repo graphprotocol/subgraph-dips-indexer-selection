@@ -108,9 +108,10 @@ score job's next daily push, and the freshness history, up to 28 days of it, is 
 `IISA_BACKUP_URL` to `gs://<bucket>/<path>` copies both files to that bucket: the scores after
 each push and the freshness file every hour, each only when it changed. At startup, a file
 that is missing from the volume or can't be read is restored from its copy before the service
-takes requests. If the bucket can't be reached, startup keeps trying for about a minute and
-then starts without the copy, and stops copying the freshness file until the next restart, so
-the copy it couldn't read isn't replaced by the history it started again from.
+takes requests. If the bucket can't be reached, startup keeps trying each file for about a
+minute, so a few minutes in all at worst, and then starts without the copy, and stops copying
+the freshness file until the next restart, so the copy it couldn't read isn't replaced by the
+history it started again from.
 
 The service signs in to the bucket as the pod, through Workload Identity Federation for GKE, so
 the pod's Kubernetes service account needs Storage Object User (`roles/storage.objectUser`) on
