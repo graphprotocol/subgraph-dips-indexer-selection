@@ -2605,6 +2605,8 @@ def test_startup_without_scores_says_selections_are_refused(
     from iisa import iisa_http_endpoints
     from iisa.iisa_http_endpoints import IISAState, app
 
+    for name in ("IISA_PUSH_TOKEN", "IISA_REQUIRE_PUSH_TOKEN", "IISA_LOG_LEVEL"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(iisa_http_endpoints, "_state", IISAState())
     iisa_http_endpoints.get_settings.cache_clear()
     mock_dm_class.return_value = MagicMock(**{"load_scores.return_value": False})
