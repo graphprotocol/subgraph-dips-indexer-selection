@@ -3,6 +3,8 @@
 import http.client
 import json
 import logging
+import os
+import stat
 import time
 import urllib.error
 from collections.abc import Iterator
@@ -219,6 +221,21 @@ class TestRestore:
 
         assert path.read_bytes() == b"saved"
         assert [p.name for p in tmp_path.iterdir()] == ["freshness.json"]
+
+    def test_the_restored_file_and_its_folder_reach_the_disk(self, tmp_path, monkeypatch):
+        synced: list[bool] = []
+        real_fsync = os.fsync
+
+        def fsync(fd: int) -> None:
+            synced.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        bucket = FakeBucket({"testnet/freshness.json": b"saved"})
+
+        assert _backup(bucket).restore(str(tmp_path / "freshness.json"), "freshness.json")
+
+        assert synced == [False, True]
 
     def test_without_a_copy_writes_nothing(self, tmp_path):
         path = tmp_path / "freshness.json"

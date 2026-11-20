@@ -285,9 +285,11 @@ def _digest(data: bytes) -> str:
 
 def _write_atomically(path: str, data: bytes) -> None:
     """Write ``data`` over ``path`` through a temp file beside it, named as the service's other
-    writes name theirs so that startup removes one a crash left behind.
+    writes name theirs so that startup removes one a crash left behind, then flush the folder so
+    the rename survives a power cut.
     """
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
     tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
     try:
         with open(tmp_path, "xb") as f:
@@ -299,3 +301,12 @@ def _write_atomically(path: str, data: bytes) -> None:
         with contextlib.suppress(FileNotFoundError):
             os.remove(tmp_path)
         raise
+    try:
+        folder = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(folder)
+        finally:
+            os.close(folder)
+    except OSError as e:
+        # The file is already in place, so this only costs its survival through a power cut.
+        logger.warning("Could not flush %s to disk after restoring %s: %s", parent, path, e)
