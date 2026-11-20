@@ -117,7 +117,7 @@ class TestLocation:
         location = BackupLocation.parse(url)
 
         assert (location.bucket, location.prefix) == (bucket, prefix)
-        assert location.object_name("/app/scores/freshness.json") == f"{prefix}freshness.json"
+        assert location.object_name("freshness.json") == f"{prefix}freshness.json"
 
     @pytest.mark.parametrize("url", ["iisa-test", "s3://iisa-test", "gs://", "gs:///x", "gs://A"])
     def test_refuses_anything_else(self, url):
@@ -215,7 +215,7 @@ class TestRestore:
         path = tmp_path / "freshness.json"
         bucket = FakeBucket({"testnet/freshness.json": b"saved"})
 
-        assert _backup(bucket).restore(str(path))
+        assert _backup(bucket).restore(str(path), path.name)
 
         assert path.read_bytes() == b"saved"
         assert [p.name for p in tmp_path.iterdir()] == ["freshness.json"]
@@ -223,7 +223,7 @@ class TestRestore:
     def test_without_a_copy_writes_nothing(self, tmp_path):
         path = tmp_path / "freshness.json"
 
-        assert not _backup(FakeBucket()).restore(str(path))
+        assert not _backup(FakeBucket()).restore(str(path), path.name)
 
         assert not path.exists()
 
@@ -232,7 +232,7 @@ class TestRestore:
         bucket.failures = [UNAVAILABLE, UNAVAILABLE, UNAVAILABLE]
         clock = Clock()
 
-        assert _backup(bucket, clock).restore(str(tmp_path / "freshness.json"))
+        assert _backup(bucket, clock).restore(str(tmp_path / "freshness.json"), "freshness.json")
 
         assert clock.sleeps == [1.0, 2.0, 4.0]
 
@@ -242,7 +242,9 @@ class TestRestore:
         clock = Clock()
 
         with caplog.at_level(logging.ERROR, logger="iisa.backup"):
-            assert not _backup(bucket, clock).restore(str(tmp_path / "freshness.json"))
+            assert not _backup(bucket, clock).restore(
+                str(tmp_path / "freshness.json"), "freshness.json"
+            )
 
         assert sum(clock.sleeps) == backup.RESTORE_WAIT_SECONDS
         assert max(clock.sleeps) == backup.MAX_PAUSE_SECONDS
@@ -253,7 +255,9 @@ class TestRestore:
         bucket.failures = [REFUSED]
         clock = Clock()
 
-        assert not _backup(bucket, clock).restore(str(tmp_path / "freshness.json"))
+        assert not _backup(bucket, clock).restore(
+            str(tmp_path / "freshness.json"), "freshness.json"
+        )
 
         assert clock.sleeps == []
 
@@ -262,10 +266,10 @@ class TestRestore:
         bucket = FakeBucket({"testnet/freshness.json": b"weeks of history"})
         bucket.failures = [REFUSED]
         kept = _backup(bucket)
-        assert not kept.restore(str(path), hold=True)
+        assert not kept.restore(str(path), path.name, hold=True)
         path.write_bytes(b"started again")
 
-        kept.copy_if_changed(str(path))
+        kept.copy_if_changed(str(path), path.name)
 
         assert bucket.puts == [] and bucket.objects["testnet/freshness.json"] == b"weeks of history"
 
@@ -274,10 +278,10 @@ class TestRestore:
         bucket = FakeBucket()
         bucket.failures = [REFUSED]
         kept = _backup(bucket)
-        assert not kept.restore(str(path))
+        assert not kept.restore(str(path), path.name)
         path.write_bytes(b"pushed")
 
-        kept.copy_if_changed(str(path))
+        kept.copy_if_changed(str(path), path.name)
 
         assert bucket.objects["testnet/indexer_scores.json"] == b"pushed"
 
@@ -285,9 +289,9 @@ class TestRestore:
         path = tmp_path / "freshness.json"
         bucket = FakeBucket({"testnet/freshness.json": b"saved"})
         kept = _backup(bucket)
-        kept.restore(str(path))
+        kept.restore(str(path), path.name)
 
-        kept.copy_if_changed(str(path))
+        kept.copy_if_changed(str(path), path.name)
 
         assert bucket.puts == []
 
@@ -299,10 +303,10 @@ class TestCopy:
         kept = _backup(bucket)
 
         path.write_bytes(b"first")
-        kept.copy_if_changed(str(path))
-        kept.copy_if_changed(str(path))
+        kept.copy_if_changed(str(path), path.name)
+        kept.copy_if_changed(str(path), path.name)
         path.write_bytes(b"second")
-        kept.copy_if_changed(str(path))
+        kept.copy_if_changed(str(path), path.name)
 
         assert bucket.puts == ["testnet/freshness.json"] * 2
         assert bucket.objects["testnet/freshness.json"] == b"second"
@@ -310,7 +314,7 @@ class TestCopy:
     def test_a_missing_file_is_not_copied(self, tmp_path):
         bucket = FakeBucket()
 
-        _backup(bucket).copy_if_changed(str(tmp_path / "freshness.json"))
+        _backup(bucket).copy_if_changed(str(tmp_path / "freshness.json"), "freshness.json")
 
         assert bucket.puts == []
 
@@ -322,8 +326,8 @@ class TestCopy:
         kept = _backup(bucket)
 
         with caplog.at_level(logging.ERROR, logger="iisa.backup"):
-            kept.copy_if_changed(str(path))
-        kept.copy_if_changed(str(path))
+            kept.copy_if_changed(str(path), path.name)
+        kept.copy_if_changed(str(path), path.name)
 
         assert "Could not copy" in caplog.records[0].getMessage()
         assert bucket.objects["testnet/freshness.json"] == b"saved"
@@ -443,6 +447,21 @@ class TestService:
         assert service.objects["testnet/freshness.json"] == b"{ newer layout, in the bucket"
         kept = sorted(p.read_bytes() for p in tmp_path.glob("freshness.json.unreadable-*"))
         assert kept == [b"{ newer layout, in the bucket", b"{ newer layout, on the disk"]
+
+    def test_each_file_has_its_own_copy_whatever_it_is_called(self, service, tmp_path, monkeypatch):
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        monkeypatch.setattr(score_loader, "SCORES_FILE_PATH", str(tmp_path / "a" / "state.json"))
+        monkeypatch.setenv("IISA_FRESHNESS_FILE_PATH", str(tmp_path / "b" / "state.json"))
+        endpoints.get_settings.cache_clear()
+        (tmp_path / "a" / "state.json").write_bytes(_scores_file())
+        (tmp_path / "b" / "state.json").write_bytes(_freshness_file())
+
+        with TestClient(app):
+            assert _wait_for(lambda: len(service.puts) == 2), service.puts
+
+        assert service.objects["testnet/indexer_scores.json"] == _read(tmp_path, "a/state.json")
+        assert service.objects["testnet/freshness.json"] == _read(tmp_path, "b/state.json")
 
     def test_a_push_copies_the_scores_even_after_a_failed_restore(self, service, tmp_path):
         service.failures = [REFUSED]

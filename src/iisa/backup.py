@@ -36,6 +36,9 @@ TOKEN_URL = (
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 )
 STORAGE_URL = "https://storage.googleapis.com"
+# What each file's copy is called, fixed so that 2 files can't share one whatever their paths.
+SCORES_COPY = "indexer_scores.json"
+FRESHNESS_COPY = "freshness.json"
 # Answers that may succeed if asked again; a 401 is among them, as a new token is fetched.
 RETRYABLE_STATUSES = frozenset({401, 408, 429, 500, 502, 503, 504})
 _BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
@@ -66,9 +69,9 @@ class BackupLocation:
         path = path.strip("/")
         return cls(bucket, f"{path}/" if path else "")
 
-    def object_name(self, path: str) -> str:
-        """The name of the copy of the file at ``path``: the prefix and the file's own name."""
-        return f"{self.prefix}{os.path.basename(path)}"
+    def object_name(self, name: str) -> str:
+        """The full name of the copy called ``name``, under the prefix."""
+        return f"{self.prefix}{name}"
 
     def __str__(self) -> str:
         return f"gs://{self.bucket}/{self.prefix}"
@@ -165,12 +168,13 @@ class Backup:
         self._held: set[str] = set()
         self._lock = threading.Lock()
 
-    def restore(self, path: str, hold: bool = False) -> bool:
-        """Write the bucket's copy of the file at ``path`` over it. True when it did; False when
-        there is no copy, or the bucket stayed unreachable for the restore wait. With ``hold``,
-        a file whose copy couldn't be read isn't copied until restart, as it builds on itself.
+    def restore(self, path: str, copy: str, hold: bool = False) -> bool:
+        """Write the bucket's copy called ``copy`` over the file at ``path``. True when it did;
+        False when there is no copy, or the bucket stayed unreachable for the restore wait. With
+        ``hold``, a file whose copy couldn't be read isn't copied until restart, as it builds on
+        itself.
         """
-        name = self.location.object_name(path)
+        name = self.location.object_name(copy)
         try:
             data = self._get_retrying(name)
         except BackupError as e:
@@ -211,9 +215,9 @@ class Backup:
             self.location,
         )
 
-    def copy_if_changed(self, path: str) -> None:
-        """Copy the file at ``path`` to the bucket unless it holds what was last copied or
-        restored. A failure is logged and the next call tries again.
+    def copy_if_changed(self, path: str, copy: str) -> None:
+        """Copy the file at ``path`` to the bucket as ``copy`` unless it holds what was last
+        copied or restored. A failure is logged and the next call tries again.
         """
         with self._lock:
             if path in self._held:
@@ -233,7 +237,7 @@ class Backup:
             if self._copied.get(path) == digest:
                 logger.debug("%s is unchanged since its last copy", path)
                 return
-            name = self.location.object_name(path)
+            name = self.location.object_name(copy)
             try:
                 self._bucket.put(name, data)
             except BackupError as e:

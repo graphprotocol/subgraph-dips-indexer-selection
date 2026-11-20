@@ -69,7 +69,14 @@ from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import score_columns as cols
-from .backup import COPY_INTERVAL_SECONDS, Backup, BackupLocation, backup_from
+from .backup import (
+    COPY_INTERVAL_SECONDS,
+    FRESHNESS_COPY,
+    SCORES_COPY,
+    Backup,
+    BackupLocation,
+    backup_from,
+)
 from .freshness import (
     HISTORY_DAYS,
     MIN_SCORED_MINUTES,
@@ -867,23 +874,24 @@ class IISAState:
             if path is not None:
                 _remove_stale_temp_files(path)
 
-    def restore_from_bucket(self, path: Optional[str], hold: bool = False) -> bool:
+    def restore_from_bucket(self, path: Optional[str], copy: str, hold: bool = False) -> bool:
         """Restore the file at ``path`` from its copy in the bucket, as Backup.restore does.
         False when backups are off or nothing was restored."""
-        return self.backup is not None and path is not None and self.backup.restore(path, hold)
+        backup = self.backup
+        return backup is not None and path is not None and backup.restore(path, copy, hold)
 
     def copy_to_bucket(self) -> None:
         """Copy the scores and freshness files to the bucket, each only if it changed."""
         self.copy_scores_to_bucket()
         if self.backup is not None and self.settings is not None:
-            self.backup.copy_if_changed(self.settings.freshness_file_path)
+            self.backup.copy_if_changed(self.settings.freshness_file_path, FRESHNESS_COPY)
 
     def copy_scores_to_bucket(self) -> None:
         """Copy the scores file to the bucket if it changed."""
         if self.backup is not None and self.data_manager is not None:
             path = self.data_manager.scores_file_path
             if path is not None:
-                self.backup.copy_if_changed(path)
+                self.backup.copy_if_changed(path, SCORES_COPY)
 
     def refresh_data(self) -> bool:
         """Load pre-computed indexer scores from the cache file on disk.
@@ -1277,7 +1285,7 @@ def _recover_cache_files() -> None:
     logger.info("Attempting to recover cached scores from disk...")
     if _state.refresh_data():
         logger.info("Recovered cached scores on startup")
-    elif _state.restore_from_bucket(scores_path) and _state.refresh_data():
+    elif _state.restore_from_bucket(scores_path, SCORES_COPY) and _state.refresh_data():
         logger.info("Recovered scores from the bucket on startup")
     else:
         logger.warning(
@@ -1301,7 +1309,7 @@ def _recover_freshness() -> None:
     if _state.refresh_freshness():
         logger.info("Recovered freshness state on startup")
         return
-    if _state.restore_from_bucket(path, hold=True):
+    if _state.restore_from_bucket(path, FRESHNESS_COPY, hold=True):
         if _state.refresh_freshness():
             logger.info("Recovered freshness state from the bucket on startup")
             return
