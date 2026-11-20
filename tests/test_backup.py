@@ -432,6 +432,18 @@ class TestService:
             tmp_path, "indexer_scores.json"
         )
 
+    def test_a_restored_copy_the_service_cannot_read_is_kept(self, service, tmp_path):
+        (tmp_path / "freshness.json").write_bytes(b"{ newer layout, on the disk")
+        service.objects = {"testnet/freshness.json": b"{ newer layout, in the bucket"}
+
+        with TestClient(app):
+            (tmp_path / "freshness.json").write_bytes(_freshness_file())
+            endpoints._state.copy_to_bucket()
+
+        assert service.objects["testnet/freshness.json"] == b"{ newer layout, in the bucket"
+        kept = sorted(p.read_bytes() for p in tmp_path.glob("freshness.json.unreadable-*"))
+        assert kept == [b"{ newer layout, in the bucket", b"{ newer layout, on the disk"]
+
     def test_a_push_copies_the_scores_even_after_a_failed_restore(self, service, tmp_path):
         service.failures = [REFUSED]
 

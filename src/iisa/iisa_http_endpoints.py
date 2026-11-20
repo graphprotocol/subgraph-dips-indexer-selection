@@ -1291,13 +1291,23 @@ def _recover_cache_files() -> None:
     else:
         logger.info("No cached sync status on startup (optional)")
 
-    freshness_path = _state.settings.freshness_file_path if _state.settings else None
+    _recover_freshness()
+
+
+def _recover_freshness() -> None:
+    """Load the freshness state, restoring it from the bucket when the volume's copy is missing
+    or unreadable. A copy the bucket holds but the service can't use stays there untouched."""
+    path = _state.settings.freshness_file_path if _state.settings else None
     if _state.refresh_freshness():
         logger.info("Recovered freshness state on startup")
-    elif _state.restore_from_bucket(freshness_path, hold=True) and _state.refresh_freshness():
-        logger.info("Recovered freshness state from the bucket on startup")
-    else:
-        logger.info("No freshness state on startup; marks start again from the first push")
+        return
+    if _state.restore_from_bucket(path, hold=True):
+        if _state.refresh_freshness():
+            logger.info("Recovered freshness state from the bucket on startup")
+            return
+        if _state.backup is not None and path is not None:
+            _state.backup.hold(path)
+    logger.info("No freshness state on startup; marks start again from the first push")
 
 
 async def _copy_to_bucket_every(seconds: float) -> None:

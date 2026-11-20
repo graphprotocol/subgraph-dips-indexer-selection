@@ -174,19 +174,15 @@ class Backup:
         try:
             data = self._get_retrying(name)
         except BackupError as e:
-            if hold:
-                with self._lock:
-                    self._held.add(path)
             logger.error(
-                "Could not restore %s from gs://%s/%s (%s); starting without it%s",
+                "Could not restore %s from gs://%s/%s (%s); starting without it",
                 path,
                 self.location.bucket,
                 name,
                 e,
-                ", and not copying it until the service restarts so the copy there is kept"
-                if hold
-                else "",
             )
+            if hold:
+                self.hold(path)
             return False
         if data is None:
             logger.warning("No copy of %s in %s to restore it from", path, self.location)
@@ -202,6 +198,18 @@ class Backup:
             "Restored %s from gs://%s/%s (%d bytes)", path, self.location.bucket, name, len(data)
         )
         return True
+
+    def hold(self, path: str) -> None:
+        """Stop copying the file at ``path`` until the service restarts, so the copy in the
+        bucket, which it couldn't read or use, isn't replaced by what it started again from."""
+        with self._lock:
+            self._held.add(path)
+        logger.error(
+            "Not copying %s to %s until the service restarts, so the copy there is kept; the "
+            "bucket's older versions keep it after that",
+            path,
+            self.location,
+        )
 
     def copy_if_changed(self, path: str) -> None:
         """Copy the file at ``path`` to the bucket unless it holds what was last copied or
