@@ -115,7 +115,9 @@ history it started again from.
 
 The service signs in to the bucket as the pod, through Workload Identity Federation for GKE, so
 the pod's Kubernetes service account needs Storage Object User (`roles/storage.objectUser`) on
-the bucket. Turn on object versioning with a rule that deletes old versions after 30 days, so
+the bucket. Give the deployment a service account of its own (`serviceAccountName`) first: the
+score job and the sync-status fetcher run as the namespace's default one, and granting that
+would let them write the copies too. Turn on object versioning with a rule that deletes old versions after 30 days, so
 a bad file copied over a good one can still be got back.
 
 ## Prerequisites
