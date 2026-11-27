@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.17.0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.16.2...v2.17.0) (2026-11-27)
+
+
+### Added
+
+* **backup:** copy cache files to a bucket, restore lost ones ([#486](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/486)) ([92a6e43](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/92a6e438cb2638100821ffcfc8f2a99763ff565e))
+
+
+### Fixed
+
+* **freshness:** move an unreadable history file aside ([#484](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/484)) ([b8b1d55](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/b8b1d550d32963458adb0eedfc2d9ccd375a073b))
+* **startup:** stop logs claiming a random selection fallback ([#483](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/483)) ([f9b5cf0](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/f9b5cf04e661a98c4fe1e0c2e044461d78b00734))
+
+
+### Changed
+
+* **k8s:** update cronjob image to sha-b0139ed ([#490](https://github.com/graphprotocol/subgraph-dips-indexer-selection/issues/490)) ([7d8ef85](https://github.com/graphprotocol/subgraph-dips-indexer-selection/commit/7d8ef85aa6b716ef37f4725223dfdcc1ec9ff765))
+
 ## [2.16.2](https://github.com/graphprotocol/subgraph-dips-indexer-selection/compare/v2.16.1...v2.16.2) (2026-11-19)
 
 
