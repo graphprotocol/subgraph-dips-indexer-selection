@@ -101,6 +101,27 @@ sends it traffic. A rollout stops the old fetcher pod before starting the new on
 otherwise the old pod, running the old code, would keep pushing every hour for as long as
 the new one could not make its first push.
 
+## Backups
+
+The scores and freshness files sit on 1 disk. If it is lost, selections are refused until the
+score job's next daily push, and the freshness history, up to 28 days of it, is gone. Setting
+`IISA_BACKUP_URL` to `gs://<bucket>/<path>` copies both files to that bucket: the scores after
+each push and the freshness file every hour, each only when it changed. At startup, a file
+that is missing from the volume or can't be read is restored from its copy before the service
+takes requests. If the bucket can't be reached, startup keeps trying each file for about a
+minute, so a few minutes in all at worst, and then starts without the copy, and stops copying
+the freshness file until the next restart, so the copy it couldn't read isn't replaced by the
+history it started again from.
+
+The service signs in to the bucket as the pod, through Workload Identity Federation for GKE, so
+the pod's Kubernetes service account needs Storage Object User (`roles/storage.objectUser`) on
+the bucket. Give the deployment a service account of its own (`serviceAccountName`) first: the
+score job and the sync-status fetcher run as the namespace's default one, and granting that
+would let them write the copies too. Turn on object versioning with a rule that deletes old versions after 30 days, so
+a bad file copied over a good one can still be got back. The pause in copying the freshness
+file lasts only until the next restart, when the history the service started again from
+replaces the copy; from then the older versions are the only way back to it.
+
 ## Prerequisites
 
 These secrets are created out of band and are never committed:

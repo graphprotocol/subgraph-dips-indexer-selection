@@ -75,6 +75,10 @@ spec:
                   name: iisa-sync-check-gateway
                   key: IISA_SYNC_CHECK_GATEWAY_API_KEY
                   optional: true
+            # Optional: where to copy the scores and freshness files, and restore a lost one
+            # from at startup. Unset, nothing is copied. See "Backups" in k8s/README.md.
+            # - name: IISA_BACKUP_URL
+            #   value: gs://<bucket>/<environment>
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
