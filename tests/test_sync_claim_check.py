@@ -13,6 +13,7 @@ import json
 import threading
 import time
 import urllib.error
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -327,7 +328,7 @@ def _record(indexer: str, success_rate: float, **changes: Any) -> dict[str, Any]
         "org": f"org-{indexer[2:4]}",
         "dst_lat": int(indexer[2:4], 16) / 4,
         "dst_lon": 4.9,
-        "computed_at": "2026-11-12T09:00:00Z",
+        "computed_at": datetime.now(timezone.utc).isoformat(),
         "dips_info_available": True,
         "dips_min_grt_per_30_days": f'{{"{CHAIN}": "450"}}',
         "dips_min_grt_per_billion_entities_per_30_days": "200",
